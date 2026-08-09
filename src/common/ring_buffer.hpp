@@ -1,4 +1,5 @@
 #pragma once
+// Hardened: thread-safe capacity/full, bounds checks, C++17 compatible
 
 #include <vector>
 #include <cstdint>
@@ -38,6 +39,7 @@ public:
     }
 
     size_t capacity() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return capacity_;
     }
 
