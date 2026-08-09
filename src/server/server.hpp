@@ -29,12 +29,12 @@ struct ServerConfig {
     bool use_test_tone = false;
     double test_tone_freq = 440.0;
 
-    [[nodiscard]] std::expected<void, std::string> validate() const noexcept {
-        if (port == 0) return std::unexpected<std::string>(std::string("port 0"));
-        if (sample_rate < 8000 || sample_rate > 192000) return std::unexpected<std::string>(std::string("sample_rate out of range"));
-        if (channels == 0 || channels > 32) return std::unexpected<std::string>(std::string("channels out of range"));
-        if (frames_per_packet == 0 || frames_per_packet > 8192) return std::unexpected<std::string>(std::string("frames_per_packet out of range"));
-        if (client_timeout_ms < 500) return std::unexpected<std::string>(std::string("client_timeout_ms too small"));
+    [[nodiscard]] audiorouter::expected<void, std::string> validate() const noexcept {
+        if (port == 0) return audiorouter::unexpected<std::string>(std::string("port 0"));
+        if (sample_rate < 8000 || sample_rate > 192000) return audiorouter::unexpected<std::string>(std::string("sample_rate out of range"));
+        if (channels == 0 || channels > 32) return audiorouter::unexpected<std::string>(std::string("channels out of range"));
+        if (frames_per_packet == 0 || frames_per_packet > 8192) return audiorouter::unexpected<std::string>(std::string("frames_per_packet out of range"));
+        if (client_timeout_ms < 500) return audiorouter::unexpected<std::string>(std::string("client_timeout_ms too small"));
         return {};
     }
 };

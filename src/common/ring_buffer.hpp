@@ -236,11 +236,11 @@ public:
     }
 
     // ── Checked helpers ──
-    [[nodiscard]] std::expected<size_t, std::string> try_write(std::span<const T> src) noexcept {
+    [[nodiscard]] audiorouter::expected<size_t, std::string> try_write(std::span<const T> src) noexcept {
         if (src.empty()) return 0;
         std::lock_guard<std::mutex> lock(mutex_);
         size_t free = (count_ < capacity_) ? capacity_ - count_ : 0;
-        if (src.size() > free) return std::unexpected<std::string>(std::string("RingBuffer full — not enough free space"));
+        if (src.size() > free) return audiorouter::unexpected<std::string>(std::string("RingBuffer full — not enough free space"));
         // delegate without re-locking — inline copy
         size_t first_chunk = std::min(src.size(), capacity_ - head_);
         copy_to_buffer(head_, src.data(), first_chunk);

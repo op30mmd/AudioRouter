@@ -52,7 +52,7 @@ public:
     explicit SocketAddress(const struct sockaddr_in& addr) noexcept;
 
     // Factory returning expected — preferred safe path
-    [[nodiscard]] static std::expected<SocketAddress, std::string> create(std::string_view ip_str, uint16_t port) noexcept;
+    [[nodiscard]] static audiorouter::expected<SocketAddress, std::string> create(std::string_view ip_str, uint16_t port) noexcept;
 
     [[nodiscard]] bool is_valid() const noexcept;
     [[nodiscard]] std::string ip() const;
@@ -101,8 +101,8 @@ public:
     [[nodiscard]] int receive_from(void* buffer, size_t max_size, SocketAddress& out_source);
 
     // C++23 span-based API — preferred, bounds-checked, [[nodiscard]]
-    [[nodiscard]] std::expected<size_t, std::string> send_to(std::span<const std::byte> data, const SocketAddress& dest) noexcept;
-    [[nodiscard]] std::expected<size_t, std::string> receive_from(std::span<std::byte> buffer, SocketAddress& out_source) noexcept;
+    [[nodiscard]] audiorouter::expected<size_t, std::string> send_to(std::span<const std::byte> data, const SocketAddress& dest) noexcept;
+    [[nodiscard]] audiorouter::expected<size_t, std::string> receive_from(std::span<std::byte> buffer, SocketAddress& out_source) noexcept;
 
     bool set_non_blocking(bool enable) noexcept;
     bool set_receive_timeout_ms(int ms) noexcept;

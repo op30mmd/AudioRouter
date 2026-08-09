@@ -40,7 +40,7 @@ public:
     void reset() noexcept;
 
     // C++23 span-based API — preferred, bounds-checked
-    [[nodiscard]] std::expected<bool, std::string> push_packet(uint32_t seq_num, uint64_t timestamp_us,
+    [[nodiscard]] audiorouter::expected<bool, std::string> push_packet(uint32_t seq_num, uint64_t timestamp_us,
                                                                std::span<const int16_t> pcm) noexcept;
     // Legacy raw pointer API — hardened
     bool push_packet(uint32_t seq_num, uint64_t timestamp_us, const void* pcm_data, size_t num_frames) noexcept;

@@ -165,11 +165,11 @@ bool run_type_safety_tests() {
         TEST_ASSERT(s_out[0]=="a");
     }
 
-    // ── std::expected usage ──
+    // ── audiorouter::expected usage ──
     {
-        std::expected<int, std::string> e = 42;
+        audiorouter::expected<int, std::string> e = 42;
         TEST_ASSERT(e.has_value() && e.value()==42);
-        std::expected<int, std::string> err = std::unexpected<std::string>(std::string("oops"));
+        audiorouter::expected<int, std::string> err = audiorouter::unexpected<std::string>(std::string("oops"));
         TEST_ASSERT(!err.has_value() && err.error()=="oops");
     }
 

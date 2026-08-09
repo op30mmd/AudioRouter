@@ -127,9 +127,9 @@ SocketAddress::SocketAddress(std::string_view ip_str, uint16_t port) : valid_(fa
 
 SocketAddress::SocketAddress(const struct sockaddr_in& addr) noexcept : addr_(addr), valid_(true) {}
 
-std::expected<SocketAddress, std::string> SocketAddress::create(std::string_view ip_str, uint16_t port) noexcept {
+audiorouter::expected<SocketAddress, std::string> SocketAddress::create(std::string_view ip_str, uint16_t port) noexcept {
     SocketAddress a(ip_str, port);
-    if (!a.is_valid()) return std::unexpected<std::string>(std::string("invalid address: ") + std::string(ip_str) + ":" + std::to_string(port));
+    if (!a.is_valid()) return audiorouter::unexpected<std::string>(std::string("invalid address: ") + std::string(ip_str) + ":" + std::to_string(port));
     return a;
 }
 
@@ -264,29 +264,29 @@ int UdpSocket::receive_from(void* buffer, size_t max_size, SocketAddress& out_so
     return static_cast<int>(bytes);
 }
 
-std::expected<size_t, std::string> UdpSocket::send_to(std::span<const std::byte> data, const SocketAddress& dest) noexcept {
-    if (data.empty()) return std::unexpected<std::string>(std::string("send_to: empty span"));
-    if (!dest.is_valid()) return std::unexpected<std::string>(std::string("send_to: invalid destination"));
+audiorouter::expected<size_t, std::string> UdpSocket::send_to(std::span<const std::byte> data, const SocketAddress& dest) noexcept {
+    if (data.empty()) return audiorouter::unexpected<std::string>(std::string("send_to: empty span"));
+    if (!dest.is_valid()) return audiorouter::unexpected<std::string>(std::string("send_to: invalid destination"));
     if (!is_open()) {
-        if (!open()) return std::unexpected<std::string>(std::string("send_to: socket open failed: ") + get_last_error_string());
+        if (!open()) return audiorouter::unexpected<std::string>(std::string("send_to: socket open failed: ") + get_last_error_string());
     }
     if (data.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
-        return std::unexpected<std::string>(std::string("send_to: data too large"));
+        return audiorouter::unexpected<std::string>(std::string("send_to: data too large"));
 #if defined(_WIN32)
     int bytes = ::sendto(handle_, reinterpret_cast<const char*>(data.data()), static_cast<int>(data.size()),
                          0, dest.sockaddr_ptr(), static_cast<int>(SocketAddress::size()));
-    if (bytes == SOCKET_ERROR) return std::unexpected<std::string>(get_last_error_string());
+    if (bytes == SOCKET_ERROR) return audiorouter::unexpected<std::string>(get_last_error_string());
     return static_cast<size_t>(bytes);
 #else
     ssize_t bytes = ::sendto(handle_, data.data(), data.size(), 0, dest.sockaddr_ptr(), static_cast<socklen_t>(SocketAddress::size()));
-    if (bytes < 0) return std::unexpected<std::string>(get_last_error_string());
+    if (bytes < 0) return audiorouter::unexpected<std::string>(get_last_error_string());
     return static_cast<size_t>(bytes);
 #endif
 }
 
-std::expected<size_t, std::string> UdpSocket::receive_from(std::span<std::byte> buffer, SocketAddress& out_source) noexcept {
-    if (buffer.empty()) return std::unexpected<std::string>(std::string("receive_from: empty buffer"));
-    if (!is_open()) return std::unexpected<std::string>(std::string("receive_from: socket not open"));
+audiorouter::expected<size_t, std::string> UdpSocket::receive_from(std::span<std::byte> buffer, SocketAddress& out_source) noexcept {
+    if (buffer.empty()) return audiorouter::unexpected<std::string>(std::string("receive_from: empty buffer"));
+    if (!is_open()) return audiorouter::unexpected<std::string>(std::string("receive_from: socket not open"));
     struct sockaddr_in src_addr{};
     socklen_t addr_len = sizeof(src_addr);
 #if defined(_WIN32)
@@ -294,16 +294,16 @@ std::expected<size_t, std::string> UdpSocket::receive_from(std::span<std::byte> 
                            0, reinterpret_cast<struct sockaddr*>(&src_addr), &addr_len);
     if (bytes == SOCKET_ERROR) {
         int err = WSAGetLastError();
-        if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) return std::unexpected<std::string>(std::string("timeout"));
-        return std::unexpected<std::string>(get_last_error_string());
+        if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) return audiorouter::unexpected<std::string>(std::string("timeout"));
+        return audiorouter::unexpected<std::string>(get_last_error_string());
     }
     out_source = SocketAddress(src_addr);
     return static_cast<size_t>(bytes);
 #else
     ssize_t bytes = ::recvfrom(handle_, buffer.data(), buffer.size(), 0, reinterpret_cast<struct sockaddr*>(&src_addr), &addr_len);
     if (bytes < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return std::unexpected<std::string>(std::string("timeout"));
-        return std::unexpected<std::string>(get_last_error_string());
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return audiorouter::unexpected<std::string>(std::string("timeout"));
+        return audiorouter::unexpected<std::string>(get_last_error_string());
     }
     out_source = SocketAddress(src_addr);
     return static_cast<size_t>(bytes);

@@ -25,10 +25,10 @@ struct ClientConfig {
     bool use_dummy_player = false;
     uint32_t reconnect_timeout_ms = 5000;
 
-    [[nodiscard]] std::expected<void, std::string> validate() const noexcept {
-        if (server_ip.empty()) return std::unexpected<std::string>(std::string("server_ip empty"));
-        if (server_port == 0) return std::unexpected<std::string>(std::string("server_port 0"));
-        if (target_latency_ms < 5 || target_latency_ms > 500) return std::unexpected<std::string>(std::string("target_latency_ms out of range"));
+    [[nodiscard]] audiorouter::expected<void, std::string> validate() const noexcept {
+        if (server_ip.empty()) return audiorouter::unexpected<std::string>(std::string("server_ip empty"));
+        if (server_port == 0) return audiorouter::unexpected<std::string>(std::string("server_port 0"));
+        if (target_latency_ms < 5 || target_latency_ms > 500) return audiorouter::unexpected<std::string>(std::string("target_latency_ms out of range"));
         return {};
     }
 };

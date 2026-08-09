@@ -88,18 +88,18 @@ struct AudioConfig {
         return true;
     }
 
-    [[nodiscard]] std::expected<void, std::string> validate() const noexcept {
+    [[nodiscard]] audiorouter::expected<void, std::string> validate() const noexcept {
         if (sample_rate == 0 || sample_rate > 192000)
-            return std::unexpected<std::string>(std::string("invalid sample_rate"));
+            return audiorouter::unexpected<std::string>(std::string("invalid sample_rate"));
         if (channels == 0 || channels > 32)
-            return std::unexpected<std::string>(std::string("invalid channels"));
+            return audiorouter::unexpected<std::string>(std::string("invalid channels"));
         if (frames_per_packet == 0 || frames_per_packet > 8192)
-            return std::unexpected<std::string>(std::string("invalid frames_per_packet"));
+            return audiorouter::unexpected<std::string>(std::string("invalid frames_per_packet"));
         if (format == AudioSampleFormat::UNKNOWN)
-            return std::unexpected<std::string>(std::string("unknown format"));
+            return audiorouter::unexpected<std::string>(std::string("unknown format"));
         size_t payload = packet_payload_size();
-        if (payload == 0) return std::unexpected<std::string>(std::string("payload size overflow or zero"));
-        if (payload > 65507) return std::unexpected<std::string>(std::string("payload exceeds max UDP"));
+        if (payload == 0) return audiorouter::unexpected<std::string>(std::string("payload size overflow or zero"));
+        if (payload > 65507) return audiorouter::unexpected<std::string>(std::string("payload exceeds max UDP"));
         return {};
     }
 
@@ -179,11 +179,11 @@ public:
         if (samples.empty()) return;
         if (std::abs(volume - 1.0f) < 0.001f) return;
         if (volume <= 0.0f) {
-            std::ranges::fill(samples, 0);
+            std::fill(samples.begin(), samples.end(), 0);
             return;
         }
         if (!std::isfinite(volume)) {
-            std::ranges::fill(samples, 0);
+            std::fill(samples.begin(), samples.end(), 0);
             return;
         }
         // clamp volume to [0, 10] to prevent extreme amplification / overflow

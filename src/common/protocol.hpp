@@ -121,44 +121,44 @@ inline const char* msg_type_to_cstr(MsgType t) noexcept { return msg_type_to_str
     return true;
 }
 
-[[nodiscard]] inline std::expected<void, std::string> validate_header(const CommonHeader& hdr, size_t received_bytes) noexcept {
-    if (received_bytes < sizeof(CommonHeader)) return std::unexpected<std::string>(std::string("packet too small for header"));
-    if (hdr.magic != MAGIC) return std::unexpected<std::string>(std::string("bad magic"));
-    if (hdr.version != CURRENT_VERSION) return std::unexpected<std::string>(std::string("unsupported version"));
-    if (!is_valid_msg_type(hdr.msg_type)) return std::unexpected<std::string>(std::string("unknown msg_type"));
-    if (hdr.payload_size > MAX_UDP_PACKET_SIZE) return std::unexpected<std::string>(std::string("payload too large"));
+[[nodiscard]] inline audiorouter::expected<void, std::string> validate_header(const CommonHeader& hdr, size_t received_bytes) noexcept {
+    if (received_bytes < sizeof(CommonHeader)) return audiorouter::unexpected<std::string>(std::string("packet too small for header"));
+    if (hdr.magic != MAGIC) return audiorouter::unexpected<std::string>(std::string("bad magic"));
+    if (hdr.version != CURRENT_VERSION) return audiorouter::unexpected<std::string>(std::string("unsupported version"));
+    if (!is_valid_msg_type(hdr.msg_type)) return audiorouter::unexpected<std::string>(std::string("unknown msg_type"));
+    if (hdr.payload_size > MAX_UDP_PACKET_SIZE) return audiorouter::unexpected<std::string>(std::string("payload too large"));
     size_t total = sizeof(CommonHeader) + static_cast<size_t>(hdr.payload_size);
-    if (received_bytes < total) return std::unexpected<std::string>(std::string("truncated payload"));
+    if (received_bytes < total) return audiorouter::unexpected<std::string>(std::string("truncated payload"));
     constexpr uint16_t known = FLAG_DISCONTINUITY | FLAG_SILENCE | FLAG_KEYFRAME | FLAG_LAST_PACKET;
-    if ((hdr.flags & ~known) != 0) return std::unexpected<std::string>(std::string("unknown flags set"));
+    if ((hdr.flags & ~known) != 0) return audiorouter::unexpected<std::string>(std::string("unknown flags set"));
     return {};
 }
 
 // Safe span-based header parsing — zero-copy view with bounds check
-[[nodiscard]] inline std::expected<CommonHeader, std::string> parse_header(std::span<const std::byte> buf) noexcept {
-    if (buf.size() < sizeof(CommonHeader)) return std::unexpected<std::string>(std::string("buffer too small"));
+[[nodiscard]] inline audiorouter::expected<CommonHeader, std::string> parse_header(std::span<const std::byte> buf) noexcept {
+    if (buf.size() < sizeof(CommonHeader)) return audiorouter::unexpected<std::string>(std::string("buffer too small"));
     CommonHeader hdr;
     std::memcpy(&hdr, buf.data(), sizeof(CommonHeader));
     auto v = validate_header(hdr, buf.size());
-    if (!v) return std::unexpected<std::string>(v.error());
+    if (!v) return audiorouter::unexpected<std::string>(v.error());
     return hdr;
 }
 
-[[nodiscard]] inline std::expected<std::span<const std::byte>, std::string>
+[[nodiscard]] inline audiorouter::expected<std::span<const std::byte>, std::string>
 payload_span(const CommonHeader& hdr, std::span<const std::byte> buf) noexcept {
     size_t total = sizeof(CommonHeader) + static_cast<size_t>(hdr.payload_size);
-    if (buf.size() < total) return std::unexpected<std::string>(std::string("buffer smaller than header+payload"));
+    if (buf.size() < total) return audiorouter::unexpected<std::string>(std::string("buffer smaller than header+payload"));
     return buf.subspan(sizeof(CommonHeader), hdr.payload_size);
 }
 
 // Audio header validation
-[[nodiscard]] inline std::expected<void, std::string> validate_audio_header(const AudioPacketHeader& ah, size_t received_bytes) noexcept {
+[[nodiscard]] inline audiorouter::expected<void, std::string> validate_audio_header(const AudioPacketHeader& ah, size_t received_bytes) noexcept {
     auto v = validate_header(ah.common, received_bytes);
     if (!v) return v;
-    if (ah.common.msg_type != static_cast<uint8_t>(MsgType::AUDIO_DATA)) return std::unexpected<std::string>(std::string("not AUDIO_DATA"));
-    if (ah.sample_rate == 0 || ah.sample_rate > 192000) return std::unexpected<std::string>(std::string("invalid sample_rate"));
-    if (ah.channels == 0 || ah.channels > 32) return std::unexpected<std::string>(std::string("invalid channels"));
-    if (ah.num_frames == 0 || ah.num_frames > 8192) return std::unexpected<std::string>(std::string("invalid num_frames"));
+    if (ah.common.msg_type != static_cast<uint8_t>(MsgType::AUDIO_DATA)) return audiorouter::unexpected<std::string>(std::string("not AUDIO_DATA"));
+    if (ah.sample_rate == 0 || ah.sample_rate > 192000) return audiorouter::unexpected<std::string>(std::string("invalid sample_rate"));
+    if (ah.channels == 0 || ah.channels > 32) return audiorouter::unexpected<std::string>(std::string("invalid channels"));
+    if (ah.num_frames == 0 || ah.num_frames > 8192) return audiorouter::unexpected<std::string>(std::string("invalid num_frames"));
     // Check payload size matches header + PCM
     size_t expected_pcm = static_cast<size_t>(ah.num_frames) * static_cast<size_t>(ah.channels) * 2; // S16LE
     size_t header_only = sizeof(AudioPacketHeader) - sizeof(CommonHeader);
@@ -166,7 +166,7 @@ payload_span(const CommonHeader& hdr, std::span<const std::byte> buf) noexcept {
         // Allow other formats (float=4 bytes) - compute via format if known
         // For now require exact match for S16LE; other formats unchecked beyond bounds
         if (ah.format == static_cast<uint8_t>(AudioSampleFormat::PCM_S16LE) && ah.common.payload_size != header_only + expected_pcm)
-            return std::unexpected<std::string>(std::string("payload size mismatches num_frames"));
+            return audiorouter::unexpected<std::string>(std::string("payload size mismatches num_frames"));
     }
     return {};
 }

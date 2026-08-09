@@ -1,15 +1,16 @@
 #pragma once
 
 // Compatibility layer for std::expected (C++23) — falls back to a minimal
-// implementation when <expected> is not available (e.g., GCC 11).
+// implementation when <expected> is not available (e.g., GCC 11 / C++17).
 #if __has_include(<expected>)
   #include <expected>
+#endif
+#if defined(__cpp_lib_expected)
   namespace audiorouter {
     template <typename T, typename E>
     using expected = std::expected<T, E>;
     using std::unexpected;
   }
-  // Also expose via std for code that still uses std::expected
 #else
   // Minimal polyfill for the subset of std::expected used in this project.
   // Supports expected<T,E> and expected<void,E> with has_value(), value(), error(), and unexpected().
@@ -84,12 +85,4 @@
   };
 
   } // namespace audiorouter
-
-  // Inject into std so existing code using std::expected / std::unexpected still works
-  namespace std {
-    template <typename T, typename E>
-    using expected = ::audiorouter::expected<T, E>;
-    template <typename E>
-    using unexpected = ::audiorouter::unexpected<E>;
-  }
 #endif
