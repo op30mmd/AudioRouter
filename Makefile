@@ -1,6 +1,20 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -O3 -Wall -Wextra -pthread
+CXXFLAGS ?= -std=c++23 -O3 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -pthread -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
 INCLUDES = -Isrc/common -Isrc/client -Isrc/server
+LDFLAGS_EXTRA = -pie
+
+# Debug / Sanitizer variant: make DEBUG=1 or make SANITIZE=address,undefined
+ifeq ($(DEBUG),1)
+    CXXFLAGS := -std=c++23 -O0 -g -Wall -Wextra -Wpedantic -Wconversion -pthread -fno-omit-frame-pointer -fstack-protector-strong
+    ifeq ($(SANITIZE),)
+        SANITIZE=address,undefined
+    endif
+endif
+
+ifneq ($(SANITIZE),)
+    CXXFLAGS += -fsanitize=$(SANITIZE) -fno-sanitize-recover=all
+    LDFLAGS_EXTRA += -fsanitize=$(SANITIZE)
+endif
 
 # Platform detection
 UNAME_S := $(shell uname -s)
@@ -43,14 +57,17 @@ TEST_SRCS = tests/test_main.cpp \
             tests/test_ring_buffer.cpp \
             tests/test_jitter_buffer.cpp \
             tests/test_socket.cpp \
-            tests/test_conversion.cpp
+            tests/test_conversion.cpp \
+            tests/test_thread_safety.cpp \
+            tests/test_type_safety.cpp \
+            tests/test_memory_safety.cpp
 TEST_OBJS = $(patsubst tests/%.cpp,$(BUILD_DIR)/test_%.o,$(TEST_SRCS))
 
 SERVER_TARGET = $(BIN_DIR)/audiorouter_server$(EXE_EXT)
 CLIENT_TARGET = $(BIN_DIR)/audiorouter_client$(EXE_EXT)
 TEST_TARGET = $(BIN_DIR)/audiorouter_tests$(EXE_EXT)
 
-.PHONY: all clean test server client directories
+.PHONY: all clean test server client directories sanitize
 
 all: directories $(SERVER_TARGET) $(CLIENT_TARGET) $(TEST_TARGET)
 
@@ -61,6 +78,12 @@ client: directories $(CLIENT_TARGET)
 test: directories $(TEST_TARGET)
 	@echo "Running AudioRouter unit tests..."
 	@$(TEST_TARGET)
+
+sanitize:
+	$(MAKE) clean
+	$(MAKE) all DEBUG=1 SANITIZE=address,undefined
+	@echo "Running with sanitizers..."
+	@$(BIN_DIR)/audiorouter_tests
 
 directories:
 	@mkdir -p $(BUILD_DIR) $(BIN_DIR)
@@ -83,17 +106,17 @@ $(BUILD_DIR)/test_%.o: tests/%.cpp
 
 # Link Server
 $(SERVER_TARGET): $(SERVER_OBJS) $(COMMON_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(SERVER_LIBS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXTRA) $^ -o $@ $(SERVER_LIBS)
 	@echo "Built: $(SERVER_TARGET)"
 
 # Link Client
 $(CLIENT_TARGET): $(CLIENT_OBJS) $(COMMON_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(CLIENT_LIBS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXTRA) $^ -o $@ $(CLIENT_LIBS)
 	@echo "Built: $(CLIENT_TARGET)"
 
 # Link Tests
 $(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(COMMON_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(CLIENT_LIBS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXTRA) $^ -o $@ $(CLIENT_LIBS)
 	@echo "Built: $(TEST_TARGET)"
 
 clean:
