@@ -81,8 +81,8 @@ bool run_socket_tests() {
     // span-based API
     {
         UdpSocket a,b;
-        a.open(); b.open();
-        a.bind(0,"127.0.0.1"); b.bind(0,"127.0.0.1");
+        TEST_ASSERT(a.open()); TEST_ASSERT(b.open());
+        TEST_ASSERT(a.bind(0,"127.0.0.1")); TEST_ASSERT(b.bind(0,"127.0.0.1"));
         auto ba = a.get_local_address(); auto bb = b.get_local_address();
         b.set_receive_timeout_ms(1000);
         std::array<std::byte, 4> payload{std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF}};
@@ -145,7 +145,7 @@ bool run_socket_tests() {
     // bind failure with invalid ip
     {
         UdpSocket s;
-        s.open();
+        TEST_ASSERT(s.open());
         TEST_ASSERT(!s.bind(1234, "999.999.999.999")); // invalid ip should make bind fail
         s.close();
     }
@@ -153,8 +153,8 @@ bool run_socket_tests() {
     // large payload handling (1400 MTU)
     {
         UdpSocket a,b;
-        a.open(); b.open();
-        a.bind(0,"127.0.0.1"); b.bind(0,"127.0.0.1");
+        TEST_ASSERT(a.open()); TEST_ASSERT(b.open());
+        TEST_ASSERT(a.bind(0,"127.0.0.1")); TEST_ASSERT(b.bind(0,"127.0.0.1"));
         b.set_receive_timeout_ms(1000);
         auto bb = b.get_local_address();
         std::vector<std::byte> large(1400, std::byte{0xAB});
@@ -170,8 +170,8 @@ bool run_socket_tests() {
     // move semantics
     {
         UdpSocket orig;
-        orig.open();
-        orig.bind(0,"127.0.0.1");
+        TEST_ASSERT(orig.open());
+        TEST_ASSERT(orig.bind(0,"127.0.0.1"));
         auto addr = orig.get_local_address();
         UdpSocket moved(std::move(orig));
         TEST_ASSERT(!orig.is_open());

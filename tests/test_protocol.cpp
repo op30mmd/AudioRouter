@@ -150,7 +150,7 @@ bool run_protocol_tests() {
 
     // Overflow guards
     AudioConfig big{48000, 32, AudioSampleFormat::PCM_S32LE, 8192};
-    size_t payload = big.packet_payload_size(); // 8192*32*4 = 1,048,576 > max? but is_valid should reject >65507
+    [[maybe_unused]] size_t payload = big.packet_payload_size(); (void)payload; // 8192*32*4 = 1,048,576 > max? but is_valid should reject >65507
     TEST_ASSERT(!big.is_valid());
 
     return true;
