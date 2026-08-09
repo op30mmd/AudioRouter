@@ -1,7 +1,7 @@
 #include "../src/common/ring_buffer.hpp"
 #include <iostream>
 #include <vector>
-#include <span>
+#include "../src/common/span_compat.hpp"
 
 #define TEST_ASSERT(cond) do { \
     if (!(cond)) { \

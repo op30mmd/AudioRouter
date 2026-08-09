@@ -6,8 +6,8 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
-#include <span>
-#include <expected>
+#include "span_compat.hpp"
+#include "expected_compat.hpp"
 #include <limits>
 #include <concepts>
 #include <utility>
@@ -90,16 +90,16 @@ struct AudioConfig {
 
     [[nodiscard]] std::expected<void, std::string> validate() const noexcept {
         if (sample_rate == 0 || sample_rate > 192000)
-            return std::unexpected(std::string("invalid sample_rate"));
+            return std::unexpected<std::string>(std::string("invalid sample_rate"));
         if (channels == 0 || channels > 32)
-            return std::unexpected(std::string("invalid channels"));
+            return std::unexpected<std::string>(std::string("invalid channels"));
         if (frames_per_packet == 0 || frames_per_packet > 8192)
-            return std::unexpected(std::string("invalid frames_per_packet"));
+            return std::unexpected<std::string>(std::string("invalid frames_per_packet"));
         if (format == AudioSampleFormat::UNKNOWN)
-            return std::unexpected(std::string("unknown format"));
+            return std::unexpected<std::string>(std::string("unknown format"));
         size_t payload = packet_payload_size();
-        if (payload == 0) return std::unexpected(std::string("payload size overflow or zero"));
-        if (payload > 65507) return std::unexpected(std::string("payload exceeds max UDP"));
+        if (payload == 0) return std::unexpected<std::string>(std::string("payload size overflow or zero"));
+        if (payload > 65507) return std::unexpected<std::string>(std::string("payload exceeds max UDP"));
         return {};
     }
 

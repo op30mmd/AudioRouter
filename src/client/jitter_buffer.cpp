@@ -6,7 +6,7 @@
 #include <cstring>
 #include <algorithm>
 #include <limits>
-#include <span>
+#include "../common/span_compat.hpp"
 
 namespace audiorouter {
 
@@ -104,12 +104,12 @@ void JitterBuffer::reset_unlocked() noexcept {
 
 std::expected<bool, std::string> JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us,
                                                            std::span<const int16_t> pcm) noexcept {
-    if (pcm.empty()) return std::unexpected(std::string("empty pcm span"));
-    if (pcm.size() > 100000) return std::unexpected(std::string("pcm span unreasonably large"));
-    if (config_.channels == 0) return std::unexpected(std::string("not configured: channels==0"));
-    if (pcm.size() % config_.channels != 0) return std::unexpected(std::string("pcm size not multiple of channels"));
+    if (pcm.empty()) return std::unexpected<std::string>(std::string("empty pcm span"));
+    if (pcm.size() > 100000) return std::unexpected<std::string>(std::string("pcm span unreasonably large"));
+    if (config_.channels == 0) return std::unexpected<std::string>(std::string("not configured: channels==0"));
+    if (pcm.size() % config_.channels != 0) return std::unexpected<std::string>(std::string("pcm size not multiple of channels"));
     size_t frames = pcm.size() / config_.channels;
-    if (frames == 0 || frames > 8192) return std::unexpected(std::string("invalid frame count"));
+    if (frames == 0 || frames > 8192) return std::unexpected<std::string>(std::string("invalid frame count"));
 
     std::lock_guard<std::mutex> lock(mutex_);
     // delegate to unlocked helper

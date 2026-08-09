@@ -3,7 +3,7 @@
 #include <iostream>
 #include <cassert>
 #include <cstring>
-#include <span>
+#include "../src/common/span_compat.hpp"
 #include <array>
 #include <vector>
 

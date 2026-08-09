@@ -8,8 +8,8 @@
 #include <cstddef>
 #include <mutex>
 #include <atomic>
-#include <span>
-#include <expected>
+#include "../common/span_compat.hpp"
+#include "../common/expected_compat.hpp"
 #include <concepts>
 
 namespace audiorouter {

@@ -8,7 +8,19 @@
 #include <chrono>
 #include <iomanip>
 #include <ctime>
-#include <source_location>
+#if __has_include(<source_location>) && __cplusplus >= 202002L
+  #include <source_location>
+  #define AUDIOROUTER_HAS_SOURCE_LOCATION 1
+#else
+  #define AUDIOROUTER_HAS_SOURCE_LOCATION 0
+  namespace std {
+    struct source_location {
+      static source_location current() noexcept { return {}; }
+      const char* file_name() const noexcept { return ""; }
+      unsigned line() const noexcept { return 0; }
+    };
+  }
+#endif
 
 namespace audiorouter {
 

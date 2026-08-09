@@ -5,8 +5,8 @@
 #include <vector>
 #include <cstdint>
 #include <cstddef>
-#include <span>
-#include <expected>
+#include "span_compat.hpp"
+#include "expected_compat.hpp"
 #include <memory>
 #include <concepts>
 

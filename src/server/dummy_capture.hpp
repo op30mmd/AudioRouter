@@ -2,10 +2,9 @@
 
 #include "audio_capture.hpp"
 #include <atomic>
-#include <thread>
-#include <stop_token>
 #include <mutex>
 #include <vector>
+#include "../common/thread_compat.hpp"
 
 namespace audiorouter {
 
@@ -26,11 +25,11 @@ public:
     void set_frequency(double freq_hz) noexcept;
 
 private:
-    void worker_thread(std::stop_token st);
+    void worker_thread(audiorouter::stop_token st);
 
     double frequency_hz_;
     std::atomic<bool> is_running_{false};
-    std::jthread thread_;
+    audiorouter::jthread thread_;
     AudioCallback callback_;
     std::mutex callback_mutex_;
     AudioConfig config_{};

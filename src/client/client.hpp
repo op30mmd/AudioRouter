@@ -7,13 +7,12 @@
 #include "jitter_buffer.hpp"
 
 #include <atomic>
-#include <thread>
-#include <stop_token>
 #include <mutex>
 #include <string>
 #include <memory>
-#include <expected>
-#include <span>
+#include "../common/span_compat.hpp"
+#include "../common/expected_compat.hpp"
+#include "../common/thread_compat.hpp"
 
 namespace audiorouter {
 
@@ -27,9 +26,9 @@ struct ClientConfig {
     uint32_t reconnect_timeout_ms = 5000;
 
     [[nodiscard]] std::expected<void, std::string> validate() const noexcept {
-        if (server_ip.empty()) return std::unexpected(std::string("server_ip empty"));
-        if (server_port == 0) return std::unexpected(std::string("server_port 0"));
-        if (target_latency_ms < 5 || target_latency_ms > 500) return std::unexpected(std::string("target_latency_ms out of range"));
+        if (server_ip.empty()) return std::unexpected<std::string>(std::string("server_ip empty"));
+        if (server_port == 0) return std::unexpected<std::string>(std::string("server_port 0"));
+        if (target_latency_ms < 5 || target_latency_ms > 500) return std::unexpected<std::string>(std::string("target_latency_ms out of range"));
         return {};
     }
 };
@@ -76,9 +75,9 @@ private:
     [[nodiscard]] bool perform_handshake();
 
     // C++23 jthread workers — stop_token aware for cooperative cancellation
-    void network_receive_thread(std::stop_token st);
-    void audio_playback_thread(std::stop_token st);
-    void heartbeat_thread(std::stop_token st);
+    void network_receive_thread(audiorouter::stop_token st);
+    void audio_playback_thread(audiorouter::stop_token st);
+    void heartbeat_thread(audiorouter::stop_token st);
 
     ClientConfig config_;
     std::atomic<bool> is_running_{false};
@@ -97,10 +96,10 @@ private:
     ClientStats stats_{};
     mutable std::mutex stats_mutex_;
 
-    // C++23 cooperative threads — automatically joining, stop-aware
-    std::jthread net_thread_;
-    std::jthread playback_thread_;
-    std::jthread heartbeat_thread_;
+    // C++23 cooperative threads — automatically joining, stop-aware (compat fallback to std::thread)
+    audiorouter::jthread net_thread_;
+    audiorouter::jthread playback_thread_;
+    audiorouter::jthread heartbeat_thread_;
 };
 
 } // namespace audiorouter

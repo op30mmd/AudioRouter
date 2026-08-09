@@ -2,7 +2,7 @@
 #include <iostream>
 #include <vector>
 #include <cstring>
-#include <span>
+#include "../src/common/span_compat.hpp"
 #include <array>
 
 #define TEST_ASSERT(cond) do { \

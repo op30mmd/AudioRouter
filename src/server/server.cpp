@@ -6,7 +6,7 @@
 
 #include <cstring>
 #include <vector>
-#include <span>
+#include "../common/span_compat.hpp"
 #include <array>
 #include <limits>
 #include <algorithm>
@@ -83,8 +83,8 @@ bool AudioRouterServer::start() {
     is_running_.store(true);
     state_.store(ServerState::LISTENING);
 
-    net_thread_ = std::jthread([this](std::stop_token st){ this->network_receive_thread(st); });
-    watchdog_thread_ = std::jthread([this](std::stop_token st){ this->watchdog_thread(st); });
+    net_thread_ = audiorouter::jthread([this](audiorouter::stop_token st){ this->network_receive_thread(st); });
+    watchdog_thread_ = audiorouter::jthread([this](audiorouter::stop_token st){ this->watchdog_thread(st); });
 
     LOG_INFO("AudioRouter Server ready. Waiting for Android client connection.");
     return true;
@@ -126,7 +126,7 @@ SocketAddress AudioRouterServer::get_active_client() const {
     return active_client_;
 }
 
-void AudioRouterServer::network_receive_thread(std::stop_token st) {
+void AudioRouterServer::network_receive_thread(audiorouter::stop_token st) {
     std::vector<uint8_t> recv_buf(65536);
     (void)socket_.set_receive_timeout_ms(200);
     while (!st.stop_requested() && is_running_.load()) {
@@ -357,7 +357,7 @@ void AudioRouterServer::disconnect_client(const std::string& reason, bool send_a
     LOG_INFO("Server back in LISTENING state. Waiting for next client.");
 }
 
-void AudioRouterServer::watchdog_thread(std::stop_token st) {
+void AudioRouterServer::watchdog_thread(audiorouter::stop_token st) {
     while (!st.stop_requested() && is_running_.load()) {
         // sleep in 100ms increments to be stop-aware
         for (int i=0;i<5 && !st.stop_requested() && is_running_.load(); ++i) sleep_ms(100);

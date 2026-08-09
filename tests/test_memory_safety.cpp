@@ -6,7 +6,7 @@
 #include <iostream>
 #include <vector>
 #include <limits>
-#include <span>
+#include "../src/common/span_compat.hpp"
 #include <cstring>
 
 #define TEST_ASSERT(cond) do { if (!(cond)) { std::cerr << "Assertion failed: " #cond " at " << __FILE__ << ":" << __LINE__ << "\n"; return false; } } while(0)

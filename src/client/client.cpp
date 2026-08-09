@@ -7,7 +7,7 @@
 
 #include <cstring>
 #include <vector>
-#include <span>
+#include "../common/span_compat.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -97,9 +97,9 @@ bool AudioRouterClient::start() {
     last_packet_time_ms_.store(get_time_ms());
 
     // Launch cooperative C++23 jthreads — they auto-join and respect stop_token
-    net_thread_ = std::jthread([this](std::stop_token st){ this->network_receive_thread(st); });
-    playback_thread_ = std::jthread([this](std::stop_token st){ this->audio_playback_thread(st); });
-    heartbeat_thread_ = std::jthread([this](std::stop_token st){ this->heartbeat_thread(st); });
+    net_thread_ = audiorouter::jthread([this](audiorouter::stop_token st){ this->network_receive_thread(st); });
+    playback_thread_ = audiorouter::jthread([this](audiorouter::stop_token st){ this->audio_playback_thread(st); });
+    heartbeat_thread_ = audiorouter::jthread([this](audiorouter::stop_token st){ this->heartbeat_thread(st); });
 
     LOG_INFO("AudioRouter Client connected and streaming directly to Android speakers!");
     return true;
@@ -263,7 +263,7 @@ bool AudioRouterClient::perform_handshake() {
     return false;
 }
 
-void AudioRouterClient::network_receive_thread(std::stop_token st) {
+void AudioRouterClient::network_receive_thread(audiorouter::stop_token st) {
     std::vector<uint8_t> recv_buf(65536);
     (void)socket_.set_receive_timeout_ms(200);
 
@@ -318,7 +318,7 @@ void AudioRouterClient::network_receive_thread(std::stop_token st) {
     }
 }
 
-void AudioRouterClient::audio_playback_thread(std::stop_token st) {
+void AudioRouterClient::audio_playback_thread(audiorouter::stop_token st) {
     const size_t period_frames = audio_config_.frames_per_packet ? audio_config_.frames_per_packet : 240;
     const size_t channels = audio_config_.channels ? audio_config_.channels : 2;
     if (channels == 0 || channels > 32) return;
@@ -340,7 +340,7 @@ void AudioRouterClient::audio_playback_thread(std::stop_token st) {
     }
 }
 
-void AudioRouterClient::heartbeat_thread(std::stop_token st) {
+void AudioRouterClient::heartbeat_thread(audiorouter::stop_token st) {
     std::array<std::byte, sizeof(protocol::CommonHeader)+sizeof(protocol::HeartbeatPayload)> ping_buf{};
     while (!st.stop_requested() && is_running_.load()) {
         // sleep with stop awareness: check every 100ms

@@ -33,7 +33,7 @@ bool DummyCapture::start(const AudioConfig& desired_config, AudioConfig& actual_
     config_ = cfg;
     actual_config = config_;
     is_running_.store(true);
-    thread_ = std::jthread([this](std::stop_token st){ this->worker_thread(st); });
+    thread_ = audiorouter::jthread([this](audiorouter::stop_token st){ this->worker_thread(st); });
 
     LOG_INFO("DummyCapture: Test tone generator started at " << frequency_hz_ << " Hz (" << config_.to_string() << ")");
     return true;
@@ -66,7 +66,7 @@ void DummyCapture::set_frequency(double freq_hz) noexcept {
     }
 }
 
-void DummyCapture::worker_thread(std::stop_token st) {
+void DummyCapture::worker_thread(audiorouter::stop_token st) {
     double phase = 0.0;
     const double rate = static_cast<double>(config_.sample_rate ? config_.sample_rate : 48000);
     const size_t frames = config_.frames_per_packet ? config_.frames_per_packet : 480;

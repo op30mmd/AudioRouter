@@ -3,8 +3,8 @@
 #include "../src/common/socket_util.hpp"
 #include "../src/common/ring_buffer.hpp"
 #include <iostream>
-#include <span>
-#include <expected>
+#include "../src/common/span_compat.hpp"
+#include "../src/common/expected_compat.hpp"
 
 #define TEST_ASSERT(cond) do { if (!(cond)) { std::cerr << "Assertion failed: " #cond " at " << __FILE__ << ":" << __LINE__ << "\n"; return false; } } while(0)
 
@@ -169,7 +169,7 @@ bool run_type_safety_tests() {
     {
         std::expected<int, std::string> e = 42;
         TEST_ASSERT(e.has_value() && e.value()==42);
-        std::expected<int, std::string> err = std::unexpected(std::string("oops"));
+        std::expected<int, std::string> err = std::unexpected<std::string>(std::string("oops"));
         TEST_ASSERT(!err.has_value() && err.error()=="oops");
     }
 

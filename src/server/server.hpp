@@ -7,14 +7,13 @@
 #include "audio_endpoint_control.hpp"
 
 #include <atomic>
-#include <thread>
-#include <stop_token>
 #include <mutex>
 #include <vector>
 #include <memory>
 #include <string>
-#include <expected>
-#include <span>
+#include "../common/span_compat.hpp"
+#include "../common/expected_compat.hpp"
+#include "../common/thread_compat.hpp"
 
 namespace audiorouter {
 
@@ -31,11 +30,11 @@ struct ServerConfig {
     double test_tone_freq = 440.0;
 
     [[nodiscard]] std::expected<void, std::string> validate() const noexcept {
-        if (port == 0) return std::unexpected(std::string("port 0"));
-        if (sample_rate < 8000 || sample_rate > 192000) return std::unexpected(std::string("sample_rate out of range"));
-        if (channels == 0 || channels > 32) return std::unexpected(std::string("channels out of range"));
-        if (frames_per_packet == 0 || frames_per_packet > 8192) return std::unexpected(std::string("frames_per_packet out of range"));
-        if (client_timeout_ms < 500) return std::unexpected(std::string("client_timeout_ms too small"));
+        if (port == 0) return std::unexpected<std::string>(std::string("port 0"));
+        if (sample_rate < 8000 || sample_rate > 192000) return std::unexpected<std::string>(std::string("sample_rate out of range"));
+        if (channels == 0 || channels > 32) return std::unexpected<std::string>(std::string("channels out of range"));
+        if (frames_per_packet == 0 || frames_per_packet > 8192) return std::unexpected<std::string>(std::string("frames_per_packet out of range"));
+        if (client_timeout_ms < 500) return std::unexpected<std::string>(std::string("client_timeout_ms too small"));
         return {};
     }
 };
@@ -68,8 +67,8 @@ public:
     [[nodiscard]] SocketAddress get_active_client() const;
 
 private:
-    void network_receive_thread(std::stop_token st);
-    void watchdog_thread(std::stop_token st);
+    void network_receive_thread(audiorouter::stop_token st);
+    void watchdog_thread(audiorouter::stop_token st);
     void on_audio_captured(const void* data, size_t num_frames, const AudioConfig& config);
 
     void handle_discovery_req(const protocol::CommonHeader& hdr, const SocketAddress& sender);
@@ -97,8 +96,8 @@ private:
     mutable std::mutex stats_mutex_;
     mutable std::mutex client_mutex_;
 
-    std::jthread net_thread_;
-    std::jthread watchdog_thread_;
+    audiorouter::jthread net_thread_;
+    audiorouter::jthread watchdog_thread_;
 
     std::vector<uint8_t> chunk_buffer_;
     std::mutex chunk_mutex_;
