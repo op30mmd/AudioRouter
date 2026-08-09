@@ -33,6 +33,9 @@ bool run_ring_buffer_tests();
 bool run_jitter_buffer_tests();
 bool run_socket_tests();
 bool run_conversion_tests();
+bool run_thread_safety_tests();
+bool run_type_safety_tests();
+bool run_memory_safety_tests();
 
 int main(int argc, char* argv[]) {
     (void)argc;
@@ -48,6 +51,9 @@ int main(int argc, char* argv[]) {
     test::register_test("Adaptive Jitter Buffer & PLC", run_jitter_buffer_tests);
     test::register_test("Socket & Network Address Parsing", run_socket_tests);
     test::register_test("Audio Converter & Downmixing", run_conversion_tests);
+    test::register_test("Thread Safety Verification", run_thread_safety_tests);
+    test::register_test("Type Safety Verification", run_type_safety_tests);
+    test::register_test("Memory Safety Verification", run_memory_safety_tests);
 
     int passed = 0;
     int failed = 0;

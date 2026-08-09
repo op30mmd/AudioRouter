@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <stdexcept>
 #include "span_compat.hpp"
 #include "expected_compat.hpp"
 #include <concepts>
