@@ -8,6 +8,9 @@
 #include <cstddef>
 #include <mutex>
 #include <atomic>
+#include "../common/span_compat.hpp"
+#include "../common/expected_compat.hpp"
+#include <concepts>
 
 namespace audiorouter {
 
@@ -24,26 +27,42 @@ struct JitterBufferStats {
 
 class JitterBuffer {
 public:
-    explicit JitterBuffer(uint32_t target_latency_ms = 35);
+    explicit JitterBuffer(uint32_t target_latency_ms = 35) noexcept;
     ~JitterBuffer() = default;
 
+    // Non-copyable, movable
+    JitterBuffer(const JitterBuffer&) = delete;
+    JitterBuffer& operator=(const JitterBuffer&) = delete;
+    JitterBuffer(JitterBuffer&&) noexcept;
+    JitterBuffer& operator=(JitterBuffer&&) noexcept;
+
     void configure(const AudioConfig& config, uint32_t target_latency_ms);
-    void reset();
+    void reset() noexcept;
 
-    // Push an incoming audio packet into the jitter buffer
-    bool push_packet(uint32_t seq_num, uint64_t timestamp_us, const void* pcm_data, size_t num_frames);
+    // C++23 span-based API — preferred, bounds-checked
+    [[nodiscard]] audiorouter::expected<bool, std::string> push_packet(uint32_t seq_num, uint64_t timestamp_us,
+                                                               std::span<const int16_t> pcm) noexcept;
+    // Legacy raw pointer API — hardened
+    bool push_packet(uint32_t seq_num, uint64_t timestamp_us, const void* pcm_data, size_t num_frames) noexcept;
 
-    // Read audio frames for ALSA playback. Returns number of frames provided.
-    size_t pop_frames(int16_t* dest, size_t num_frames);
+    // Pop frames — span version
+    size_t pop_frames(std::span<int16_t> dest) noexcept;
+    // Legacy
+    size_t pop_frames(int16_t* dest, size_t num_frames) noexcept;
 
-    bool is_ready() const;
-    size_t available_frames() const;
-    double available_duration_ms() const;
-    JitterBufferStats get_stats() const;
+    [[nodiscard]] bool is_ready() const noexcept;
+    [[nodiscard]] size_t available_frames() const noexcept;
+    [[nodiscard]] double available_duration_ms() const noexcept;
+    [[nodiscard]] JitterBufferStats get_stats() const noexcept;
+
+    // Validation helper
+    [[nodiscard]] bool is_configured() const noexcept { return config_.is_valid(); }
 
 private:
-    size_t available_frames_unlocked() const;
-    double available_duration_ms_unlocked() const;
+    size_t available_frames_unlocked() const noexcept;
+    double available_duration_ms_unlocked() const noexcept;
+    void reset_unlocked() noexcept;
+    bool push_packet_unlocked(uint32_t seq_num, uint64_t timestamp_us, std::span<const int16_t> pcm) noexcept;
 
     struct PacketSlot {
         uint32_t seq_num = 0;
@@ -55,22 +74,20 @@ private:
 
     static constexpr size_t MAX_SLOTS = 256;
 
-    AudioConfig config_;
-    uint32_t target_latency_ms_;
-    size_t target_buffer_frames_;
+    AudioConfig config_{};
+    uint32_t target_latency_ms_ = 35;
+    size_t target_buffer_frames_ = 0;
 
     std::vector<PacketSlot> slots_;
-    uint32_t next_play_seq_;
-    bool has_first_packet_;
-    bool is_buffering_;
+    uint32_t next_play_seq_ = 0;
+    bool has_first_packet_ = false;
+    bool is_buffering_ = true;
+    size_t slot_frame_offset_ = 0;
 
-    // Partial frame consumption within current slot
-    size_t slot_frame_offset_;
-
-    // Metrics & Skew tracking
-    JitterBufferStats stats_;
-    uint64_t last_arrival_timestamp_us_;
-    double jitter_estimate_us_;
+    JitterBufferStats stats_{};
+    uint64_t last_arrival_timestamp_us_ = 0;
+    double jitter_estimate_us_ = 0.0;
+    int64_t last_transit_ = 0; // per-instance, not static
     mutable std::mutex mutex_;
 };
 
