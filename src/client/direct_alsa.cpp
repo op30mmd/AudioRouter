@@ -59,8 +59,25 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
     }
 
     if (fd_ < 0) {
-        LOG_ERROR("DirectAlsaPlayer: Failed to open device '" << device_path_
-                  << "': " << strerror(errno) << " (Are you running with root privileges 'su' in Termux?)");
+        // Scan for any other available pcmC*D*p nodes if the default node fails to open
+        LOG_WARN("Could not open standard /dev/snd/pcmC0D0p. Scanning for available kernel PCM devices...");
+        std::vector<std::string> available_devices = enumerate_kernel_pcm_devices();
+        for (const auto& dev : available_devices) {
+            if (dev != "/dev/snd/pcmC0D0p") {
+                LOG_INFO("Trying fallback kernel device: " << dev);
+                fd_ = ::open(dev.c_str(), O_RDWR);
+                if (fd_ >= 0) {
+                    device_path_ = dev;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (fd_ < 0) {
+        LOG_ERROR("DirectAlsaPlayer: Failed to open any kernel PCM device in /dev/snd/. "
+                  << "Last error for '" << device_path_ << "': " << strerror(errno)
+                  << " (Are you running with root privileges 'su' in Termux?)");
         return false;
     }
 
