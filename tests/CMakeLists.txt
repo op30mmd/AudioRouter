@@ -5,6 +5,9 @@ set(TEST_SOURCES
     test_jitter_buffer.cpp
     test_socket.cpp
     test_conversion.cpp
+    test_thread_safety.cpp
+    test_type_safety.cpp
+    test_memory_safety.cpp
     ../src/client/jitter_buffer.cpp
     ../src/common/socket_util.cpp
 )
