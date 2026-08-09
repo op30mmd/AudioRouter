@@ -162,8 +162,8 @@ void AudioRouterServer::network_receive_thread() {
         }
 
         const auto* hdr = reinterpret_cast<const protocol::CommonHeader*>(recv_buf.data());
-        if (hdr->magic != protocol::MAGIC || hdr->version != protocol::CURRENT_VERSION) {
-            continue; // Not an AudioRouter packet
+        if (!protocol::is_valid_header(*hdr, static_cast<size_t>(bytes_read))) {
+            continue; // Not an AudioRouter packet or invalid
         }
 
         const uint8_t* payload = recv_buf.data() + sizeof(protocol::CommonHeader);

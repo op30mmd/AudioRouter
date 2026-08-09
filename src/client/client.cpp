@@ -209,10 +209,9 @@ bool AudioRouterClient::discover_server(SocketAddress& out_server_addr) {
         int bytes = socket_.receive_from(recv_buf.data(), recv_buf.size(), responder);
         if (bytes >= static_cast<int>(sizeof(protocol::CommonHeader) + sizeof(protocol::DiscoveryRespPayload))) {
             const auto* resp_hdr = reinterpret_cast<const protocol::CommonHeader*>(recv_buf.data());
-            const auto* resp_pay = reinterpret_cast<const protocol::DiscoveryRespPayload*>(recv_buf.data() + sizeof(protocol::CommonHeader));
-
-            if (resp_hdr->magic == protocol::MAGIC &&
+            if (protocol::is_valid_header(*resp_hdr, static_cast<size_t>(bytes)) &&
                 resp_hdr->msg_type == static_cast<uint8_t>(protocol::MsgType::DISCOVERY_RESP)) {
+                const auto* resp_pay = reinterpret_cast<const protocol::DiscoveryRespPayload*>(recv_buf.data() + sizeof(protocol::CommonHeader));
                 out_server_addr = responder;
                 LOG_INFO("Discovered server '" << resp_pay->server_name << "' at " << responder.to_string()
                          << " (PC Muted: " << (resp_pay->pc_muted ? "Yes" : "No") << ")");
@@ -258,7 +257,7 @@ bool AudioRouterClient::perform_handshake() {
 
         if (bytes >= static_cast<int>(sizeof(protocol::CommonHeader))) {
             const auto* hdr = reinterpret_cast<const protocol::CommonHeader*>(recv_buf.data());
-            if (hdr->magic != protocol::MAGIC) continue;
+            if (!protocol::is_valid_header(*hdr, static_cast<size_t>(bytes))) continue;
 
             if (hdr->msg_type == static_cast<uint8_t>(protocol::MsgType::CONNECT_ACK)) {
                 if (bytes >= static_cast<int>(sizeof(protocol::CommonHeader) + sizeof(protocol::ConnectAckPayload))) {
@@ -308,7 +307,7 @@ void AudioRouterClient::network_receive_thread() {
         if (static_cast<size_t>(bytes) < sizeof(protocol::CommonHeader)) continue;
 
         const auto* hdr = reinterpret_cast<const protocol::CommonHeader*>(recv_buf.data());
-        if (hdr->magic != protocol::MAGIC || hdr->version != protocol::CURRENT_VERSION) continue;
+        if (!protocol::is_valid_header(*hdr, static_cast<size_t>(bytes))) continue;
 
         last_packet_time_ms_ = get_time_ms();
 
@@ -323,14 +322,18 @@ void AudioRouterClient::network_receive_thread() {
         if (msg_type == protocol::MsgType::AUDIO_DATA) {
             if (static_cast<size_t>(bytes) >= sizeof(protocol::AudioPacketHeader)) {
                 const auto* audio_hdr = reinterpret_cast<const protocol::AudioPacketHeader*>(recv_buf.data());
-                const void* pcm_data = recv_buf.data() + sizeof(protocol::AudioPacketHeader);
+                if (protocol::validate_audio_header(*audio_hdr, static_cast<size_t>(bytes))) {
+                    const void* pcm_data = recv_buf.data() + sizeof(protocol::AudioPacketHeader);
 
-                jitter_buffer_.push_packet(
-                    audio_hdr->common.seq_num,
-                    audio_hdr->common.timestamp_us,
-                    pcm_data,
-                    audio_hdr->num_frames
-                );
+                    jitter_buffer_.push_packet(
+                        audio_hdr->common.seq_num,
+                        audio_hdr->common.timestamp_us,
+                        pcm_data,
+                        audio_hdr->num_frames
+                    );
+                } else {
+                    LOG_WARN("Discarded invalid/malformed audio packet.");
+                }
             }
         } else if (msg_type == protocol::MsgType::HEARTBEAT_PONG) {
             if (static_cast<size_t>(bytes) >= sizeof(protocol::CommonHeader) + sizeof(protocol::HeartbeatPayload)) {
