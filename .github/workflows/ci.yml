@@ -1,0 +1,197 @@
+name: CI / CD & Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-test-linux:
+    name: Build & Test (Linux & Android ARM64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies & aarch64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake make g++ gcc-aarch64-linux-gnu g++-aarch64-linux-gnu zip
+
+      - name: Build host tests & binaries
+        run: |
+          cmake -B build-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-host --config Release --parallel
+
+      - name: Run Unit Tests
+        run: |
+          ctest --test-dir build-host --output-on-failure
+
+      - name: Build Android / Termux ARM64 Client
+        run: |
+          NDK_PATH=""
+          if [ -n "$ANDROID_NDK_LATEST_HOME" ] && [ -d "$ANDROID_NDK_LATEST_HOME" ]; then
+            NDK_PATH="$ANDROID_NDK_LATEST_HOME"
+          elif [ -n "$ANDROID_NDK_HOME" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+            NDK_PATH="$ANDROID_NDK_HOME"
+          elif [ -d "$ANDROID_SDK_ROOT/ndk" ]; then
+            NDK_PATH=$(ls -d "$ANDROID_SDK_ROOT/ndk/"* 2>/dev/null | sort -V | tail -n 1)
+          fi
+
+          if [ -n "$NDK_PATH" ] && [ -f "$NDK_PATH/build/cmake/android.toolchain.cmake" ]; then
+            echo "Building with Android NDK toolchain at: $NDK_PATH"
+            cmake -B build-android-arm64 \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI=arm64-v8a \
+              -DANDROID_PLATFORM=android-24 \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build build-android-arm64 --target audiorouter_client --parallel
+            
+            mkdir -p staging-arm64
+            cp build-android-arm64/src/client/audiorouter_client staging-arm64/audiorouter_client
+          else
+            echo "Building with aarch64-linux-gnu-g++"
+            mkdir -p staging-arm64
+            aarch64-linux-gnu-g++ -std=c++17 -O3 -Wall -Wextra \
+              -Isrc/common -Isrc/client \
+              src/client/main.cpp \
+              src/client/client.cpp \
+              src/client/alsa_player.cpp \
+              src/client/direct_alsa.cpp \
+              src/client/dummy_player.cpp \
+              src/client/jitter_buffer.cpp \
+              src/client/android_helpers.cpp \
+              src/common/socket_util.cpp \
+              -o staging-arm64/audiorouter_client \
+              -lpthread -ldl
+          fi
+
+          # Copy Termux runtime scripts & docs
+          cp scripts/termux_setup.sh staging-arm64/
+          cp scripts/termux_run.sh staging-arm64/
+          cp scripts/android_mixer_setup.sh staging-arm64/
+          cp README.md staging-arm64/
+          cp LICENSE staging-arm64/
+          chmod +x staging-arm64/*.sh staging-arm64/audiorouter_client
+
+      - name: Upload Android ARM64 Client Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audiorouter_client_android_arm64
+          path: staging-arm64/
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows Server (x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: |
+          cmake -B build-win -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Windows Server
+        run: |
+          cmake --build build-win --config Release --target audiorouter_server --parallel
+
+      - name: Stage Windows Artifacts
+        shell: bash
+        run: |
+          mkdir -p staging-win
+          cp build-win/src/server/Release/audiorouter_server.exe staging-win/
+          cp scripts/build_server_msvc.bat staging-win/
+          cp scripts/build_server_mingw.bat staging-win/
+          cp README.md staging-win/
+          cp LICENSE staging-win/
+
+      - name: Upload Windows Server Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audiorouter_server_windows_x64
+          path: staging-win/
+          if-no-files-found: error
+
+  release:
+    name: Generate Tag & Publish Release
+    needs: [build-and-test-linux, build-windows]
+    runs-on: ubuntu-latest
+    # Only run on push to main or manual trigger, NEVER on pull requests
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Android ARM64 Client Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: audiorouter_client_android_arm64
+          path: release-staging/client-arm64
+
+      - name: Download Windows Server Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: audiorouter_server_windows_x64
+          path: release-staging/server-win
+
+      - name: Generate Automatic Tag & Archives
+        id: tag_gen
+        run: |
+          VERSION_TAG="v1.0.${{ github.run_number }}"
+          echo "Generated Tag: $VERSION_TAG"
+          echo "tag_name=$VERSION_TAG" >> "$GITHUB_OUTPUT"
+
+          # Package Windows zip
+          cd release-staging/server-win
+          zip -r "../../audiorouter-$VERSION_TAG-windows-x64.zip" .
+          cd ../..
+
+          # Package Android Termux tar.gz
+          cd release-staging/client-arm64
+          tar -czvf "../../audiorouter-$VERSION_TAG-android-termux-arm64.tar.gz" .
+          cd ../..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.tag_gen.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          name: "AudioRouter ${{ steps.tag_gen.outputs.tag_name }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            audiorouter-*.zip
+            audiorouter-*.tar.gz
+          body: |
+            ## 🎵 AudioRouter ${{ steps.tag_gen.outputs.tag_name }}
+            
+            High-performance audio streaming engine from Windows PC to Android Termux (ALSA / Root).
+
+            ### 📦 Release Assets
+            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-windows-x64.zip`**: Windows PC Server (`audiorouter_server.exe` with WASAPI Loopback Capture and Endpoint Volume muting).
+            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-android-termux-arm64.tar.gz`**: Android ARM64 Client for Termux (`audiorouter_client` with dual ALSA & direct `/dev/snd/` support).
+
+            ### 🚀 Quick Start
+            1. **Windows PC**: Run `audiorouter_server.exe`
+            2. **Android Termux (Root)**:
+               ```bash
+               su
+               ./audiorouter_client -s <PC_IP> -p 44100
+               ```
