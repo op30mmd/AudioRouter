@@ -34,7 +34,7 @@ bool AudioRouterClient::start() {
         LOG_INFO("Running with root privileges (UID 0). Direct ALSA access enabled.");
         AndroidHelpers::fix_snd_permissions();
     } else {
-        LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'tsu' in Termux.");
+        LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'sudo' in Termux.");
     }
 
     // Open UDP Socket

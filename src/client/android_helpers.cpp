@@ -84,7 +84,7 @@ bool AndroidHelpers::run_tinymix_command(const std::string& control_name, const 
 
 void AndroidHelpers::print_android_troubleshooting_tips() {
     LOG_INFO("=== Android ALSA / Termux Root Tips ===");
-    LOG_INFO("1. Make sure to run Termux with root: type 'su' or 'tsu' before launching.");
+    LOG_INFO("1. Make sure to run Termux with root: type 'su' or 'sudo' before launching.");
     LOG_INFO("2. If no sound is heard on the phone speaker:");
     LOG_INFO("   - Check '/proc/asound/cards' to see the audio card name.");
     LOG_INFO("   - Check available nodes in '/dev/snd/'. Usually '/dev/snd/pcmC0D0p' is Card 0 Device 0 Playback.");

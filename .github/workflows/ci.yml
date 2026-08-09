@@ -113,8 +113,6 @@ jobs:
         run: |
           mkdir -p staging-win
           cp build-win/src/server/Release/audiorouter_server.exe staging-win/
-          cp scripts/build_server_msvc.bat staging-win/
-          cp scripts/build_server_mingw.bat staging-win/
           cp README.md staging-win/
           cp LICENSE staging-win/
 

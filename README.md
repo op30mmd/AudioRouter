@@ -143,7 +143,7 @@ Inside Termux on your Android phone:
 git clone https://github.com/op30mmd/AudioRouter.git
 cd AudioRouter
 
-# 2. Run automated setup script (installs clang, make, alsa-lib, tsu)
+# 2. Run automated setup script (installs clang, make, alsa-lib, sudo)
 chmod +x scripts/*.sh
 ./scripts/termux_setup.sh
 ```
