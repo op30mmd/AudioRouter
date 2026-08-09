@@ -28,9 +28,6 @@ target_include_directories(audiorouter_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../common
 )
 
-target_compile_features(audiorouter_server PRIVATE cxx_std_23)
-set_target_properties(audiorouter_server PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-
 if (WIN32)
     target_link_libraries(audiorouter_server PRIVATE
         ws2_32

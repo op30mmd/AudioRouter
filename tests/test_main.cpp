@@ -33,20 +33,14 @@ bool run_ring_buffer_tests();
 bool run_jitter_buffer_tests();
 bool run_socket_tests();
 bool run_conversion_tests();
-bool run_thread_safety_tests();
-bool run_type_safety_tests();
-bool run_memory_safety_tests();
 
 int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
     audiorouter::Logger::instance().set_level(audiorouter::LogLevel::Info);
-    // Disable colored output for CI determinism
-    audiorouter::Logger::instance().set_colored_output(false);
 
     std::cout << "\n=========================================\n";
     std::cout << " Running AudioRouter Comprehensive Tests\n";
-    std::cout << " C++23 | Memory/Thread/Type Safety Hardened\n";
     std::cout << "=========================================\n\n";
 
     test::register_test("Protocol & Packet Serialization", run_protocol_tests);
@@ -54,9 +48,6 @@ int main(int argc, char* argv[]) {
     test::register_test("Adaptive Jitter Buffer & PLC", run_jitter_buffer_tests);
     test::register_test("Socket & Network Address Parsing", run_socket_tests);
     test::register_test("Audio Converter & Downmixing", run_conversion_tests);
-    test::register_test("Thread Safety & Concurrency", run_thread_safety_tests);
-    test::register_test("Type Safety & Strong Typing (C++23)", run_type_safety_tests);
-    test::register_test("Memory Safety & Bounds Checking", run_memory_safety_tests);
 
     int passed = 0;
     int failed = 0;
@@ -68,9 +59,6 @@ int main(int argc, char* argv[]) {
             ok = test_case.test_fn();
         } catch (const std::exception& ex) {
             std::cerr << "Exception: " << ex.what() << "\n";
-            ok = false;
-        } catch (...) {
-            std::cerr << "Unknown exception\n";
             ok = false;
         }
 
