@@ -9,6 +9,83 @@
 
 #if defined(__linux__) || defined(__ANDROID__)
     #include <sound/asound.h>
+
+namespace {
+
+// Fill an snd_pcm_hw_params struct with "any" masks/intervals, i.e. no
+// constraints, exactly like alsa-lib's snd_pcm_hw_params_any().
+void init_any_params(struct snd_pcm_hw_params& params) {
+    std::memset(&params, 0, sizeof(params));
+
+    for (int k = SNDRV_PCM_HW_PARAM_FIRST_MASK; k <= SNDRV_PCM_HW_PARAM_LAST_MASK; ++k) {
+        auto& mask = params.masks[k - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+        for (size_t b = 0; b < sizeof(mask.bits) / sizeof(mask.bits[0]); ++b) {
+            mask.bits[b] = 0xFFFFFFFFu;
+        }
+    }
+
+    for (int k = SNDRV_PCM_HW_PARAM_FIRST_INTERVAL; k <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL; ++k) {
+        auto& iv = params.intervals[k - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        iv.min = 0;
+        iv.max = UINT32_MAX;
+        iv.openmin = 0;
+        iv.openmax = 0;
+        iv.integer = 0;
+        iv.empty = 0;
+    }
+}
+
+// Set a single hw param to an exact value.
+void set_param_value(struct snd_pcm_hw_params& params, int param, unsigned int value) {
+    if (param >= SNDRV_PCM_HW_PARAM_FIRST_MASK && param <= SNDRV_PCM_HW_PARAM_LAST_MASK) {
+        auto& mask = params.masks[param - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+        for (size_t b = 0; b < sizeof(mask.bits) / sizeof(mask.bits[0]); ++b) {
+            mask.bits[b] = 0;
+        }
+        mask.bits[value / 32] = (1u << (value % 32));
+    } else if (param >= SNDRV_PCM_HW_PARAM_FIRST_INTERVAL && param <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL) {
+        auto& iv = params.intervals[param - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        iv.min = value;
+        iv.max = value;
+    }
+}
+
+// Re-open the primary candidate and ask the kernel (HW_REFINE with "any"
+// params) what this device actually supports, so failures become actionable.
+void log_device_capabilities(const std::vector<std::string>& candidates, const std::string& last_error) {
+    if (candidates.empty()) return;
+
+    const std::string& probe_path = candidates.front();
+    int probe_fd = ::open(probe_path.c_str(), O_RDWR);
+    if (probe_fd < 0) {
+        LOG_DEBUG("DirectAlsaPlayer: Could not re-open '" << probe_path << "' for capability probe: " << strerror(errno));
+        return;
+    }
+
+    struct snd_pcm_hw_params probe;
+    init_any_params(probe);
+    if (ioctl(probe_fd, SNDRV_PCM_IOCTL_HW_REFINE, &probe) == 0) {
+        const auto& rate = probe.intervals[SNDRV_PCM_HW_PARAM_RATE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        const auto& channels = probe.intervals[SNDRV_PCM_HW_PARAM_CHANNELS - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        const auto& period = probe.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        const auto& buffer = probe.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        const auto& access = probe.masks[SNDRV_PCM_HW_PARAM_ACCESS - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+        const auto& formats = probe.masks[SNDRV_PCM_HW_PARAM_FORMAT - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+
+        LOG_WARN("DirectAlsaPlayer: Device '" << probe_path << "' capabilities (probe failed with: " << last_error << "):");
+        LOG_WARN("  rate [" << rate.min << ", " << rate.max << "] Hz, channels [" << channels.min << ", " << channels.max
+                 << "], period [" << period.min << ", " << period.max << "] frames, buffer [" << buffer.min << ", "
+                 << buffer.max << "] frames");
+        LOG_WARN("  supports RW_INTERLEAVED: " << ((access.bits[SNDRV_PCM_ACCESS_RW_INTERLEAVED / 32] >> (SNDRV_PCM_ACCESS_RW_INTERLEAVED % 32)) & 1u)
+                 << ", supports S16_LE: " << ((formats.bits[SNDRV_PCM_FORMAT_S16_LE / 32] >> (SNDRV_PCM_FORMAT_S16_LE % 32)) & 1u));
+    } else {
+        LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_REFINE probe failed for '" << probe_path << "': " << strerror(errno));
+    }
+
+    ::close(probe_fd);
+}
+
+} // namespace
 #endif
 
 namespace audiorouter {
@@ -71,58 +148,70 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
     }
 
     bool success = false;
+    std::string last_error;
     for (const auto& candidate : candidates) {
         fd_ = ::open(candidate.c_str(), O_RDWR);
         if (fd_ < 0) {
+            last_error = "open: " + std::string(strerror(errno));
             continue;
         }
 
         // Set hardware parameters via ioctl
         struct snd_pcm_hw_params params;
-        std::memset(&params, 0, sizeof(params));
+        init_any_params(params);
 
-        // Initialize hw params mask/intervals to any
-        for (int i = 0; i <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL; ++i) {
-            params.intervals[i - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = 0;
-            params.intervals[i - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = UINT32_MAX;
-        }
-        for (int i = 0; i <= SNDRV_PCM_HW_PARAM_LAST_MASK; ++i) {
-            params.masks[i - SNDRV_PCM_HW_PARAM_FIRST_MASK].bits[0] = 0xFFFFFFFF;
-            params.masks[i - SNDRV_PCM_HW_PARAM_FIRST_MASK].bits[1] = 0xFFFFFFFF;
-        }
-
-        // Access: RW interleaved
-        params.masks[SNDRV_PCM_HW_PARAM_ACCESS - SNDRV_PCM_HW_PARAM_FIRST_MASK].bits[0] = (1 << SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+        // Access: RW interleaved (required for SNDRV_PCM_IOCTL_WRITEI_FRAMES)
+        set_param_value(params, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
 
         // Format: S16_LE
-        params.masks[SNDRV_PCM_HW_PARAM_FORMAT - SNDRV_PCM_HW_PARAM_FIRST_MASK].bits[0] = (1 << SNDRV_PCM_FORMAT_S16_LE);
+        set_param_value(params, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
 
-        // Channels
-        params.intervals[SNDRV_PCM_HW_PARAM_CHANNELS - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = config_.channels;
-        params.intervals[SNDRV_PCM_HW_PARAM_CHANNELS - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = config_.channels;
+        // Channels (exact - stream is stereo)
+        set_param_value(params, SNDRV_PCM_HW_PARAM_CHANNELS, config_.channels);
 
-        // Rate
-        params.intervals[SNDRV_PCM_HW_PARAM_RATE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = config_.sample_rate;
-        params.intervals[SNDRV_PCM_HW_PARAM_RATE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = config_.sample_rate;
+        // Rate (exact - this path performs no resampling)
+        set_param_value(params, SNDRV_PCM_HW_PARAM_RATE, config_.sample_rate);
 
-        // Period size & buffer size
-        period_size_frames_ = config_.frames_per_packet > 0 ? config_.frames_per_packet : 240;
-        buffer_size_frames_ = period_size_frames_ * 4;
+        // Period & buffer size: prefer near-requested sizes, but many Android
+        // devices have rigid constraints (e.g. period must be 1024 frames,
+        // buffer a multiple of 4096). If the tight range is rejected, retry
+        // with period/buffer unconstrained and let the kernel pick values.
+        const unsigned int period_req = config_.frames_per_packet > 0 ? static_cast<unsigned int>(config_.frames_per_packet) : 240;
+        const unsigned int buffer_req = period_req * 4;
 
-        params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = static_cast<unsigned int>(period_size_frames_);
-        params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = static_cast<unsigned int>(period_size_frames_ * 2);
-        params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = static_cast<unsigned int>(buffer_size_frames_);
-        params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = static_cast<unsigned int>(buffer_size_frames_ * 4);
+        params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = period_req;
+        params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = period_req * 2;
+        params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = buffer_req;
+        params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = buffer_req * 4;
 
         if (ioctl(fd_, SNDRV_PCM_IOCTL_HW_PARAMS, &params) < 0) {
-            LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_PARAMS failed for candidate " << candidate << ": " << strerror(errno));
-            ::close(fd_);
-            fd_ = -1;
-            continue;
+            last_error = "hw_params: " + std::string(strerror(errno));
+            LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_PARAMS with requested period/buffer failed for candidate "
+                      << candidate << ": " << strerror(errno) << ". Retrying with unconstrained period/buffer...");
+
+            init_any_params(params);
+            set_param_value(params, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+            set_param_value(params, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+            set_param_value(params, SNDRV_PCM_HW_PARAM_CHANNELS, config_.channels);
+            set_param_value(params, SNDRV_PCM_HW_PARAM_RATE, config_.sample_rate);
+
+            if (ioctl(fd_, SNDRV_PCM_IOCTL_HW_PARAMS, &params) < 0) {
+                last_error = "hw_params (relaxed): " + std::string(strerror(errno));
+                LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_PARAMS failed for candidate " << candidate << ": " << strerror(errno));
+                ::close(fd_);
+                fd_ = -1;
+                continue;
+            }
         }
+
+        // The kernel copies the chosen configuration back into 'params' (the
+        // ioctl is _IOWR). Read back the values it actually selected.
+        period_size_frames_ = params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+        buffer_size_frames_ = params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
 
         // Prepare PCM
         if (ioctl(fd_, SNDRV_PCM_IOCTL_PREPARE) < 0) {
+            last_error = "prepare: " + std::string(strerror(errno));
             LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_PREPARE failed for candidate " << candidate << ": " << strerror(errno));
             ::close(fd_);
             fd_ = -1;
@@ -135,12 +224,15 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
     }
 
     if (!success) {
-        LOG_ERROR("DirectAlsaPlayer: Failed to open and configure any fallback kernel PCM devices in /dev/snd/ (Last error: " << strerror(errno) << ")");
+        log_device_capabilities(candidates, last_error);
+        LOG_ERROR("DirectAlsaPlayer: Failed to open and configure any fallback kernel PCM devices in /dev/snd/ (Last error: " << last_error << ")");
         return false;
     }
 
     is_open_ = true;
-    LOG_INFO("DirectAlsaPlayer: Successfully opened and configured kernel ALSA device '" << device_path_ << "' (" << config_.to_string() << ")");
+    LOG_INFO("DirectAlsaPlayer: Successfully opened and configured kernel ALSA device '" << device_path_
+             << "' (" << config_.to_string() << ", period " << period_size_frames_
+             << " frames, buffer " << buffer_size_frames_ << " frames)");
     return true;
 #else
     LOG_INFO("DirectAlsaPlayer: Mock open on non-Linux platform");

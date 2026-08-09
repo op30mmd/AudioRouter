@@ -141,44 +141,23 @@ bool AlsaPlayer::open(const AudioConfig& config, const std::string& device_name)
 
 #if defined(__linux__) || defined(__ANDROID__)
     if (impl_->load_libasound()) {
-        const int SND_PCM_STREAM_PLAYBACK_VAL = 0;
-        const int SND_PCM_ACCESS_RW_INTERLEAVED_VAL = 3;
-        const int SND_PCM_FORMAT_S16_LE_VAL = 2;
+        // Try the requested device first, then fall back to other libasound
+        // names. On Termux the default 'default' device is routed through the
+        // PulseAudio plugin, which fails with "Connection refused" when no
+        // PulseAudio server is running; 'plughw:0,0' opens the hardware
+        // directly (with the plug layer doing rate/format conversion) and
+        // avoids PulseAudio entirely.
+        std::vector<std::string> dev_candidates;
+        dev_candidates.push_back(device_name_);
+        if (device_name_ != "plughw:0,0") {
+            dev_candidates.push_back("plughw:0,0");
+        }
+        if (device_name_ != "hw:0,0") {
+            dev_candidates.push_back("hw:0,0");
+        }
 
-        int err = impl_->snd_pcm_open(&impl_->pcm_handle, device_name_.c_str(), SND_PCM_STREAM_PLAYBACK_VAL, 0);
-        if (err < 0) {
-            LOG_WARN("AlsaPlayer: snd_pcm_open failed for '" << device_name_ << "': "
-                     << impl_->snd_strerror(err) << ". Trying fallback to Direct Kernel driver...");
-        } else {
-            void* hw_params = nullptr;
-            impl_->snd_pcm_hw_params_malloc(&hw_params);
-            impl_->snd_pcm_hw_params_any(impl_->pcm_handle, hw_params);
-            impl_->snd_pcm_hw_params_set_access(impl_->pcm_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED_VAL);
-            impl_->snd_pcm_hw_params_set_format(impl_->pcm_handle, hw_params, SND_PCM_FORMAT_S16_LE_VAL);
-            impl_->snd_pcm_hw_params_set_channels(impl_->pcm_handle, hw_params, config_.channels);
-
-            unsigned int rate = config_.sample_rate;
-            int dir = 0;
-            impl_->snd_pcm_hw_params_set_rate_near(impl_->pcm_handle, hw_params, &rate, &dir);
-
-            unsigned long period_size = config_.frames_per_packet > 0 ? config_.frames_per_packet : 240;
-            impl_->snd_pcm_hw_params_set_period_size_near(impl_->pcm_handle, hw_params, &period_size, &dir);
-
-            unsigned long buffer_size = period_size * 4;
-            impl_->snd_pcm_hw_params_set_buffer_size_near(impl_->pcm_handle, hw_params, &buffer_size);
-
-            err = impl_->snd_pcm_hw_params(impl_->pcm_handle, hw_params);
-            impl_->snd_pcm_hw_params_free(hw_params);
-
-            if (err < 0) {
-                LOG_WARN("AlsaPlayer: snd_pcm_hw_params failed: " << impl_->snd_strerror(err));
-                impl_->snd_pcm_close(impl_->pcm_handle);
-                impl_->pcm_handle = nullptr;
-            } else {
-                impl_->snd_pcm_prepare(impl_->pcm_handle);
-                is_open_ = true;
-                LOG_INFO("AlsaPlayer: Successfully opened ALSA PCM device '" << device_name_
-                         << "' via libasound (" << config_.to_string() << ")");
+        for (const auto& dev : dev_candidates) {
+            if (try_open_via_libasound(config, dev)) {
                 return true;
             }
         }
@@ -193,6 +172,59 @@ bool AlsaPlayer::open(const AudioConfig& config, const std::string& device_name)
         LOG_WARN("AlsaPlayer: Could not open direct kernel ALSA device. Check Termux root permissions (run 'su').");
     }
     return is_open_;
+}
+
+bool AlsaPlayer::try_open_via_libasound(const AudioConfig& config, const std::string& device_name) {
+#if defined(__linux__) || defined(__ANDROID__)
+    const int SND_PCM_STREAM_PLAYBACK_VAL = 0;
+    const int SND_PCM_ACCESS_RW_INTERLEAVED_VAL = 3;
+    const int SND_PCM_FORMAT_S16_LE_VAL = 2;
+
+    int err = impl_->snd_pcm_open(&impl_->pcm_handle, device_name.c_str(), SND_PCM_STREAM_PLAYBACK_VAL, 0);
+    if (err < 0) {
+        LOG_WARN("AlsaPlayer: snd_pcm_open failed for '" << device_name << "': "
+                 << impl_->snd_strerror(err));
+        return false;
+    }
+
+    void* hw_params = nullptr;
+    impl_->snd_pcm_hw_params_malloc(&hw_params);
+    impl_->snd_pcm_hw_params_any(impl_->pcm_handle, hw_params);
+    impl_->snd_pcm_hw_params_set_access(impl_->pcm_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED_VAL);
+    impl_->snd_pcm_hw_params_set_format(impl_->pcm_handle, hw_params, SND_PCM_FORMAT_S16_LE_VAL);
+    impl_->snd_pcm_hw_params_set_channels(impl_->pcm_handle, hw_params, config.channels);
+
+    unsigned int rate = config.sample_rate;
+    int dir = 0;
+    impl_->snd_pcm_hw_params_set_rate_near(impl_->pcm_handle, hw_params, &rate, &dir);
+
+    unsigned long period_size = config.frames_per_packet > 0 ? config.frames_per_packet : 240;
+    impl_->snd_pcm_hw_params_set_period_size_near(impl_->pcm_handle, hw_params, &period_size, &dir);
+
+    unsigned long buffer_size = period_size * 4;
+    impl_->snd_pcm_hw_params_set_buffer_size_near(impl_->pcm_handle, hw_params, &buffer_size);
+
+    err = impl_->snd_pcm_hw_params(impl_->pcm_handle, hw_params);
+    impl_->snd_pcm_hw_params_free(hw_params);
+
+    if (err < 0) {
+        LOG_WARN("AlsaPlayer: snd_pcm_hw_params failed for '" << device_name << "': " << impl_->snd_strerror(err));
+        impl_->snd_pcm_close(impl_->pcm_handle);
+        impl_->pcm_handle = nullptr;
+        return false;
+    }
+
+    impl_->snd_pcm_prepare(impl_->pcm_handle);
+    is_open_ = true;
+    device_name_ = device_name;
+    LOG_INFO("AlsaPlayer: Successfully opened ALSA PCM device '" << device_name
+             << "' via libasound (" << config.to_string() << ")");
+    return true;
+#else
+    (void)config;
+    (void)device_name;
+    return false;
+#endif
 }
 
 void AlsaPlayer::close() {
