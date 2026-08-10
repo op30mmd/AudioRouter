@@ -79,6 +79,20 @@ std::vector<std::string> scan_for_agm_libraries() {
     return found;
 }
 
+// When agm_session_open fails, dump the AGM service state so the failure is
+// actionable: binder service registered? daemon running?
+void log_agm_service_status() {
+    FILE* pipe = popen("service list 2>/dev/null | grep -i agm; ps -A 2>/dev/null | grep -i agm", "r");
+    if (!pipe) return;
+    char line[256];
+    while (fgets(line, sizeof(line), pipe)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (!s.empty()) LOG_ERROR("AgmPlayer:   " << s);
+    }
+    pclose(pipe);
+}
+
 } // namespace
 
 namespace audiorouter {
@@ -182,9 +196,13 @@ void AgmPlayer::unload_agm_library() {
 bool AgmPlayer::open_session(const AudioConfig& config, const std::string& backend) {
     uint32_t session_id = g_next_session_id.fetch_add(1);
     uint64_t handle = 0;
-    if (api_->session_open(session_id, AGM_SESSION_MODE_RX, &handle) != 0 || handle == 0) {
-        LOG_ERROR("AgmPlayer: agm_session_open(" << session_id
-                  << ", RX) failed. Is the vendor agm_service running? (stop audioserver first: 'stop audioserver')");
+    int rc = api_->session_open(session_id, AGM_SESSION_MODE_RX, &handle);
+    if (rc != 0 || handle == 0) {
+        LOG_ERROR("AgmPlayer: agm_session_open(" << session_id << ", RX) returned " << rc
+                  << " (handle " << handle << ").");
+        LOG_ERROR("AgmPlayer: the vendor AGM service may be down or not exposed to this process. "
+                  << "Check whether agm_service is running and registered:");
+        log_agm_service_status();
         return false;
     }
 
