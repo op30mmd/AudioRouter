@@ -15,6 +15,19 @@
 
 namespace audiorouter {
 
+// Heap-allocated state shared between the client and the background
+// device-open threads. It (and the player objects it references) safely
+// outlive the client: a device thread can still be stuck inside a kernel
+// open() when the client is destroyed, and must never touch other members.
+struct DeviceOpenShared {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool pending = false;
+    bool result = false;
+    std::atomic<bool> shutdown{false};
+    std::shared_ptr<IAudioPlayer> player;
+};
+
 struct ClientConfig {
     std::string server_ip = "127.0.0.1";
     uint16_t server_port = protocol::DEFAULT_PORT;
@@ -64,7 +77,6 @@ private:
     void audio_playback_thread();
     void heartbeat_thread();
     void open_player_with_timeout(const std::string& device_name, uint32_t timeout_ms);
-    void device_open_thread(const std::string& device_name);
 
     ClientConfig config_;
     std::atomic<bool> is_running_;
@@ -78,9 +90,7 @@ private:
     // Guards all socket send/receive/close calls (UdpSocket is not thread-safe)
     std::mutex socket_mutex_;
 
-    // Guarded by player_open_mutex_: the playback thread reads it, the device
-    // open thread hot-swaps it to the real device once it opens.
-    std::shared_ptr<IAudioPlayer> player_;
+    std::shared_ptr<DeviceOpenShared> open_;
     JitterBuffer jitter_buffer_;
 
     std::atomic<uint64_t> last_packet_time_ms_;
@@ -95,18 +105,8 @@ private:
     std::thread playback_thread_;
     std::thread heartbeat_thread_;
 
-    // Device-open retry thread. The ALSA/direct open can hang in a kernel
-    // ioctl, so it runs here (never joined; detached on shutdown). It keeps
-    // its own shared_ptr to the player, so it can hot-swap it into player_
-    // when the device finally opens.
+    // Device-open supervisor thread (never joined; detached on shutdown).
     std::thread device_thread_;
-
-    // Bounded audio-device open coordination.
-    std::mutex player_open_mutex_;
-    std::condition_variable player_open_cv_;
-    bool player_open_pending_ = false;
-    bool player_open_result_ = false;
-    std::atomic<bool> player_open_cancelled_{false};
 };
 
 } // namespace audiorouter

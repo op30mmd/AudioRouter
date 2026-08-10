@@ -60,7 +60,7 @@ void log_device_capabilities(const std::vector<std::string>& candidates, const s
     if (candidates.empty()) return;
 
     const std::string& probe_path = candidates.front();
-    int probe_fd = ::open(probe_path.c_str(), O_RDWR | O_NONBLOCK);
+    int probe_fd = ::open(probe_path.c_str(), O_WRONLY | O_NONBLOCK);
     if (probe_fd < 0) {
         LOG_DEBUG("DirectAlsaPlayer: Could not re-open '" << probe_path << "' for capability probe: " << strerror(errno));
         return;
@@ -160,8 +160,10 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
     for (const auto& candidate : candidates) {
         if (is_open_) break;
 
+        LOG_DEBUG("DirectAlsaPlayer: attempting candidate '" << candidate << "' (open O_WRONLY|O_NONBLOCK)...");
+
         uint64_t step_start_ms = get_time_ms();
-        int opened_fd = ::open(candidate.c_str(), O_RDWR | O_NONBLOCK);
+        int opened_fd = ::open(candidate.c_str(), O_WRONLY | O_NONBLOCK);
         uint64_t step_ms = get_time_ms() - step_start_ms;
         if (step_ms > 1000) {
             LOG_WARN("DirectAlsaPlayer: open() of '" << candidate << "' took " << step_ms << "ms");
@@ -198,6 +200,7 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
         params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = buffer_req * 4;
 
         step_start_ms = get_time_ms();
+        LOG_DEBUG("DirectAlsaPlayer:   -> SNDRV_PCM_IOCTL_HW_PARAMS (constrained)...");
         int hw_params_ret = ioctl(opened_fd, SNDRV_PCM_IOCTL_HW_PARAMS, &params);
         step_ms = get_time_ms() - step_start_ms;
         if (step_ms > 1000) {
@@ -217,6 +220,7 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
             set_param_value(params, SNDRV_PCM_HW_PARAM_RATE, config_.sample_rate);
 
             step_start_ms = get_time_ms();
+            LOG_DEBUG("DirectAlsaPlayer:   -> SNDRV_PCM_IOCTL_HW_PARAMS (relaxed)...");
             hw_params_ret = ioctl(opened_fd, SNDRV_PCM_IOCTL_HW_PARAMS, &params);
             step_ms = get_time_ms() - step_start_ms;
             if (step_ms > 1000) {
@@ -253,6 +257,7 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
         }
 
         step_start_ms = get_time_ms();
+        LOG_DEBUG("DirectAlsaPlayer:   -> SNDRV_PCM_IOCTL_SW_PARAMS...");
         int sw_params_ret = ioctl(opened_fd, SNDRV_PCM_IOCTL_SW_PARAMS, &swparams);
         step_ms = get_time_ms() - step_start_ms;
         if (step_ms > 1000) {
@@ -265,6 +270,7 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
 
         // Prepare PCM
         step_start_ms = get_time_ms();
+        LOG_DEBUG("DirectAlsaPlayer:   -> SNDRV_PCM_IOCTL_PREPARE...");
         int prepare_ret = ioctl(opened_fd, SNDRV_PCM_IOCTL_PREPARE);
         step_ms = get_time_ms() - step_start_ms;
         if (step_ms > 1000) {
