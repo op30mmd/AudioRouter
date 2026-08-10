@@ -12,6 +12,7 @@
 #include <functional>
 #include <chrono>
 #include <algorithm>
+#include <limits>
 
 namespace audiorouter {
 
@@ -29,6 +30,10 @@ namespace {
     // stop after this many attempts so a device held by Android's audioserver
     // doesn't stall the client forever.
     constexpr size_t kMaxNodeOpenAttempts = 8;
+    // AGM is tried first for "agm"/"agm:<backend>" devices. If the vendor
+    // library is absent (many Samsung/entry-level builds ship the classic ALSA
+    // HAL instead) those attempts fail fast and the client falls back.
+    constexpr size_t kMaxAgmOpenAttempts = 2;
 
     // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
     // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
@@ -44,9 +49,11 @@ namespace {
     }
 
     std::vector<std::string> build_node_candidates(const std::string& device_name) {
-        std::string primary = device_name;
+        std::string primary = "/dev/snd/pcmC0D0p";
         if (device_name.rfind("direct:", 0) == 0) {
             primary = device_name.substr(7);
+        } else if (device_name.rfind("/dev/", 0) == 0) {
+            primary = device_name;
         }
         if (primary.empty()) {
             primary = "/dev/snd/pcmC0D0p";
@@ -94,107 +101,152 @@ namespace {
         }
     }
 
+    enum class OpenStrategy { AGM, NODES, LEGACY };
+
+    // "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds don't ship
+    // libagmclient.so at all), then direct kernel PCM nodes, then ALSA-lib.
+    // Node-based names open PCM nodes only; everything else is ALSA-lib only.
+    std::vector<OpenStrategy> build_open_strategies(const std::string& device_name) {
+        if (is_agm_device(device_name)) {
+            return {OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
+        }
+        if (is_node_based_device(device_name)) {
+            return {OpenStrategy::NODES};
+        }
+        return {OpenStrategy::LEGACY};
+    }
+
+    const char* strategy_label(OpenStrategy strategy, bool node_based) {
+        switch (strategy) {
+            case OpenStrategy::AGM: return "AGM session (libagmclient.so)";
+            case OpenStrategy::NODES: return node_based ? "direct kernel PCM nodes (/dev/snd)" : "direct kernel PCM nodes";
+            default: return "ALSA-lib device (default/hw:0,0)";
+        }
+    }
+
     // Supervises the retry loop: spawns one attempt thread at a time, abandons
     // it if it hangs in the kernel for kDeviceAttemptTimeoutMs, and retries
     // with backoff. Abandoned attempts keep running and hot-swap the device in
-    // automatically if they eventually succeed. Node-based devices try each
-    // PCM node in turn so one hung node (e.g. held by Android's audioserver)
-    // can't hide the others; after kMaxNodeOpenAttempts total attempts the loop
-    // gives up and tells the user how to free the node.
+    // automatically if they eventually succeed. Node-based opens try each PCM
+    // node in turn so one hung node (e.g. held by Android's audioserver) can't
+    // hide the others; when a strategy exhausts its attempt budget the next
+    // strategy (if any) takes over.
     void device_open_supervisor(std::shared_ptr<DeviceOpenShared> open,
                                 AudioConfig cfg, std::string device_name) {
-        const std::vector<std::string> candidates =
-            is_node_based_device(device_name) ? build_node_candidates(device_name) : std::vector<std::string>{};
-        const bool node_based = !candidates.empty();
-        const bool agm_device = is_agm_device(device_name);
-
+        const std::vector<OpenStrategy> strategies = build_open_strategies(device_name);
+        size_t strategy_index = 0;
         uint32_t backoff_ms = kDeviceRetryBackoffMs;
         int attempt = 1;
-        size_t candidate_index = 0;
 
-        while (!open->shutdown.load()) {
-            std::string candidate;
+        while (!open->shutdown.load() && strategy_index < strategies.size()) {
+            const OpenStrategy strategy = strategies[strategy_index];
+            const size_t max_attempts = strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
+                                      : strategy == OpenStrategy::NODES ? kMaxNodeOpenAttempts
+                                                                        : std::numeric_limits<size_t>::max();
+            const bool node_based = strategy == OpenStrategy::NODES;
+
+            std::vector<std::string> candidates;
+            size_t candidate_index = 0;
             if (node_based) {
-                candidate = candidates[candidate_index % candidates.size()];
-                ++candidate_index;
-                LOG_INFO("Audio device open attempt " << attempt << ": trying PCM node '" << candidate
-                         << "' (node " << ((candidate_index - 1) % candidates.size()) + 1
-                         << " of " << candidates.size() << ")");
+                candidates = build_node_candidates(device_name);
             }
 
-            std::shared_ptr<IAudioPlayer> device =
-                node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
-                : agm_device ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmPlayer>())
-                             : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
-            auto finished = std::make_shared<std::atomic<bool>>(false);
-            std::thread attempt_thread([open, cfg, device_name, candidate, device, finished]() {
-                if (!candidate.empty()) {
-                    attempt_device_open(open, device, [&]() {
-                        return std::static_pointer_cast<DirectAlsaPlayer>(device)->open_candidate_only(cfg, candidate);
-                    });
-                } else {
-                    attempt_device_open(open, device, [&]() {
-                        return device->open(cfg, device_name);
-                    });
-                }
-                finished->store(true);
-            });
+            if (strategy_index > 0) {
+                LOG_WARN("Audio device: previous strategy failed, falling back to "
+                         << strategy_label(strategy, node_based));
+                backoff_ms = kDeviceRetryBackoffMs;
+            }
 
-            uint32_t waited = 0;
-            for (; waited < kDeviceAttemptTimeoutMs && !open->shutdown.load() && !finished->load();
-                 waited += kDeviceAttemptPollMs) {
-                sleep_ms(kDeviceAttemptPollMs);
+            size_t attempts_in_strategy = 0;
+            while (!open->shutdown.load() && attempts_in_strategy < max_attempts) {
+                ++attempts_in_strategy;
+
+                std::string candidate;
+                if (node_based) {
+                    candidate = candidates[candidate_index % candidates.size()];
+                    ++candidate_index;
+                    LOG_INFO("Audio device open attempt " << attempt << ": trying PCM node '" << candidate
+                             << "' (node " << ((candidate_index - 1) % candidates.size()) + 1
+                             << " of " << candidates.size() << ")");
+                }
+
+                std::shared_ptr<IAudioPlayer> device =
+                    node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
+                    : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmPlayer>())
+                                                    : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
+                auto finished = std::make_shared<std::atomic<bool>>(false);
+                std::thread attempt_thread([open, cfg, device_name, candidate, device, finished]() {
+                    if (!candidate.empty()) {
+                        attempt_device_open(open, device, [&]() {
+                            return std::static_pointer_cast<DirectAlsaPlayer>(device)->open_candidate_only(cfg, candidate);
+                        });
+                    } else {
+                        attempt_device_open(open, device, [&]() {
+                            return device->open(cfg, device_name);
+                        });
+                    }
+                    finished->store(true);
+                });
+
+                uint32_t waited = 0;
+                for (; waited < kDeviceAttemptTimeoutMs && !open->shutdown.load() && !finished->load();
+                     waited += kDeviceAttemptPollMs) {
+                    sleep_ms(kDeviceAttemptPollMs);
+                }
+
+                if (!open->shutdown.load()) {
+                    bool ok = false;
+                    {
+                        std::lock_guard<std::mutex> lock(open->mutex);
+                        ok = open->result;
+                    }
+                    if (finished->load() && ok) {
+                        attempt_thread.join();
+                        LOG_INFO("Audio device opened successfully on attempt " << attempt
+                                 << ": " << device->get_device_name());
+                        return;
+                    }
+                }
+
+                if (open->shutdown.load()) {
+                    if (attempt_thread.joinable()) attempt_thread.detach();
+                    break;
+                }
+
+                if (!finished->load()) {
+                    LOG_WARN("Audio device open attempt " << attempt
+                             << (candidate.empty() ? "" : " on '" + candidate + "'")
+                             << " hung in a kernel call (" << kDeviceAttemptTimeoutMs << "ms). Abandoning it and trying "
+                             << (node_based ? "the next PCM node" : "again with a fresh player") << "; if the abandoned "
+                             << "attempt later succeeds the real device is hot-swapped in automatically.");
+                    attempt_thread.detach();
+                } else {
+                    attempt_thread.join();
+                    LOG_INFO("Audio device open attempt " << attempt
+                             << (candidate.empty() ? "" : " on '" + candidate + "'") << " failed; retrying.");
+                }
+
+                ++attempt;
+                for (waited = 0; waited < backoff_ms && !open->shutdown.load(); waited += kDeviceAttemptPollMs) {
+                    sleep_ms(kDeviceAttemptPollMs);
+                }
+                backoff_ms = std::min(backoff_ms * 2, kDeviceRetryMaxBackoffMs);
             }
 
             if (!open->shutdown.load()) {
-                bool ok = false;
-                {
-                    std::lock_guard<std::mutex> lock(open->mutex);
-                    ok = open->result;
-                }
-                if (finished->load() && ok) {
-                    attempt_thread.join();
-                    LOG_INFO("Audio device opened successfully on attempt " << attempt
-                             << ": " << device->get_device_name());
-                    return;
-                }
+                ++strategy_index;
             }
-
-            if (open->shutdown.load()) {
-                if (attempt_thread.joinable()) attempt_thread.detach();
-                break;
-            }
-
-            if (!finished->load()) {
-                LOG_WARN("Audio device open attempt " << attempt
-                         << (candidate.empty() ? "" : " on '" + candidate + "'")
-                         << " hung in a kernel call (" << kDeviceAttemptTimeoutMs << "ms). Abandoning it and trying "
-                         << (node_based ? "the next PCM node" : "a fresh player") << "; if the abandoned attempt "
-                         << "later succeeds the real device is hot-swapped in automatically.");
-                attempt_thread.detach();
-            } else {
-                attempt_thread.join();
-                LOG_INFO("Audio device open attempt " << attempt
-                         << (candidate.empty() ? "" : " on '" + candidate + "'") << " failed; retrying.");
-            }
-
-            ++attempt;
-            if (node_based && attempt > static_cast<int>(kMaxNodeOpenAttempts)) {
-                LOG_ERROR("Giving up on the audio device after " << kMaxNodeOpenAttempts
-                          << " attempts across " << candidates.size() << " PCM node(s).");
-                LOG_ERROR("If every node hangs or fails, Android's 'audioserver' is most likely holding the "
-                          << "primary PCM device. On a rooted phone run (as root):");
-                LOG_ERROR("    stop audioserver");
-                LOG_ERROR("then re-run the client. Re-enable Android audio later with: start audioserver");
-                break;
-            }
-
-            for (waited = 0; waited < backoff_ms && !open->shutdown.load(); waited += kDeviceAttemptPollMs) {
-                sleep_ms(kDeviceAttemptPollMs);
-            }
-            backoff_ms = std::min(backoff_ms * 2, kDeviceRetryMaxBackoffMs);
         }
 
+        // Reached only when every strategy exhausted its budget (a plain
+        // node-based device with all nodes hung).
+        if (!open->shutdown.load()) {
+            LOG_ERROR("Could not open any audio device after exhausting all strategies.");
+            LOG_ERROR("If every PCM node hangs or fails while running as root, Android's 'audioserver' is "
+                      << "most likely holding the primary PCM device. Run (as root):");
+            LOG_ERROR("    stop audioserver");
+            LOG_ERROR("then re-run the client. Re-enable Android audio later with: start audioserver");
+        }
         LOG_INFO("Audio device open thread exiting.");
     }
 }

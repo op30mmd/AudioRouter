@@ -3,6 +3,7 @@
 #include "../common/logger.hpp"
 
 #include <dlfcn.h>
+#include <dirent.h>
 #include <cstring>
 #include <atomic>
 #include <vector>
@@ -40,6 +41,41 @@ typedef int (*agm_session_close_fn)(uint64_t session_handle);
 // collide with a fresh one in the AGM service.
 std::atomic<uint32_t> g_next_session_id{1000};
 
+const char* kAgmLibCandidates[] = {
+    "libagmclient.so",
+    "/vendor/lib64/libagmclient.so",
+    "/vendor/lib/libagmclient.so",
+    "/system/lib64/libagmclient.so",
+    "/system/lib/libagmclient.so",
+    "/system_ext/lib64/libagmclient.so",
+    "/odm/lib64/libagmclient.so",
+};
+
+// Samsung / budget Qualcomm builds sometimes rename or relocate the AGM
+// client; list every AGM-shaped library found on the device so the failure
+// becomes actionable instead of a dead end.
+std::vector<std::string> scan_for_agm_libraries() {
+    std::vector<std::string> found;
+    const char* dirs[] = {
+        "/vendor/lib64", "/vendor/lib",
+        "/system/lib64", "/system/lib",
+        "/system_ext/lib64", "/odm/lib64",
+    };
+    for (const char* dir : dirs) {
+        DIR* d = opendir(dir);
+        if (!d) continue;
+        struct dirent* entry;
+        while ((entry = readdir(d)) != nullptr) {
+            const std::string name = entry->d_name;
+            if (name.find("agm") != std::string::npos || name.find("AGM") != std::string::npos) {
+                found.push_back(std::string(dir) + "/" + name);
+            }
+        }
+        closedir(d);
+    }
+    return found;
+}
+
 } // namespace
 
 namespace audiorouter {
@@ -69,22 +105,30 @@ bool AgmPlayer::load_agm_library() {
         api_ = nullptr;
     }
 
-    const char* candidates[] = {
-        "libagmclient.so",
-        "/vendor/lib64/libagmclient.so",
-        "/vendor/lib/libagmclient.so",
-        "/system/lib64/libagmclient.so",
-        "/system/lib/libagmclient.so",
-    };
-
     void* handle = nullptr;
-    for (const char* path : candidates) {
+    const char* loaded_path = nullptr;
+    for (const char* path : kAgmLibCandidates) {
         handle = dlopen(path, RTLD_NOW);
-        if (handle) break;
+        if (handle) {
+            loaded_path = path;
+            break;
+        }
     }
     if (!handle) {
         LOG_ERROR("AgmPlayer: could not dlopen libagmclient.so: " << dlerror());
         LOG_ERROR("AgmPlayer: run this binary via 'su' (root). Plain Termux processes cannot load vendor libraries.");
+
+        const std::vector<std::string> agm_libs = scan_for_agm_libraries();
+        if (agm_libs.empty()) {
+            LOG_ERROR("AgmPlayer: no AGM libraries exist under /vendor, /system, /system_ext or /odm. This build "
+                      << "uses the classic ALSA HAL; the client will fall back to direct /dev/snd PCM nodes "
+                      << "(run: stop audioserver, then retry).");
+        } else {
+            LOG_ERROR("AgmPlayer: AGM-related libraries found, but none named libagmclient.so:");
+            for (const auto& lib : agm_libs) {
+                LOG_ERROR("    " << lib);
+            }
+        }
         return false;
     }
 
@@ -108,7 +152,7 @@ bool AgmPlayer::load_agm_library() {
     }
 
     api_ = api;
-    LOG_INFO("AgmPlayer: loaded libagmclient.so (" << candidates[0] << ")");
+    LOG_INFO("AgmPlayer: loaded libagmclient.so from '" << loaded_path << "'");
     return true;
 }
 
