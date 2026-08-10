@@ -259,6 +259,7 @@ AudioRouter/
 │       ├── client.hpp/.cpp        # Client receiver engine & NAT heartbeat
 │       ├── alsa_player.hpp/.cpp   # ALSA player (dynamic libasound)
 │       ├── direct_alsa.hpp/.cpp   # Direct kernel /dev/snd/pcmC0D0p ioctl driver
+│       ├── agm_player.hpp/.cpp    # Qualcomm AGM playback (dlopen libagmclient.so)
 │       ├── dummy_player.hpp/.cpp  # Simulated audio sink (benchmarks/CI)
 │       ├── jitter_buffer.hpp/.cpp # Adaptive Jitter Buffer with PLC
 │       ├── android_helpers.hpp/.cpp # Root verification & tinymix helpers

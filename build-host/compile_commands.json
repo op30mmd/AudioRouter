@@ -1,0 +1,158 @@
+[
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/main.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/main.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/main.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/main.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/client.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/client.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/client.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/client.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/alsa_player.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/alsa_player.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/alsa_player.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/alsa_player.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/direct_alsa.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/direct_alsa.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/direct_alsa.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/direct_alsa.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/agm_player.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/agm_player.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/agm_player.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/agm_player.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/dummy_player.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/dummy_player.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/dummy_player.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/dummy_player.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/jitter_buffer.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/jitter_buffer.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/jitter_buffer.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/jitter_buffer.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/android_helpers.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/android_helpers.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/android_helpers.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/android_helpers.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/client",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/src/client/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_client.dir/__/common/socket_util.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/common/socket_util.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/common/socket_util.cpp",
+  "output": "src/client/CMakeFiles/audiorouter_client.dir/__/common/socket_util.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/server",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_server.dir/main.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/server/main.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/server/main.cpp",
+  "output": "src/server/CMakeFiles/audiorouter_server.dir/main.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/server",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_server.dir/server.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/server/server.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/server/server.cpp",
+  "output": "src/server/CMakeFiles/audiorouter_server.dir/server.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/server",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_server.dir/wasapi_capture.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/server/wasapi_capture.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/server/wasapi_capture.cpp",
+  "output": "src/server/CMakeFiles/audiorouter_server.dir/wasapi_capture.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/server",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_server.dir/dummy_capture.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/server/dummy_capture.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/server/dummy_capture.cpp",
+  "output": "src/server/CMakeFiles/audiorouter_server.dir/dummy_capture.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/server",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_server.dir/audio_endpoint_control.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/server/audio_endpoint_control.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/server/audio_endpoint_control.cpp",
+  "output": "src/server/CMakeFiles/audiorouter_server.dir/audio_endpoint_control.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/src/server",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server -I/mnt/c/Users/mmd/Dev/AudioRouter/src/server/../common -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_server.dir/__/common/socket_util.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/common/socket_util.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/common/socket_util.cpp",
+  "output": "src/server/CMakeFiles/audiorouter_server.dir/__/common/socket_util.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_main.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_main.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_main.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_main.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_protocol.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_protocol.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_protocol.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_protocol.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_ring_buffer.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_ring_buffer.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_ring_buffer.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_ring_buffer.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_jitter_buffer.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_jitter_buffer.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_jitter_buffer.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_jitter_buffer.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_socket.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_socket.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_socket.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_socket.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_conversion.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_conversion.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_conversion.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_conversion.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_thread_safety.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_thread_safety.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_thread_safety.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_thread_safety.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_type_safety.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_type_safety.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_type_safety.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_type_safety.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/test_memory_safety.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/tests/test_memory_safety.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/tests/test_memory_safety.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/test_memory_safety.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/__/src/client/jitter_buffer.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/client/jitter_buffer.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/client/jitter_buffer.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/__/src/client/jitter_buffer.cpp.o"
+},
+{
+  "directory": "/mnt/c/Users/mmd/Dev/AudioRouter/build-host/tests",
+  "command": "/usr/bin/c++  -I/mnt/c/Users/mmd/Dev/AudioRouter/src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/common -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/client -I/mnt/c/Users/mmd/Dev/AudioRouter/tests/../src/server -O3 -DNDEBUG -std=c++23 -Wall -Wextra -O3 -pthread -o CMakeFiles/audiorouter_tests.dir/__/src/common/socket_util.cpp.o -c /mnt/c/Users/mmd/Dev/AudioRouter/src/common/socket_util.cpp",
+  "file": "/mnt/c/Users/mmd/Dev/AudioRouter/src/common/socket_util.cpp",
+  "output": "tests/CMakeFiles/audiorouter_tests.dir/__/src/common/socket_util.cpp.o"
+}
+]

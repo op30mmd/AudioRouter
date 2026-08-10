@@ -1,0 +1,264 @@
+#include "agm_player.hpp"
+#include "android_helpers.hpp"
+#include "../common/logger.hpp"
+
+#include <dlfcn.h>
+#include <cstring>
+#include <atomic>
+#include <vector>
+
+// The AGM client library is a Qualcomm vendor library not present in the NDK
+// or Termux; the API contract below matches agm_api.h shipped in
+// hardware/qcom/audio/agm (libagmclient symbols). The struct/flag values are
+// ABI constants of that header.
+namespace {
+
+enum agm_session_mode {
+    AGM_SESSION_MODE_RX = 1,
+    AGM_SESSION_MODE_TX = 2,
+};
+
+enum agm_media_format {
+    AGM_MEDIA_FORMAT_PCM_16_BIT = 0,
+};
+
+struct agm_media_config {
+    uint32_t rate;
+    uint32_t channels;
+    uint32_t format;
+};
+
+typedef int (*agm_aif_set_media_config_fn)(const char* aif_name, struct agm_media_config* media_config);
+typedef int (*agm_session_open_fn)(uint32_t session_id, uint32_t mode, uint64_t* session_handle);
+typedef int (*agm_session_prepare_fn)(uint64_t session_handle);
+typedef int (*agm_session_start_fn)(uint64_t session_handle);
+typedef int (*agm_session_write_fn)(uint64_t session_handle, void* buf, size_t* byte_count);
+typedef int (*agm_session_stop_fn)(uint64_t session_handle);
+typedef int (*agm_session_close_fn)(uint64_t session_handle);
+
+// Each open attempt uses its own session id so a hung/abandoned attempt can't
+// collide with a fresh one in the AGM service.
+std::atomic<uint32_t> g_next_session_id{1000};
+
+} // namespace
+
+namespace audiorouter {
+
+struct AgmPlayer::AgmApi {
+    void* handle = nullptr;
+    agm_aif_set_media_config_fn aif_set_media_config = nullptr;
+    agm_session_open_fn session_open = nullptr;
+    agm_session_prepare_fn session_prepare = nullptr;
+    agm_session_start_fn session_start = nullptr;
+    agm_session_write_fn session_write = nullptr;
+    agm_session_stop_fn session_stop = nullptr;
+    agm_session_close_fn session_close = nullptr;
+};
+
+AgmPlayer::AgmPlayer() : api_(nullptr), session_handle_(0), frame_bytes_(4), is_open_(false) {}
+
+AgmPlayer::~AgmPlayer() {
+    close();
+    unload_agm_library();
+}
+
+bool AgmPlayer::load_agm_library() {
+    if (api_ && api_->handle) return true;
+    if (api_) {
+        delete api_;
+        api_ = nullptr;
+    }
+
+    const char* candidates[] = {
+        "libagmclient.so",
+        "/vendor/lib64/libagmclient.so",
+        "/vendor/lib/libagmclient.so",
+        "/system/lib64/libagmclient.so",
+        "/system/lib/libagmclient.so",
+    };
+
+    void* handle = nullptr;
+    for (const char* path : candidates) {
+        handle = dlopen(path, RTLD_NOW);
+        if (handle) break;
+    }
+    if (!handle) {
+        LOG_ERROR("AgmPlayer: could not dlopen libagmclient.so: " << dlerror());
+        LOG_ERROR("AgmPlayer: run this binary via 'su' (root). Plain Termux processes cannot load vendor libraries.");
+        return false;
+    }
+
+    auto* api = new AgmApi();
+    api->handle = handle;
+    api->aif_set_media_config =
+        reinterpret_cast<agm_aif_set_media_config_fn>(dlsym(handle, "agm_aif_set_media_config"));
+    api->session_open = reinterpret_cast<agm_session_open_fn>(dlsym(handle, "agm_session_open"));
+    api->session_prepare = reinterpret_cast<agm_session_prepare_fn>(dlsym(handle, "agm_session_prepare"));
+    api->session_start = reinterpret_cast<agm_session_start_fn>(dlsym(handle, "agm_session_start"));
+    api->session_write = reinterpret_cast<agm_session_write_fn>(dlsym(handle, "agm_session_write"));
+    api->session_stop = reinterpret_cast<agm_session_stop_fn>(dlsym(handle, "agm_session_stop"));
+    api->session_close = reinterpret_cast<agm_session_close_fn>(dlsym(handle, "agm_session_close"));
+
+    if (!api->aif_set_media_config || !api->session_open || !api->session_prepare || !api->session_start ||
+        !api->session_write || !api->session_stop || !api->session_close) {
+        LOG_ERROR("AgmPlayer: libagmclient.so is missing required AGM symbols: " << dlerror());
+        dlclose(handle);
+        delete api;
+        return false;
+    }
+
+    api_ = api;
+    LOG_INFO("AgmPlayer: loaded libagmclient.so (" << candidates[0] << ")");
+    return true;
+}
+
+void AgmPlayer::unload_agm_library() {
+    if (api_) {
+        if (api_->handle) dlclose(api_->handle);
+        delete api_;
+        api_ = nullptr;
+    }
+}
+
+bool AgmPlayer::open_session(const AudioConfig& config, const std::string& backend) {
+    uint32_t session_id = g_next_session_id.fetch_add(1);
+    uint64_t handle = 0;
+    if (api_->session_open(session_id, AGM_SESSION_MODE_RX, &handle) != 0 || handle == 0) {
+        LOG_ERROR("AgmPlayer: agm_session_open(" << session_id
+                  << ", RX) failed. Is the vendor agm_service running? (stop audioserver first: 'stop audioserver')");
+        return false;
+    }
+
+    struct agm_media_config media_config;
+    std::memset(&media_config, 0, sizeof(media_config));
+    media_config.rate = config.sample_rate;
+    media_config.channels = config.channels;
+    media_config.format = AGM_MEDIA_FORMAT_PCM_16_BIT;
+
+    int ret = api_->aif_set_media_config(backend.c_str(), &media_config);
+    if (ret != 0) {
+        LOG_ERROR("AgmPlayer: agm_aif_set_media_config('" << backend << "') failed with " << ret
+                  << ". Set the backend name or stop audioserver and retry.");
+        api_->session_close(handle);
+        return false;
+    }
+
+    ret = api_->session_prepare(handle);
+    if (ret != 0) {
+        LOG_ERROR("AgmPlayer: agm_session_prepare failed with " << ret
+                  << ". The DSP graph could not be created on backend '" << backend << "'.");
+        api_->session_close(handle);
+        return false;
+    }
+
+    ret = api_->session_start(handle);
+    if (ret != 0) {
+        LOG_ERROR("AgmPlayer: agm_session_start failed with " << ret);
+        api_->session_stop(handle);
+        api_->session_close(handle);
+        return false;
+    }
+
+    session_handle_ = handle;
+    backend_ = backend;
+    frame_bytes_ = static_cast<size_t>(config.channels) * 2;
+    LOG_INFO("AgmPlayer: session " << session_id << " started on backend '" << backend << "' ("
+             << config.to_string() << ")");
+    return true;
+}
+
+bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) {
+#if defined(__linux__) || defined(__ANDROID__)
+    if (is_open_) close();
+
+    config_ = config;
+    std::string backend = "CODEC_DMA-LPAIF_RXTX-RX-1";
+    const std::string name = device_name.empty() ? "agm" : device_name;
+    if (name.rfind("agm:", 0) == 0) {
+        std::string rest = name.substr(4);
+        if (!rest.empty()) backend = rest;
+    }
+
+    if (!load_agm_library()) return false;
+
+    // Route the codec to the speaker before starting the session. Best effort:
+    // if audioserver re-routes the mixer this is redone on the next open.
+    AndroidHelpers::apply_speaker_routing();
+
+    if (!open_session(config, backend)) return false;
+
+    is_open_ = true;
+    LOG_INFO("AgmPlayer: open complete on backend '" << backend_ << "'");
+    return true;
+#else
+    (void)config;
+    (void)device_name;
+    LOG_INFO("AgmPlayer: AGM playback not available on this platform");
+    return false;
+#endif
+}
+
+void AgmPlayer::close() {
+    is_open_ = false;
+#if defined(__linux__) || defined(__ANDROID__)
+    if (api_ && session_handle_ != 0) {
+        api_->session_stop(session_handle_);
+        api_->session_close(session_handle_);
+        session_handle_ = 0;
+        LOG_INFO("AgmPlayer: session closed");
+    }
+#endif
+}
+
+bool AgmPlayer::is_open() const {
+    return is_open_;
+}
+
+size_t AgmPlayer::write_frames(const void* pcm_data, size_t num_frames) {
+    if (!is_open_ || !pcm_data || num_frames == 0) return 0;
+#if defined(__linux__) || defined(__ANDROID__)
+    if (!api_ || session_handle_ == 0) return 0;
+
+    const uint64_t handle = session_handle_;
+    const size_t channels = (config_.channels > 0) ? config_.channels : 2;
+    const size_t frame_bytes = channels * 2;
+
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(pcm_data);
+    size_t bytes_left = num_frames * frame_bytes;
+    size_t chunk_bytes = 2048 * frame_bytes;  // ~43 ms @ 48 kHz
+
+    while (bytes_left > 0 && is_open_ && session_handle_ != 0) {
+        size_t chunk = (bytes_left < chunk_bytes) ? bytes_left : chunk_bytes;
+        size_t written = chunk;
+        int ret = api_->session_write(handle, const_cast<uint8_t*>(src), &written);
+        if (ret != 0) {
+            LOG_DEBUG("AgmPlayer: agm_session_write returned " << ret << " (" << strerror(errno) << ")");
+            return (num_frames * frame_bytes - bytes_left) / frame_bytes;
+        }
+        if (written == 0 || written > chunk) break;  // no progress - avoid spinning
+        src += written;
+        bytes_left -= written;
+    }
+
+    return num_frames;
+#else
+    (void)pcm_data;
+    (void)num_frames;
+    return 0;
+#endif
+}
+
+size_t AgmPlayer::get_buffer_delay_frames() const {
+    // The AGM client does not expose the DSP buffer level; report none.
+    return 0;
+}
+
+void AgmPlayer::flush() {
+    // Nothing to drop: session_write is paced by the DSP calendar.
+}
+
+std::string AgmPlayer::get_device_name() const {
+    return "agm:" + backend_;
+}
+
+} // namespace audiorouter

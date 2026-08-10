@@ -1,6 +1,7 @@
 #include "client.hpp"
 #include "alsa_player.hpp"
 #include "direct_alsa.hpp"
+#include "agm_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -34,6 +35,12 @@ namespace {
     // through the whole-chain AlsaPlayer open (ALSA-lib style).
     bool is_node_based_device(const std::string& device_name) {
         return device_name.rfind("direct:", 0) == 0 || device_name.rfind("/dev/", 0) == 0;
+    }
+
+    // "agm" / "agm:..." streams straight into Qualcomm's Audio Graph Manager
+    // (vendor libagmclient.so) instead of raw PCM nodes.
+    bool is_agm_device(const std::string& device_name) {
+        return device_name.rfind("agm:", 0) == 0 || device_name == "agm";
     }
 
     std::vector<std::string> build_node_candidates(const std::string& device_name) {
@@ -99,6 +106,7 @@ namespace {
         const std::vector<std::string> candidates =
             is_node_based_device(device_name) ? build_node_candidates(device_name) : std::vector<std::string>{};
         const bool node_based = !candidates.empty();
+        const bool agm_device = is_agm_device(device_name);
 
         uint32_t backoff_ms = kDeviceRetryBackoffMs;
         int attempt = 1;
@@ -116,7 +124,8 @@ namespace {
 
             std::shared_ptr<IAudioPlayer> device =
                 node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
-                           : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
+                : agm_device ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmPlayer>())
+                             : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
             auto finished = std::make_shared<std::atomic<bool>>(false);
             std::thread attempt_thread([open, cfg, device_name, candidate, device, finished]() {
                 if (!candidate.empty()) {
@@ -288,6 +297,11 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
         open_->player->open(audio_config_, device_name);
         return;
     }
+
+    // Route the codec to the speaker before any open attempt so a successful
+    // open has an audible path right away. Best effort: some devices name the
+    // mixer controls differently.
+    AndroidHelpers::apply_speaker_routing();
 
     {
         std::lock_guard<std::mutex> lock(open_->mutex);
