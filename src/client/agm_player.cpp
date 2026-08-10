@@ -372,10 +372,8 @@ bool AgmPlayer::is_open() const {
 }
 
 size_t AgmPlayer::write_frames(const void* pcm_data, size_t num_frames) {
-    if (!is_open_ || !pcm_data || num_frames == 0) return 0;
+    if (!pcm_data || num_frames == 0) return 0;
 #if defined(__linux__) || defined(__ANDROID__)
-    if (!api_ || !pcm_impl_) return 0;
-
     const size_t in_channels = (config_.channels > 0) ? config_.channels : 2;
     const int16_t* src = reinterpret_cast<const int16_t*>(pcm_data);
 
@@ -391,7 +389,10 @@ size_t AgmPlayer::write_frames(const void* pcm_data, size_t num_frames) {
     }
 
     size_t bytes = num_frames * 2;  // mono S16
+    // All state checks happen under io_mutex_ so a concurrent close() cannot
+    // free the plugin handle between the check and the pcm_write call.
     std::lock_guard<std::mutex> lock(io_mutex_);
+    if (!is_open_ || !api_ || !pcm_impl_) return 0;
     int rc = api_->pcm_write(pcm_impl_, src, static_cast<unsigned int>(bytes));
     if (rc != 0) {
         LOG_DEBUG("AgmPlayer: pcm_write failed: "
@@ -420,10 +421,8 @@ size_t AgmPlayer::get_buffer_delay_frames() const {
 
 void AgmPlayer::flush() {
 #if defined(__linux__) || defined(__ANDROID__)
-    if (api_ && pcm_impl_) {
-        std::lock_guard<std::mutex> lock(io_mutex_);
-        if (api_->pcm_drain) api_->pcm_drain(pcm_impl_);
-    }
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (api_ && pcm_impl_ && api_->pcm_drain) api_->pcm_drain(pcm_impl_);
 #endif
 }
 
