@@ -1,3 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+project(audiorouter_tests CXX)
+
 set(TEST_SOURCES
     test_main.cpp
     test_protocol.cpp
