@@ -105,13 +105,10 @@ bool AudioRouterClient::start() {
 }
 
 void AudioRouterClient::stop() {
-    if (!is_running_) return;
-
-    LOG_INFO("Stopping AudioRouter Client...");
     is_running_ = false;
 
     // Send DISCONNECT_REQ to Windows server so it un-mutes PC speaker immediately
-    if (server_addr_.is_valid()) {
+    if (server_addr_.is_valid() && socket_.is_open()) {
         std::vector<uint8_t> dis_buf(sizeof(protocol::CommonHeader) + sizeof(protocol::DisconnectPayload));
         auto* dis_hdr = reinterpret_cast<protocol::CommonHeader*>(dis_buf.data());
         auto* dis_pay = reinterpret_cast<protocol::DisconnectPayload*>(dis_buf.data() + sizeof(protocol::CommonHeader));
@@ -130,8 +127,13 @@ void AudioRouterClient::stop() {
         socket_.send_to(dis_buf.data(), dis_buf.size(), server_addr_);
     }
 
-    // Close UDP socket
+    // Close UDP socket to unblock network receive thread
     socket_.close();
+
+    // Close audio player to unblock playback thread immediately
+    if (player_) {
+        player_->close();
+    }
 
     if (playback_thread_.joinable()) {
         playback_thread_.join();
@@ -141,10 +143,6 @@ void AudioRouterClient::stop() {
     }
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
-    }
-
-    if (player_) {
-        player_->close();
     }
 
     state_ = ClientState::STOPPED;
@@ -160,9 +158,10 @@ ClientState AudioRouterClient::get_state() const {
 }
 
 ClientStats AudioRouterClient::get_stats() const {
+    auto j_stats = jitter_buffer_.get_stats();
     std::lock_guard<std::mutex> lock(stats_mutex_);
     ClientStats s = stats_;
-    s.jitter_stats = jitter_buffer_.get_stats();
+    s.jitter_stats = j_stats;
     s.round_trip_time_us = last_rtt_us_.load();
     return s;
 }

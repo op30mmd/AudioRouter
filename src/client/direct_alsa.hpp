@@ -3,6 +3,7 @@
 #include "audio_player.hpp"
 #include <string>
 #include <vector>
+#include <atomic>
 
 namespace audiorouter {
 
@@ -23,13 +24,13 @@ public:
     static std::vector<std::string> enumerate_kernel_pcm_devices();
 
 private:
-    int fd_;
+    std::atomic<int> fd_;
     AudioConfig config_;
     std::string device_path_;
     size_t period_size_frames_;
     size_t buffer_size_frames_;
     std::vector<int16_t> staging_buffer_;
-    bool is_open_;
+    std::atomic<bool> is_open_;
 };
 
 } // namespace audiorouter

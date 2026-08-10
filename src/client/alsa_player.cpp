@@ -252,20 +252,20 @@ bool AlsaPlayer::try_open_via_libasound(const AudioConfig& config, const std::st
 }
 
 void AlsaPlayer::close() {
-    if (!is_open_) return;
+    is_open_ = false;
 
     if (using_direct_fallback_) {
         direct_fallback_->close();
     } else {
 #if defined(__linux__) || defined(__ANDROID__)
         if (impl_->pcm_handle && impl_->snd_pcm_close) {
-            impl_->snd_pcm_drop(impl_->pcm_handle);
-            impl_->snd_pcm_close(impl_->pcm_handle);
+            void* handle = impl_->pcm_handle;
             impl_->pcm_handle = nullptr;
+            if (impl_->snd_pcm_drop) impl_->snd_pcm_drop(handle);
+            impl_->snd_pcm_close(handle);
         }
 #endif
     }
-    is_open_ = false;
     LOG_INFO("AlsaPlayer: Closed");
 }
 

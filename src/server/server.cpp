@@ -92,9 +92,6 @@ bool AudioRouterServer::start() {
 }
 
 void AudioRouterServer::stop() {
-    if (!is_running_) return;
-
-    LOG_INFO("Stopping AudioRouter Server...");
     is_running_ = false;
 
     // Disconnect active client and unmute PC speaker
