@@ -36,6 +36,9 @@ struct ClientConfig {
     bool auto_discover = false;
     bool use_dummy_player = false;
     uint32_t reconnect_timeout_ms = 5000;
+    // Network interface to pin the UDP socket to ("auto" = detect physical
+    // NIC, "" = leave routing to the OS). Bypasses Android VPN tunnels.
+    std::string bind_iface = "";
 };
 
 enum class ClientState {

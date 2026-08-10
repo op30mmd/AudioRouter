@@ -288,6 +288,35 @@ bool AudioRouterClient::start() {
     socket_.set_buffer_sizes(1024 * 1024, 1024 * 1024);
     socket_.set_qos_priority(true);
 
+    // Optional VPN bypass: pin the socket to the physical Wi-Fi interface so
+    // an Android VPN tunnel (tun0) cannot swallow the LAN traffic to the PC.
+    // Requires root (SO_BINDTODEVICE / CAP_NET_RAW); best-effort otherwise.
+    if (!config_.bind_iface.empty()) {
+        std::string iface = config_.bind_iface;
+        if (iface == "auto") {
+            iface = UdpSocket::pick_physical_interface();
+            if (iface.empty()) {
+                LOG_WARN("No physical interface found to bind to; continuing with default routing");
+            } else {
+                LOG_INFO("Auto-selected physical interface '" << iface << "' for VPN bypass");
+            }
+        }
+        if (!iface.empty()) {
+            socket_.bind_to_interface(iface);
+        }
+    } else {
+        auto ifaces = UdpSocket::get_local_interfaces();
+        bool vpn_active = false;
+        for (const auto& info : ifaces) {
+            if (info.is_loopback || !info.is_up) continue;
+            if (info.name.rfind("tun", 0) == 0 || info.name.rfind("ppp", 0) == 0) vpn_active = true;
+        }
+        if (vpn_active) {
+            LOG_WARN("VPN tunnel detected but no -b/--bind given. If the handshake fails, rerun with "
+                     << "'-b auto' (or '-b wlan0') to bypass the VPN: e.g. -b auto");
+        }
+    }
+
     // Auto-discovery if requested
     if (config_.auto_discover) {
         state_ = ClientState::DISCOVERING;

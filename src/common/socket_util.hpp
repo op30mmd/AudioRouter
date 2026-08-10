@@ -97,10 +97,20 @@ public:
 
     SocketAddress get_local_address() const;
 
+    // Forces all traffic on this socket out the named interface (SO_BINDTODEVICE).
+    // Linux/Android only (needs root / CAP_NET_RAW); on Windows this is a no-op
+    // returning false. Use it to bypass an Android VPN tunnel (tun0) so LAN
+    // audio traffic goes straight over Wi-Fi.
+    bool bind_to_interface(const std::string& ifname);
+
     static void init_networking();
     static void cleanup_networking();
     static std::vector<NetworkInterfaceInfo> get_local_interfaces();
     static std::string get_last_error_string();
+
+    // Best-effort pick of the physical (non-virtual, non-loopback) interface,
+    // e.g. "wlan0" on a phone with an active VPN (tun0). Empty if none found.
+    static std::string pick_physical_interface();
 
 private:
     socket_t handle_;
