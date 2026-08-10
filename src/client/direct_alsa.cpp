@@ -58,7 +58,7 @@ void log_device_capabilities(const std::vector<std::string>& candidates, const s
     if (candidates.empty()) return;
 
     const std::string& probe_path = candidates.front();
-    int probe_fd = ::open(probe_path.c_str(), O_RDWR);
+    int probe_fd = ::open(probe_path.c_str(), O_RDWR | O_NONBLOCK);
     if (probe_fd < 0) {
         LOG_DEBUG("DirectAlsaPlayer: Could not re-open '" << probe_path << "' for capability probe: " << strerror(errno));
         return;
@@ -154,7 +154,7 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
     bool success = false;
     std::string last_error;
     for (const auto& candidate : candidates) {
-        fd_ = ::open(candidate.c_str(), O_RDWR);
+        fd_ = ::open(candidate.c_str(), O_RDWR | O_NONBLOCK);
         if (fd_ < 0) {
             last_error = "open: " + std::string(strerror(errno));
             continue;
@@ -239,6 +239,12 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
             ::close(fd_);
             fd_ = -1;
             continue;
+        }
+
+        // Restore blocking mode for audio writes
+        int flags = fcntl(fd_, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK);
         }
 
         device_path_ = candidate;

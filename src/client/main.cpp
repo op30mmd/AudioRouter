@@ -11,14 +11,10 @@
 
 namespace {
     std::atomic<bool> g_shutdown_requested{false};
-    audiorouter::AudioRouterClient* g_client_ptr = nullptr;
 
     void signal_handler(int sig) {
-        LOG_INFO("Caught termination signal (" << sig << "), disconnecting gracefully...");
-        g_shutdown_requested = true;
-        if (g_client_ptr) {
-            g_client_ptr->stop();
-        }
+        (void)sig;
+        g_shutdown_requested.store(true);
     }
 }
 
@@ -118,7 +114,6 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, signal_handler);
 
     audiorouter::AudioRouterClient client(config);
-    g_client_ptr = &client;
 
     if (!client.start()) {
         LOG_FATAL("Failed to start AudioRouter Client.");
@@ -147,7 +142,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (g_shutdown_requested) {
+        LOG_INFO("Termination requested, disconnecting gracefully...");
+    }
+
     client.stop();
-    g_client_ptr = nullptr;
     return 0;
 }

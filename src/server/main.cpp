@@ -14,14 +14,10 @@
 
 namespace {
     std::atomic<bool> g_shutdown_requested{false};
-    audiorouter::AudioRouterServer* g_server_ptr = nullptr;
 
     void signal_handler(int sig) {
-        LOG_INFO("Caught termination signal (" << sig << "), shutting down server...");
-        g_shutdown_requested = true;
-        if (g_server_ptr) {
-            g_server_ptr->stop();
-        }
+        (void)sig;
+        g_shutdown_requested.store(true);
     }
 
 #if defined(_WIN32)
@@ -31,11 +27,7 @@ namespace {
             case CTRL_BREAK_EVENT:
             case CTRL_CLOSE_EVENT:
             case CTRL_SHUTDOWN_EVENT:
-                LOG_INFO("Caught Windows console control event, restoring audio and shutting down...");
-                g_shutdown_requested = true;
-                if (g_server_ptr) {
-                    g_server_ptr->stop();
-                }
+                g_shutdown_requested.store(true);
                 return TRUE;
             default:
                 return FALSE;
@@ -142,7 +134,6 @@ int main(int argc, char* argv[]) {
 #endif
 
     audiorouter::AudioRouterServer server(config);
-    g_server_ptr = &server;
 
     if (!server.start()) {
         LOG_FATAL("Failed to start AudioRouter Server.");
@@ -167,7 +158,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (g_shutdown_requested) {
+        LOG_INFO("Termination requested, shutting down server...");
+    }
+
     server.stop();
-    g_server_ptr = nullptr;
     return 0;
 }

@@ -157,13 +157,20 @@ bool AlsaPlayer::open(const AudioConfig& config, const std::string& device_name)
     }
 
 #if defined(__linux__) || defined(__ANDROID__)
+    // If device_name is default and direct kernel PCM nodes are detected, prefer Direct ALSA
+    auto kernel_devs = DirectAlsaPlayer::enumerate_kernel_pcm_devices();
+    if (!kernel_devs.empty() && device_name_ == "default") {
+        LOG_INFO("AlsaPlayer: Direct ALSA nodes detected in /dev/snd/, attempting direct hardware playback...");
+        using_direct_fallback_ = true;
+        if (direct_fallback_->open(config, kernel_devs.front())) {
+            is_open_ = true;
+            return true;
+        }
+        using_direct_fallback_ = false;
+    }
+
     if (impl_->load_libasound()) {
-        // Try the requested device first, then fall back to other libasound
-        // names. On Termux the default 'default' device is routed through the
-        // PulseAudio plugin, which fails with "Connection refused" when no
-        // PulseAudio server is running; 'plughw:0,0' opens the hardware
-        // directly (with the plug layer doing rate/format conversion) and
-        // avoids PulseAudio entirely.
+        // Try the requested device first, then fall back to other libasound names
         std::vector<std::string> dev_candidates;
         dev_candidates.push_back(device_name_);
         if (device_name_ != "plughw:0,0") {

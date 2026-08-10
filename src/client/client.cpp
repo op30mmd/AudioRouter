@@ -383,9 +383,6 @@ void AudioRouterClient::heartbeat_thread() {
     auto* ping_pay = reinterpret_cast<protocol::HeartbeatPayload*>(ping_buf.data() + sizeof(protocol::CommonHeader));
 
     while (is_running_) {
-        sleep_ms(1000);
-        if (!is_running_) break;
-
         auto j_stats = jitter_buffer_.get_stats();
 
         ping_hdr->magic = protocol::MAGIC;
@@ -413,6 +410,8 @@ void AudioRouterClient::heartbeat_thread() {
             perform_handshake();
             last_packet_time_ms_ = get_time_ms();
         }
+
+        sleep_ms(1000);
     }
 }
 
