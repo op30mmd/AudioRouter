@@ -54,12 +54,13 @@ typedef int (*mixer_ctl_set_enum_by_string_fn)(struct mixer_ctl* ctl, const char
 
 // AGM media config, matching agm_api.h field order exactly (the library
 // reads it by offset, so the layout must be byte-for-byte correct):
-//   rate, format, channels, data_format
+//   rate, channels, format, data_format
+// format is the tinyalsa-style enum: 0 = PCM S16_LE.
 struct agm_media_config {
     uint32_t rate;         // sample rate in Hz
-    uint32_t format;       // enum agm_media_format: 1 = AGM_FORMAT_PCM_S16_LE
     uint32_t channels;
-    uint32_t data_format;  // 0 = default
+    uint32_t format;       // 0 = S16_LE (tinyalsa enum)
+    uint32_t data_format;  // 0 = default / fixed-point
 };
 typedef int (*agm_aif_set_media_config_fn)(const char* aif_name, struct agm_media_config* media_config);
 
@@ -291,12 +292,18 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
         struct agm_media_config media_config;
         memset(&media_config, 0, sizeof(media_config));
         media_config.rate = cfg.rate;
-        media_config.format = 1;  // AGM_FORMAT_PCM_S16_LE (NOT 0 = INVALID -> -EINVAL)
         media_config.channels = 1;
+        media_config.format = 0;  // S16_LE (tinyalsa-style enum)
         media_config.data_format = 0;
-        const int mc_ret = api_->agm_aif_set_media_config(backend_.c_str(), &media_config);
+        int mc_ret = api_->agm_aif_set_media_config(backend_.c_str(), &media_config);
+        if (mc_ret != 0) {
+            // Some AGM builds number the PCM formats from 1 (S16_LE = 1);
+            // retry with the alternate numbering before concluding failure.
+            media_config.format = 1;
+            mc_ret = api_->agm_aif_set_media_config(backend_.c_str(), &media_config);
+        }
         LOG_INFO("AgmPlayer: agm_aif_set_media_config('" << backend_ << "', " << cfg.rate << " Hz, 1ch, S16_LE) rc "
-                 << mc_ret << (mc_ret != 0 ? " (EINVAL means a field is invalid; expected format=1, channels=1)"
+                 << mc_ret << (mc_ret != 0 ? " (-EINVAL: wrong field layout, enum value, or unknown AIF name)"
                                            : ""));
     }
 
