@@ -4,6 +4,7 @@
 
 #include <dlfcn.h>
 #include <dirent.h>
+#include <cerrno>
 #include <cstring>
 #include <atomic>
 #include <vector>
@@ -37,10 +38,10 @@ typedef int (*agm_session_write_fn)(uint64_t session_handle, void* buf, size_t* 
 typedef int (*agm_session_stop_fn)(uint64_t session_handle);
 typedef int (*agm_session_close_fn)(uint64_t session_handle);
 
-// Session ids start at 100 (the id used by the vendor's agmplay tool) and
-// increment per attempt so a hung/abandoned attempt can't collide with a fresh
-// one in the AGM service.
-std::atomic<uint32_t> g_next_session_id{100};
+// A previous crashed run (ours or audioserver's) can leave a session id
+// stuck open in the AGM service's table, making agm_session_open return
+// -EPIPE for that id. Try a spread of ids; whichever opens wins.
+const uint32_t kCandidateSessionIds[] = {100, 200, 300, 400, 500, 50, 1, 2, 3, 4};
 
 // Qualcomm ships the AGM client in the vendor partition; the bare name is only
 // a last resort for setups that add it to the linker path.
@@ -194,17 +195,34 @@ void AgmPlayer::unload_agm_library() {
 }
 
 bool AgmPlayer::open_session(const AudioConfig& config, const std::string& backend) {
-    uint32_t session_id = g_next_session_id.fetch_add(1);
     uint64_t handle = 0;
-    int rc = api_->session_open(session_id, AGM_SESSION_MODE_RX, &handle);
-    if (rc != 0 || handle == 0) {
-        LOG_ERROR("AgmPlayer: agm_session_open(" << session_id << ", RX) returned " << rc
-                  << " (handle " << handle << ").");
-        LOG_ERROR("AgmPlayer: the vendor AGM service may be down or not exposed to this process. "
-                  << "Check whether agm_service is running and registered:");
+    int rc = 0;
+    uint32_t session_id = 0;
+
+    for (uint32_t sid : kCandidateSessionIds) {
+        uint64_t h = 0;
+        int r = api_->session_open(sid, AGM_SESSION_MODE_RX, &h);
+        if (r == 0 && h != 0) {
+            session_id = sid;
+            handle = h;
+            rc = r;
+            break;
+        }
+        rc = r;  // remember the last error for diagnostics
+    }
+
+    if (session_id == 0 || handle == 0) {
+        LOG_ERROR("AgmPlayer: agm_session_open failed for all candidate session ids (last rc " << rc << " "
+                  << (rc == static_cast<int>(-EPIPE) ? "= -EPIPE, likely a stuck session entry" : "") << ").");
+        LOG_ERROR("AgmPlayer: free the audio stack and retry (as root):");
+        LOG_ERROR("AgmPlayer:   stop audioserver");
+        LOG_ERROR("AgmPlayer:   killall -9 android.hardware.audio.service_64 secaudiohalaidl 2>/dev/null;"
+                  << " killall -9 vendor.audio.agm 2>/dev/null");
         log_agm_service_status();
         return false;
     }
+
+    LOG_INFO("AgmPlayer: session id " << session_id << " opened (handle " << handle << ")");
 
     struct agm_media_config media_config;
     std::memset(&media_config, 0, sizeof(media_config));
