@@ -5,8 +5,9 @@
 #include <vector>
 #include <atomic>
 
-// tinyalsa handle (opaque vendor type).
+// tinyalsa handles (opaque vendor types).
 struct pcm;
+struct mixer;
 
 namespace audiorouter {
 
@@ -50,6 +51,7 @@ private:
 
     PcmApi* api_;
     struct pcm* pcm_impl_;
+    struct mixer* mixer_impl_;
     std::string backend_;
     AudioConfig config_;
     // The speaker backend is a mono graph; stereo input is downmixed here

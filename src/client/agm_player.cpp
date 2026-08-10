@@ -43,6 +43,9 @@ typedef const char* (*pcm_get_error_fn)(const struct pcm* pcm);
 typedef int (*pcm_drain_fn)(struct pcm* pcm);
 typedef int (*pcm_drop_fn)(struct pcm* pcm);
 
+typedef struct mixer* (*mixer_open_fn)(unsigned int card);
+typedef void (*mixer_close_fn)(struct mixer* mixer);
+
 constexpr unsigned int kPcmOut = 0x00000000;
 
 // Card/device pair used by the vendor's own agmplay tool for the speaker
@@ -63,9 +66,11 @@ struct AgmPlayer::PcmApi {
     pcm_get_error_fn pcm_get_error = nullptr;
     pcm_drain_fn pcm_drain = nullptr;
     pcm_drop_fn pcm_drop = nullptr;
+    mixer_open_fn mixer_open = nullptr;
+    mixer_close_fn mixer_close = nullptr;
 };
 
-AgmPlayer::AgmPlayer() : api_(nullptr), pcm_impl_(nullptr), is_open_(false) {}
+AgmPlayer::AgmPlayer() : api_(nullptr), pcm_impl_(nullptr), mixer_impl_(nullptr), is_open_(false) {}
 
 AgmPlayer::~AgmPlayer() {
     close();
@@ -107,8 +112,10 @@ bool AgmPlayer::load_tinyalsa() {
     api->pcm_get_error = reinterpret_cast<pcm_get_error_fn>(dlsym(api->tinyalsa_handle, "pcm_get_error"));
     api->pcm_drain = reinterpret_cast<pcm_drain_fn>(dlsym(api->tinyalsa_handle, "pcm_drain"));
     api->pcm_drop = reinterpret_cast<pcm_drop_fn>(dlsym(api->tinyalsa_handle, "pcm_drop"));
+    api->mixer_open = reinterpret_cast<mixer_open_fn>(dlsym(api->tinyalsa_handle, "mixer_open"));
+    api->mixer_close = reinterpret_cast<mixer_close_fn>(dlsym(api->tinyalsa_handle, "mixer_close"));
 
-    if (!api->pcm_open || !api->pcm_write || !api->pcm_close) {
+    if (!api->pcm_open || !api->pcm_write || !api->pcm_close || !api->mixer_open || !api->mixer_close) {
         LOG_ERROR("AgmPlayer: libtinyalsa.so is missing required PCM symbols: " << dlerror());
         dlclose(api->tinyalsa_handle);
         delete api;
@@ -158,6 +165,15 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
     cfg.silence_size = 0;
     cfg.avail_min = cfg.period_size;
 
+    LOG_INFO("AgmPlayer: opening AGM mixer plugin on card " << kAgmCard << "...");
+    mixer_impl_ = api_->mixer_open(kAgmCard);
+    if (!mixer_impl_) {
+        LOG_ERROR("AgmPlayer: mixer_open(" << kAgmCard
+                  << ") failed - libagm_pcm_plugin.so requires the card-100 mixer context (GKV) to be "
+                  << "registered before pcm_open. Is the AGM mixer plugin present?");
+        return false;
+    }
+
     LOG_INFO("AgmPlayer: opening AGM PCM card " << kAgmCard << " device " << kAgmDevice
              << " (backend '" << backend_ << "', " << cfg.rate << " Hz mono S16_LE)...");
 
@@ -170,6 +186,8 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
             api_->pcm_close(pcm_impl_);
             pcm_impl_ = nullptr;
         }
+        api_->mixer_close(mixer_impl_);
+        mixer_impl_ = nullptr;
         return false;
     }
 
@@ -188,10 +206,16 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
 void AgmPlayer::close() {
 #if defined(__linux__) || defined(__ANDROID__)
     is_open_ = false;
-    if (api_ && pcm_impl_) {
-        api_->pcm_close(pcm_impl_);
-        pcm_impl_ = nullptr;
-        LOG_INFO("AgmPlayer: AGM PCM closed");
+    if (api_) {
+        if (pcm_impl_) {
+            api_->pcm_close(pcm_impl_);
+            pcm_impl_ = nullptr;
+        }
+        if (mixer_impl_) {
+            api_->mixer_close(mixer_impl_);
+            mixer_impl_ = nullptr;
+        }
+        LOG_INFO("AgmPlayer: AGM PCM + mixer closed");
     }
 #endif
 }
