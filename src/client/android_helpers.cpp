@@ -124,6 +124,9 @@ void AndroidHelpers::print_android_troubleshooting_tips() {
     LOG_INFO("   - If the PCM node hangs or fails to open, Android's 'audioserver' is usually holding it.");
     LOG_INFO("     Free the device (root), then re-run the client:");
     LOG_INFO("       stop audioserver      (re-enable Android audio later with: start audioserver)");
+    LOG_INFO("   - If the AGM path (-d agm) cannot dlopen libagmclient.so, the linker namespace blocks");
+    LOG_INFO("     vendor libraries. Run with LD_LIBRARY_PATH set (as root):");
+    LOG_INFO("       su -c 'LD_LIBRARY_PATH=/vendor/lib64 ./audiorouter_client -s <PC_IP> -d agm'");
     LOG_INFO("3. You can pass a specific ALSA device using: -d direct:/dev/snd/pcmC0D0p or -d hw:0,0");
 }
 

@@ -2,7 +2,7 @@
 
 #include "audio_player.hpp"
 #include <string>
-#include <mutex>
+#include <vector>
 #include <atomic>
 
 namespace audiorouter {
@@ -50,7 +50,9 @@ private:
     uint64_t session_handle_;
     std::string backend_;
     AudioConfig config_;
-    size_t frame_bytes_;
+    // The CODEC_DMA-LPAIF_RXTX-RX-1 backend is a mono graph; stereo input is
+    // downmixed here before it is written to the session.
+    std::vector<int16_t> downmix_buffer_;
     std::atomic<bool> is_open_;
 };
 

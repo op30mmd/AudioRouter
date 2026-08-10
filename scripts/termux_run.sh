@@ -58,8 +58,9 @@ echo "Connecting to Windows Server at $SERVER_IP:$PORT..."
 # Run with root if possible
 if [ "$(id -u)" -ne 0 ]; then
     echo "Requesting root privileges via su..."
-    su -c "chmod 666 /dev/snd/* 2>/dev/null; export HOME=\${HOME:-/data/data/com.termux/files/home}; $BIN_PATH -s $SERVER_IP -p $PORT ${@:3}"
+    su -c "chmod 666 /dev/snd/* 2>/dev/null; export HOME=\${HOME:-/data/data/com.termux/files/home}; export LD_LIBRARY_PATH=/vendor/lib64:\$LD_LIBRARY_PATH; $BIN_PATH -s $SERVER_IP -p $PORT ${@:3}"
 else
     chmod 666 /dev/snd/* 2>/dev/null || true
+    export LD_LIBRARY_PATH=/vendor/lib64:$LD_LIBRARY_PATH
     "$BIN_PATH" -s "$SERVER_IP" -p "$PORT" "${@:3}"
 fi

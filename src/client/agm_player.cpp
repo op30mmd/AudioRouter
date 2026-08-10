@@ -37,18 +37,21 @@ typedef int (*agm_session_write_fn)(uint64_t session_handle, void* buf, size_t* 
 typedef int (*agm_session_stop_fn)(uint64_t session_handle);
 typedef int (*agm_session_close_fn)(uint64_t session_handle);
 
-// Each open attempt uses its own session id so a hung/abandoned attempt can't
-// collide with a fresh one in the AGM service.
-std::atomic<uint32_t> g_next_session_id{1000};
+// Session ids start at 100 (the id used by the vendor's agmplay tool) and
+// increment per attempt so a hung/abandoned attempt can't collide with a fresh
+// one in the AGM service.
+std::atomic<uint32_t> g_next_session_id{100};
 
+// Qualcomm ships the AGM client in the vendor partition; the bare name is only
+// a last resort for setups that add it to the linker path.
 const char* kAgmLibCandidates[] = {
-    "libagmclient.so",
     "/vendor/lib64/libagmclient.so",
     "/vendor/lib/libagmclient.so",
     "/system/lib64/libagmclient.so",
     "/system/lib/libagmclient.so",
     "/system_ext/lib64/libagmclient.so",
     "/odm/lib64/libagmclient.so",
+    "libagmclient.so",
 };
 
 // Samsung / budget Qualcomm builds sometimes rename or relocate the AGM
@@ -91,7 +94,7 @@ struct AgmPlayer::AgmApi {
     agm_session_close_fn session_close = nullptr;
 };
 
-AgmPlayer::AgmPlayer() : api_(nullptr), session_handle_(0), frame_bytes_(4), is_open_(false) {}
+AgmPlayer::AgmPlayer() : api_(nullptr), session_handle_(0), is_open_(false) {}
 
 AgmPlayer::~AgmPlayer() {
     close();
@@ -108,7 +111,7 @@ bool AgmPlayer::load_agm_library() {
     void* handle = nullptr;
     const char* loaded_path = nullptr;
     for (const char* path : kAgmLibCandidates) {
-        handle = dlopen(path, RTLD_NOW);
+        handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
         if (handle) {
             loaded_path = path;
             break;
@@ -119,7 +122,19 @@ bool AgmPlayer::load_agm_library() {
         LOG_ERROR("AgmPlayer: run this binary via 'su' (root). Plain Termux processes cannot load vendor libraries.");
 
         const std::vector<std::string> agm_libs = scan_for_agm_libraries();
-        if (agm_libs.empty()) {
+        bool found_exact = false;
+        for (const auto& lib : agm_libs) {
+            if (lib.size() >= 16 && lib.compare(lib.size() - 16, 16, "libagmclient.so") == 0) {
+                found_exact = true;
+                break;
+            }
+        }
+
+        if (found_exact) {
+            LOG_ERROR("AgmPlayer: libagmclient.so EXISTS on this device but dlopen failed - the linker "
+                      << "namespace likely blocks vendor paths and their dependencies. Run with:");
+            LOG_ERROR("AgmPlayer:   su -c \"LD_LIBRARY_PATH=/vendor/lib64 ./audiorouter_client -s <PC_IP> -d agm\"");
+        } else if (agm_libs.empty()) {
             LOG_ERROR("AgmPlayer: no AGM libraries exist under /vendor, /system, /system_ext or /odm. This build "
                       << "uses the classic ALSA HAL; the client will fall back to direct /dev/snd PCM nodes "
                       << "(run: stop audioserver, then retry).");
@@ -176,7 +191,9 @@ bool AgmPlayer::open_session(const AudioConfig& config, const std::string& backe
     struct agm_media_config media_config;
     std::memset(&media_config, 0, sizeof(media_config));
     media_config.rate = config.sample_rate;
-    media_config.channels = config.channels;
+    // The CODEC_DMA-LPAIF_RXTX-RX-1 graph is mono; stereo streams are downmixed
+    // in write_frames().
+    media_config.channels = 1;
     media_config.format = AGM_MEDIA_FORMAT_PCM_16_BIT;
 
     int ret = api_->aif_set_media_config(backend.c_str(), &media_config);
@@ -205,9 +222,8 @@ bool AgmPlayer::open_session(const AudioConfig& config, const std::string& backe
 
     session_handle_ = handle;
     backend_ = backend;
-    frame_bytes_ = static_cast<size_t>(config.channels) * 2;
     LOG_INFO("AgmPlayer: session " << session_id << " started on backend '" << backend << "' ("
-             << config.to_string() << ")");
+             << config.to_string() << ", mono output)");
     return true;
 }
 
@@ -264,23 +280,34 @@ size_t AgmPlayer::write_frames(const void* pcm_data, size_t num_frames) {
     if (!api_ || session_handle_ == 0) return 0;
 
     const uint64_t handle = session_handle_;
-    const size_t channels = (config_.channels > 0) ? config_.channels : 2;
-    const size_t frame_bytes = channels * 2;
+    const size_t in_channels = (config_.channels > 0) ? config_.channels : 2;
+    const size_t out_channels = 1;  // mono backend
+    const size_t out_frame_bytes = out_channels * 2;
 
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(pcm_data);
-    size_t bytes_left = num_frames * frame_bytes;
-    size_t chunk_bytes = 2048 * frame_bytes;  // ~43 ms @ 48 kHz
+    const int16_t* src = reinterpret_cast<const int16_t*>(pcm_data);
+    if (in_channels == 2) {
+        downmix_buffer_.resize(num_frames);
+        for (size_t i = 0; i < num_frames; ++i) {
+            const int32_t l = src[i * 2];
+            const int32_t r = src[i * 2 + 1];
+            downmix_buffer_[i] = static_cast<int16_t>((l + r) / 2);
+        }
+        src = downmix_buffer_.data();
+    }
+
+    size_t bytes_left = num_frames * out_frame_bytes;
+    size_t chunk_bytes = 2048 * out_frame_bytes;  // ~43 ms @ 48 kHz
 
     while (bytes_left > 0 && is_open_ && session_handle_ != 0) {
         size_t chunk = (bytes_left < chunk_bytes) ? bytes_left : chunk_bytes;
         size_t written = chunk;
-        int ret = api_->session_write(handle, const_cast<uint8_t*>(src), &written);
+        int ret = api_->session_write(handle, const_cast<int16_t*>(src), &written);
         if (ret != 0) {
             LOG_DEBUG("AgmPlayer: agm_session_write returned " << ret << " (" << strerror(errno) << ")");
-            return (num_frames * frame_bytes - bytes_left) / frame_bytes;
+            return (num_frames * out_frame_bytes - bytes_left) / out_frame_bytes;
         }
         if (written == 0 || written > chunk) break;  // no progress - avoid spinning
-        src += written;
+        src += written / out_frame_bytes * out_channels;
         bytes_left -= written;
     }
 
