@@ -52,6 +52,81 @@ typedef struct mixer_ctl* (*mixer_get_ctl_by_id_fn)(struct mixer* mixer, unsigne
 typedef const char* (*mixer_ctl_get_name_fn)(const struct mixer_ctl* ctl);
 typedef int (*mixer_ctl_set_value_fn)(struct mixer_ctl* ctl, unsigned int id, int value);
 typedef int (*mixer_ctl_set_enum_by_string_fn)(struct mixer_ctl* ctl, const char* string);
+typedef int (*mixer_ctl_set_array_fn)(struct mixer_ctl* ctl, const void* data, size_t num_bytes);
+
+// AudioReach graph/calibration key values (kvh2xml.h). These are the keys the
+// A05s's ACDB uses to identify the speaker playback graph; agmplay's metadata
+// writes on the device resolve to exactly these pairs
+// (gkv[0] = 0xa1000000/0xa100000e PCM_LL_PLAYBACK, INSTANCE, gkv[2] =
+// 0xac000000/0xac000002 DEVICEPP_RX_AUDIO_MBDRC).
+constexpr uint32_t kKvStreamRx        = 0xA1000000;
+constexpr uint32_t kKvPcmLlPlayback   = 0xA100000E;
+constexpr uint32_t kKvDeviceRx        = 0xA2000000;
+constexpr uint32_t kKvSpeaker         = 0xA2000001;
+constexpr uint32_t kKvVolume          = 0xA4000000;
+constexpr uint32_t kKvSamplingRate    = 0xA5000000;
+constexpr uint32_t kKvBitWidth        = 0xA6000000;
+constexpr uint32_t kKvInstance        = 0xAB000000;
+constexpr uint32_t kKvInstance1       = 0x1;
+constexpr uint32_t kKvDevicePpRx      = 0xAC000000;
+constexpr uint32_t kKvDevicePpRxMbDrc = 0xAC000002;
+
+// SNDRV_PCM_FORMAT_S16_LE (the plugin maps this via alsa_to_agm_fmt, so the
+// raw bits value 16 used before produced AGM_FORMAT_INVALID on the device).
+constexpr uint32_t kAlsaFormatS16Le = 2;
+// AGM_DATA_FORMAT_FIXED_POINT (0 = AGM_DATA_FORMAT_INVALID).
+constexpr uint32_t kAgmDataFormatFixedPoint = 1;
+
+void AppendU32Le(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+}
+
+// "<backend> metadata" control payload (same layout as
+// set_agm_audio_intf_metadata in the AGM test apps):
+//   uint32 num_gkv, agm_key_value gkv[], uint32 num_ckv,
+//   agm_key_value ckv[], prop_data {prop_id, num_values, values[]}
+std::vector<uint8_t> BuildBackendMetadataPayload(uint32_t rate, uint32_t bit_width) {
+    std::vector<uint8_t> m;
+    AppendU32Le(m, 1);               // num_gkv
+    AppendU32Le(m, kKvDeviceRx);     // gkv[0].key  = DEVICERX
+    AppendU32Le(m, kKvSpeaker);      // gkv[0].value = SPEAKER
+    AppendU32Le(m, 2);               // num_ckv
+    AppendU32Le(m, kKvSamplingRate); // ckv[0].key = SAMPLINGRATE
+    AppendU32Le(m, rate);
+    AppendU32Le(m, kKvBitWidth);     // ckv[1].key = BITWIDTH
+    AppendU32Le(m, bit_width);
+    AppendU32Le(m, 0);               // prop_id
+    AppendU32Le(m, 0);               // num_values
+    return m;
+}
+
+// "PCM<dev> metadata" control payload (same layout as set_agm_stream_metadata
+// for PLAYBACK with an instance key): STREAMRX:PCM_LL_PLAYBACK +
+// INSTANCE:INSTANCE_1, ckv VOLUME:LEVEL_0. The A05s's agmplay additionally
+// carries the DEVICEPP_RX key in the stream metadata (its log shows
+// gkv[2] = 0xac000000/0xac000002), so that pair is appended when enabled via
+// AUDIOROUTER_AGM_DEVICEPP_KV=1.
+std::vector<uint8_t> BuildStreamMetadataPayload(bool include_devicepp) {
+    std::vector<uint8_t> m;
+    AppendU32Le(m, include_devicepp ? 3u : 2u);  // num_gkv
+    AppendU32Le(m, kKvStreamRx);                 // gkv[0].key = STREAMRX
+    AppendU32Le(m, kKvPcmLlPlayback);            // gkv[0].value = PCM_LL_PLAYBACK
+    AppendU32Le(m, kKvInstance);                 // gkv[1].key = INSTANCE
+    AppendU32Le(m, kKvInstance1);                // gkv[1].value = INSTANCE_1
+    if (include_devicepp) {
+        AppendU32Le(m, kKvDevicePpRx);           // gkv[2].key = DEVICEPP_RX
+        AppendU32Le(m, kKvDevicePpRxMbDrc);      // gkv[2].value = DEVICEPP_RX_AUDIO_MBDRC
+    }
+    AppendU32Le(m, 1);                           // num_ckv
+    AppendU32Le(m, kKvVolume);                   // ckv[0].key = VOLUME
+    AppendU32Le(m, 0);                           // ckv[0].value = LEVEL_0
+    AppendU32Le(m, 0);                           // prop_id
+    AppendU32Le(m, 0);                           // num_values
+    return m;
+}
 
 // AGM media config, matching agm_api.h field order exactly (the library
 // reads it by offset, so the layout must be byte-for-byte correct):
@@ -98,6 +173,7 @@ struct AgmPlayer::PcmApi {
     mixer_ctl_get_name_fn mixer_ctl_get_name = nullptr;
     mixer_ctl_set_value_fn mixer_ctl_set_value = nullptr;
     mixer_ctl_set_enum_by_string_fn mixer_ctl_set_enum_by_string = nullptr;
+    mixer_ctl_set_array_fn mixer_ctl_set_array = nullptr;
     // Best-effort AGM API (libagmclient): media config on the AIF prior to open.
     void* agm_handle = nullptr;
     agm_aif_set_media_config_fn agm_aif_set_media_config = nullptr;
@@ -152,6 +228,7 @@ bool AgmPlayer::load_tinyalsa() {
     api->mixer_ctl_get_name = reinterpret_cast<mixer_ctl_get_name_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_get_name"));
     api->mixer_ctl_set_value = reinterpret_cast<mixer_ctl_set_value_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_value"));
     api->mixer_ctl_set_enum_by_string = reinterpret_cast<mixer_ctl_set_enum_by_string_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_enum_by_string"));
+    api->mixer_ctl_set_array = reinterpret_cast<mixer_ctl_set_array_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_array"));
     api->agm_handle = dlopen("/vendor/lib64/libagmclient.so", RTLD_NOW | RTLD_GLOBAL);
     if (!api->agm_handle) api->agm_handle = dlopen("libagmclient.so", RTLD_NOW | RTLD_GLOBAL);
     if (api->agm_handle) {
@@ -230,17 +307,25 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
 
     // Register the backend graph keys (GKV) the AGM PCM plugin needs, exactly
     // as agmplay does on this device:
-    //   1) "<backend> rate"  - integer control carrying rate/ch/ch-bits
-    //      (verified on the A05s as control #9; older builds name it
-    //       "<backend> rate ch fmt"). Setting it registers the backend GKV.
-    //   2) "PCM<dev> connect" - enum control routing PCM session <dev> onto
+    //   1) "<backend> rate ch fmt" - integer control carrying
+    //      rate/ch/<alsa format enum>/<data format>. Format must be the ALSA
+    //      enum value (2 = SNDRV_PCM_FORMAT_S16_LE), not the bit width, and
+    //      data format must be 1 (AGM_DATA_FORMAT_FIXED_POINT); otherwise the
+    //      AGM media config stored on the device is invalid and graph open
+    //      fails with -EIO. (Verified on the A05s as control #9.)
+    //   2) "<backend> metadata" - byte control registering the backend
+    //      (DEVICERX/SPEAKER + SAMPLINGRATE/BITWIDTH) sub-graph KV pairs.
+    //   3) "PCM<dev> control" = ZERO + "PCM<dev> metadata" - byte control
+    //      registering the stream (STREAMRX/PCM_LL_PLAYBACK + INSTANCE) and
+    //      stream-PP sub-graph KV pairs. Without these the session's merged
+    //      GKV is empty, gsl_get_tags_with_module_info() finds no graph, and
+    //      pcm_open fails with -5 (EIO).
+    //   4) "PCM<dev> connect" - enum control routing PCM session <dev> onto
     //      the backend graph (verified as control #51). Without it the plugin
     //      sees an unrouted session and pcm_open fails with -32.
     // Successful tinymix settings from a shell do not travel into this
-    // process, so both controls are set here, in-process, on our own mixer
+    // process, so all controls are set here, in-process, on our own mixer
     // handle.
-    const unsigned int bits_per_sample = 16;  // S16_LE
-
     // --- 1) backend rate control: by name, then by known control ID ---
     std::string rate_ctl_name = backend_ + " rate";
     struct mixer_ctl* rate_ctl = api_->mixer_get_ctl(mixer_impl_, rate_ctl_name.c_str());
@@ -261,17 +346,60 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
             if (n) resolved_name = n;
         }
         const int set_ret = api_->mixer_ctl_set_value(rate_ctl, 0, static_cast<int>(cfg.rate));
-        api_->mixer_ctl_set_value(rate_ctl, 1, 1);                       // mono
-        api_->mixer_ctl_set_value(rate_ctl, 2, static_cast<int>(bits_per_sample));
-        api_->mixer_ctl_set_value(rate_ctl, 3, 0);
+        api_->mixer_ctl_set_value(rate_ctl, 1, 1);                              // mono
+        api_->mixer_ctl_set_value(rate_ctl, 2, static_cast<int>(kAlsaFormatS16Le));
+        api_->mixer_ctl_set_value(rate_ctl, 3, static_cast<int>(kAgmDataFormatFixedPoint));
         LOG_INFO("AgmPlayer: rate control (by " << rate_lookup << ", resolved '" << resolved_name
-                 << "') = " << cfg.rate << " Hz, 1 ch, " << bits_per_sample << " bit (rc " << set_ret << ")");
+                 << "') = " << cfg.rate << " Hz, 1 ch, fmt " << kAlsaFormatS16Le
+                 << " (S16_LE), data_fmt " << kAgmDataFormatFixedPoint
+                 << " (FIXED_POINT) (rc " << set_ret << ")");
     } else {
         LOG_WARN("AgmPlayer: backend rate control for '" << backend_ << "' not found on card " << kAgmCard
                  << "; the AGM PCM plugin may refuse to open. List controls with: tinymix -D " << kAgmCard);
     }
 
-    // --- 2) route PCM session onto the backend: by name, then by ID ---
+    // --- 2) backend metadata (device sub-graph KV pair registration) ---
+    const std::string be_mtd_ctl_name = backend_ + " metadata";
+    struct mixer_ctl* be_mtd_ctl = api_->mixer_get_ctl(mixer_impl_, be_mtd_ctl_name.c_str());
+    if (be_mtd_ctl && api_->mixer_ctl_set_array) {
+        const std::vector<uint8_t> payload = BuildBackendMetadataPayload(cfg.rate, 16);
+        const int mtd_ret = api_->mixer_ctl_set_array(be_mtd_ctl, payload.data(), payload.size());
+        LOG_INFO("AgmPlayer: '" << be_mtd_ctl_name << "' metadata (" << payload.size()
+                 << " bytes: DEVICERX:SPEAKER, SAMPLINGRATE:" << cfg.rate << ", BITWIDTH:16) rc "
+                 << mtd_ret);
+    } else if (!api_->mixer_ctl_set_array) {
+        LOG_WARN("AgmPlayer: vendor libtinyalsa lacks mixer_ctl_set_array; skipping backend metadata");
+    } else {
+        LOG_WARN("AgmPlayer: control '" << be_mtd_ctl_name << "' not found on card " << kAgmCard
+                 << "; skipping backend metadata (graph open may fail with -5)");
+    }
+
+    // --- 3) stream metadata: "PCM<dev> control" = ZERO, then "PCM<dev> metadata" ---
+    const std::string pcm_ctl_name = "PCM" + std::to_string(kAgmDevice) + " control";
+    struct mixer_ctl* pcm_ctl = api_->mixer_get_ctl(mixer_impl_, pcm_ctl_name.c_str());
+    if (pcm_ctl) {
+        const int zero_ret = api_->mixer_ctl_set_enum_by_string(pcm_ctl, "ZERO");
+        LOG_INFO("AgmPlayer: '" << pcm_ctl_name << "' -> ZERO (rc " << zero_ret << ")");
+    } else {
+        LOG_WARN("AgmPlayer: control '" << pcm_ctl_name << "' not found on card " << kAgmCard);
+    }
+    const std::string pcm_mtd_ctl_name = "PCM" + std::to_string(kAgmDevice) + " metadata";
+    struct mixer_ctl* pcm_mtd_ctl = api_->mixer_get_ctl(mixer_impl_, pcm_mtd_ctl_name.c_str());
+    if (pcm_mtd_ctl && api_->mixer_ctl_set_array) {
+        const bool include_devicepp = getenv("AUDIOROUTER_AGM_DEVICEPP_KV") != nullptr;
+        const std::vector<uint8_t> payload = BuildStreamMetadataPayload(include_devicepp);
+        const int mtd_ret = api_->mixer_ctl_set_array(pcm_mtd_ctl, payload.data(), payload.size());
+        LOG_INFO("AgmPlayer: '" << pcm_mtd_ctl_name << "' metadata (" << payload.size()
+                 << " bytes: STREAMRX:PCM_LL_PLAYBACK, INSTANCE:1" << (include_devicepp
+                 ? ", DEVICEPP_RX:AUDIO_MBDRC" : "") << ", VOLUME:0) rc " << mtd_ret);
+    } else if (!api_->mixer_ctl_set_array) {
+        LOG_WARN("AgmPlayer: vendor libtinyalsa lacks mixer_ctl_set_array; skipping stream metadata");
+    } else {
+        LOG_WARN("AgmPlayer: control '" << pcm_mtd_ctl_name << "' not found on card " << kAgmCard
+                 << "; skipping stream metadata (graph open may fail with -5)");
+    }
+
+    // --- 4) route PCM session onto the backend: by name, then by ID ---
     const std::string connect_ctl_name = "PCM" + std::to_string(kAgmDevice) + " connect";
     struct mixer_ctl* connect_ctl = api_->mixer_get_ctl(mixer_impl_, connect_ctl_name.c_str());
     std::string connect_lookup = "name '" + connect_ctl_name + "'";
@@ -293,12 +421,14 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
                  << "; list controls with: tinymix -D " << kAgmCard);
     }
 
-    // --- 3) optional media config on the AIF via AGM API ---
+    // --- 5) optional media config on the AIF via AGM API ---
     // Disabled by default: on the A05s, control #9 already configures the AIF
-    // (rate/ch/bits) inside the plugin layer, and calling agm_aif_set_media_config
-    // afterwards conflicts with that state (it returns -EINVAL even with the
-    // correct 16-byte layout and both format values). Control-9/51-only routing
-    // mirrors agmplay, which never calls this API.
+    // (rate/ch/fmt/data_fmt) inside the plugin layer, and calling
+    // agm_aif_set_media_config afterwards conflicts with that state (it
+    // returns -EINVAL even with the correct 16-byte layout and both format
+    // values). Control-9/metadata/51-only routing mirrors agmplay, which never
+    // calls this API. Note the SM6225 build takes uint32_t aif_id, not the
+    // backend name string this client passes.
     if (getenv("AUDIOROUTER_AGM_MEDIA_CONFIG")) {
         if (api_->agm_aif_set_media_config) {
             struct agm_media_config media_config;
