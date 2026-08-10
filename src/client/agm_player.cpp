@@ -48,6 +48,7 @@ typedef void (*mixer_close_fn)(struct mixer* mixer);
 struct mixer_ctl;
 typedef struct mixer_ctl* (*mixer_get_ctl_fn)(struct mixer* mixer, const char* name);
 typedef struct mixer_ctl* (*mixer_get_ctl_by_id_fn)(struct mixer* mixer, unsigned int id);
+typedef const char* (*mixer_ctl_get_name_fn)(const struct mixer_ctl* ctl);
 typedef int (*mixer_ctl_set_value_fn)(struct mixer_ctl* ctl, unsigned int id, int value);
 typedef int (*mixer_ctl_set_enum_by_string_fn)(struct mixer_ctl* ctl, const char* string);
 
@@ -89,6 +90,7 @@ struct AgmPlayer::PcmApi {
     mixer_close_fn mixer_close = nullptr;
     mixer_get_ctl_fn mixer_get_ctl = nullptr;
     mixer_get_ctl_by_id_fn mixer_get_ctl_by_id = nullptr;
+    mixer_ctl_get_name_fn mixer_ctl_get_name = nullptr;
     mixer_ctl_set_value_fn mixer_ctl_set_value = nullptr;
     mixer_ctl_set_enum_by_string_fn mixer_ctl_set_enum_by_string = nullptr;
     // Best-effort AGM API (libagmclient): media config on the AIF prior to open.
@@ -142,6 +144,7 @@ bool AgmPlayer::load_tinyalsa() {
     api->mixer_close = reinterpret_cast<mixer_close_fn>(dlsym(api->tinyalsa_handle, "mixer_close"));
     api->mixer_get_ctl = reinterpret_cast<mixer_get_ctl_fn>(dlsym(api->tinyalsa_handle, "mixer_get_ctl"));
     api->mixer_get_ctl_by_id = reinterpret_cast<mixer_get_ctl_by_id_fn>(dlsym(api->tinyalsa_handle, "mixer_get_ctl"));
+    api->mixer_ctl_get_name = reinterpret_cast<mixer_ctl_get_name_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_get_name"));
     api->mixer_ctl_set_value = reinterpret_cast<mixer_ctl_set_value_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_value"));
     api->mixer_ctl_set_enum_by_string = reinterpret_cast<mixer_ctl_set_enum_by_string_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_enum_by_string"));
     api->agm_handle = dlopen("/vendor/lib64/libagmclient.so", RTLD_NOW | RTLD_GLOBAL);
@@ -242,12 +245,17 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
         rate_lookup = "id " + std::to_string(kRateCtlId);
     }
     if (rate_ctl) {
+        std::string resolved_name = "?";
+        if (api_->mixer_ctl_get_name) {
+            const char* n = api_->mixer_ctl_get_name(rate_ctl);
+            if (n) resolved_name = n;
+        }
         const int set_ret = api_->mixer_ctl_set_value(rate_ctl, 0, static_cast<int>(cfg.rate));
         api_->mixer_ctl_set_value(rate_ctl, 1, 1);                       // mono
         api_->mixer_ctl_set_value(rate_ctl, 2, static_cast<int>(bits_per_sample));
         api_->mixer_ctl_set_value(rate_ctl, 3, 0);
-        LOG_INFO("AgmPlayer: rate control (by " << rate_lookup << ") = " << cfg.rate
-                 << " Hz, 1 ch, " << bits_per_sample << " bit (rc " << set_ret << ")");
+        LOG_INFO("AgmPlayer: rate control (by " << rate_lookup << ", resolved '" << resolved_name
+                 << "') = " << cfg.rate << " Hz, 1 ch, " << bits_per_sample << " bit (rc " << set_ret << ")");
     } else {
         LOG_WARN("AgmPlayer: backend rate control for '" << backend_ << "' not found on card " << kAgmCard
                  << "; the AGM PCM plugin may refuse to open. List controls with: tinymix -D " << kAgmCard);
@@ -263,8 +271,13 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
     }
     if (connect_ctl) {
         const int conn_ret = api_->mixer_ctl_set_enum_by_string(connect_ctl, backend_.c_str());
-        LOG_INFO("AgmPlayer: '" << connect_ctl_name << "' (by " << connect_lookup << ") -> '" << backend_
-                 << "' (rc " << conn_ret << ")");
+        std::string resolved_name = "?";
+        if (api_->mixer_ctl_get_name) {
+            const char* n = api_->mixer_ctl_get_name(connect_ctl);
+            if (n) resolved_name = n;
+        }
+        LOG_INFO("AgmPlayer: '" << connect_ctl_name << "' (by " << connect_lookup << ", resolved '"
+                 << resolved_name << "') -> '" << backend_ << "' (rc " << conn_ret << ")");
     } else {
         LOG_WARN("AgmPlayer: control '" << connect_ctl_name << "' not found on card " << kAgmCard
                  << "; list controls with: tinymix -D " << kAgmCard);
