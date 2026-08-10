@@ -4,6 +4,7 @@
 
 #include <dlfcn.h>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <vector>
 
@@ -287,35 +288,36 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
                  << "; list controls with: tinymix -D " << kAgmCard);
     }
 
-    // --- 3) best-effort media config on the AIF via AGM API ---
-    if (api_->agm_aif_set_media_config) {
-        // 16-byte struct matching agm_api.h; memset keeps offset 12
-        // (data_format) clean - garbage there yields -EINVAL.
-        struct agm_media_config media_config;
-        memset(&media_config, 0, sizeof(media_config));
-        media_config.rate = cfg.rate;
-        media_config.channels = 1;
-        media_config.data_format = 0;
-        int mc_ret = -22;
-        for (uint32_t fmt = 0; fmt <= 1; ++fmt) {  // tinyalsa enum 0, alternate 1
+    // --- 3) optional media config on the AIF via AGM API ---
+    // Disabled by default: on the A05s, control #9 already configures the AIF
+    // (rate/ch/bits) inside the plugin layer, and calling agm_aif_set_media_config
+    // afterwards conflicts with that state (it returns -EINVAL even with the
+    // correct 16-byte layout and both format values). Control-9/51-only routing
+    // mirrors agmplay, which never calls this API.
+    if (getenv("AUDIOROUTER_AGM_MEDIA_CONFIG")) {
+        if (api_->agm_aif_set_media_config) {
+            struct agm_media_config media_config;
             memset(&media_config, 0, sizeof(media_config));
             media_config.rate = cfg.rate;
             media_config.channels = 1;
-            media_config.format = fmt;
             media_config.data_format = 0;
-            mc_ret = api_->agm_aif_set_media_config(backend_.c_str(), &media_config);
-            LOG_INFO("AgmPlayer: agm_aif_set_media_config('" << backend_ << "', " << cfg.rate
-                     << " Hz, 1ch, format=" << fmt << ") rc " << mc_ret);
-            if (mc_ret == 0) break;
+            int mc_ret = -22;
+            for (uint32_t fmt = 0; fmt <= 1 && mc_ret != 0; ++fmt) {  // tinyalsa enum 0, alternate 1
+                memset(&media_config, 0, sizeof(media_config));
+                media_config.rate = cfg.rate;
+                media_config.channels = 1;
+                media_config.format = fmt;
+                media_config.data_format = 0;
+                mc_ret = api_->agm_aif_set_media_config(backend_.c_str(), &media_config);
+                LOG_INFO("AgmPlayer: agm_aif_set_media_config('" << backend_ << "', " << cfg.rate
+                         << " Hz, 1ch, format=" << fmt << ") rc " << mc_ret);
+            }
+        } else {
+            LOG_WARN("AgmPlayer: AUDIOROUTER_AGM_MEDIA_CONFIG=1 but libagmclient.so is unavailable");
         }
-        if (mc_ret != 0) {
-            // Not fatal: some builds route purely via the mixer controls
-            // above (agmplay never calls this API), so pcm_open still gets a
-            // chance. The plugin failing with "failed to open plugin" later
-            // would point back here.
-            LOG_WARN("AgmPlayer: AGM rejected the media config for AIF '" << backend_
-                     << "' (last rc " << mc_ret << "); continuing - pcm_open may fail");
-        }
+    } else {
+        LOG_INFO("AgmPlayer: skipping agm_aif_set_media_config (control 9 already configures the AIF; "
+                 << "set AUDIOROUTER_AGM_MEDIA_CONFIG=1 to enable)");
     }
 
     LOG_INFO("AgmPlayer: opening AGM PCM card " << kAgmCard << " device " << kAgmDevice
