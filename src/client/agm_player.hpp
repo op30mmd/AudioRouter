@@ -5,27 +5,30 @@
 #include <vector>
 #include <atomic>
 
+// tinyalsa handle (opaque vendor type).
+struct pcm;
+
 namespace audiorouter {
 
-// Qualcomm Audio Graph Manager (AGM) playback path.
+// Qualcomm AGM playback via tinyalsa's vendor PCM plugin.
 //
-// dlopen()s the vendor-supplied libagmclient.so (and, optionally,
-// libtinyalsa.so) at runtime and streams PCM to the CODEC_DMA backend of the
-// DSP-created graph. Unlike the raw /dev/snd PCM nodes this path does not
-// depend on Android's audioserver having released the hardware: AGM talks to
-// the vendor's agm_service, which keeps running even with audioserver stopped.
+// Android's AGM stack exposes the speaker backend ("CODEC_DMA-LPAIF_RXTX-RX-1")
+// as Card 100 / Device 100. Opening it with tinyalsa's pcm_open() makes the
+// loader pull in /vendor/lib64/sound_fx/libagm_pcm_plugin.so, which performs
+// the mandatory graph-key registration with the ADSP and manages the AGM
+// session itself. Raw agm_session_open() calls bypass that registration and
+// the AGM service rejects them with -EPIPE, so this player deliberately uses
+// the plugin path (same as the vendor's own agmplay tool).
 //
 // Prerequisites (handled with graceful failures + log hints):
 //   * Process must run as root (uid 0) so the linker permits dlopen() of
-//     vendor libraries (run via 'su', not plain Termux).
-//   * The PCM path on the codec must be routed to the speaker: the mixer
-//     controls must be set (AndroidHelpers::apply_speaker_routing()).
+//     vendor libraries (run via 'su'). If vendor paths are namespace-blocked,
+//     launch with: su -c "LD_LIBRARY_PATH=/vendor/lib64 ./audiorouter_client ..."
+//   * The codec must be routed to the speaker: the mixer controls are set via
+//     AndroidHelpers::apply_speaker_routing() before the PCM is opened.
 //
-// Device naming:   agm                        -> default backend
-//                  agm:CODEC_DMA-LPAIF_RXTX-RX-1 -> given backend (or
-//                                                   libtinyalsa stream name)
-// The optional libtinyalsa path (agm:pcmC0D0p style) is NOT implemented; AGM
-// backends are identified by their graph backend names.
+// Device naming: agm               -> default backend (card 100, device 100)
+//                agm:<backend>     -> accepted for compatibility (same card/device)
 class AgmPlayer : public IAudioPlayer {
 public:
     AgmPlayer();
@@ -41,17 +44,16 @@ public:
     std::string get_device_name() const override;
 
 private:
-    struct AgmApi;
-    bool load_agm_library();
-    void unload_agm_library();
-    bool open_session(const AudioConfig& config, const std::string& backend);
+    struct PcmApi;
+    bool load_tinyalsa();
+    void unload_tinyalsa();
 
-    AgmApi* api_;
-    uint64_t session_handle_;
+    PcmApi* api_;
+    struct pcm* pcm_impl_;
     std::string backend_;
     AudioConfig config_;
-    // The CODEC_DMA-LPAIF_RXTX-RX-1 backend is a mono graph; stereo input is
-    // downmixed here before it is written to the session.
+    // The speaker backend is a mono graph; stereo input is downmixed here
+    // before it is written to the PCM.
     std::vector<int16_t> downmix_buffer_;
     std::atomic<bool> is_open_;
 };

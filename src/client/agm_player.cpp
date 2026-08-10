@@ -3,264 +3,128 @@
 #include "../common/logger.hpp"
 
 #include <dlfcn.h>
-#include <dirent.h>
-#include <cerrno>
 #include <cstring>
-#include <atomic>
+#include <algorithm>
 #include <vector>
 
-// The AGM client library is a Qualcomm vendor library not present in the NDK
-// or Termux; the API contract below matches agm_api.h shipped in
-// hardware/qcom/audio/agm (libagmclient symbols). The struct/flag values are
-// ABI constants of that header.
+// ABI of external/tinyalsa as seen by the vendor plugin: pcm_config is read by
+// field offset, so the full layout must be declared (not a minimal subset).
 namespace {
 
-enum agm_session_mode {
-    AGM_SESSION_MODE_RX = 1,
-    AGM_SESSION_MODE_TX = 2,
+enum pcm_format {
+    PCM_FORMAT_S16_LE = 0,
 };
 
-enum agm_media_format {
-    AGM_MEDIA_FORMAT_PCM_16_BIT = 0,
+struct pcm_config {
+    unsigned int channels;
+    unsigned int rate;
+    unsigned int period_size;
+    unsigned int period_count;
+    unsigned int format;  // enum pcm_format
+    unsigned int start_threshold;
+    unsigned int stop_threshold;
+    unsigned int silence_threshold;
+    unsigned int silence_size;
+    unsigned int avail_min;
+    unsigned int prealloc_size;
+    unsigned int prealloc_count;
+    unsigned int mmap_playback_start;
+    unsigned int mmap_capture_start;
+    unsigned int mmap_playback_avail_needs_fill;
+    unsigned int mmap_capture_avail_needs_fill;
 };
 
-struct agm_media_config {
-    uint32_t rate;
-    uint32_t channels;
-    uint32_t format;
-};
+typedef struct pcm* (*pcm_open_fn)(unsigned int card, unsigned int device, unsigned int flags,
+                                   const struct pcm_config* config);
+typedef int (*pcm_close_fn)(struct pcm* pcm);
+typedef int (*pcm_write_fn)(struct pcm* pcm, const void* data, unsigned int count);
+typedef int (*pcm_is_ready_fn)(const struct pcm* pcm);
+typedef const char* (*pcm_get_error_fn)(const struct pcm* pcm);
+typedef int (*pcm_drain_fn)(struct pcm* pcm);
+typedef int (*pcm_drop_fn)(struct pcm* pcm);
 
-typedef int (*agm_aif_set_media_config_fn)(const char* aif_name, struct agm_media_config* media_config);
-typedef int (*agm_session_open_fn)(uint32_t session_id, uint32_t mode, uint64_t* session_handle);
-typedef int (*agm_session_prepare_fn)(uint64_t session_handle);
-typedef int (*agm_session_start_fn)(uint64_t session_handle);
-typedef int (*agm_session_write_fn)(uint64_t session_handle, void* buf, size_t* byte_count);
-typedef int (*agm_session_stop_fn)(uint64_t session_handle);
-typedef int (*agm_session_close_fn)(uint64_t session_handle);
+constexpr unsigned int kPcmOut = 0x00000000;
 
-// A previous crashed run (ours or audioserver's) can leave a session id
-// stuck open in the AGM service's table, making agm_session_open return
-// -EPIPE for that id. Try a spread of ids; whichever opens wins.
-const uint32_t kCandidateSessionIds[] = {100, 200, 300, 400, 500, 50, 1, 2, 3, 4};
-
-// Qualcomm ships the AGM client in the vendor partition; the bare name is only
-// a last resort for setups that add it to the linker path.
-const char* kAgmLibCandidates[] = {
-    "/vendor/lib64/libagmclient.so",
-    "/vendor/lib/libagmclient.so",
-    "/system/lib64/libagmclient.so",
-    "/system/lib/libagmclient.so",
-    "/system_ext/lib64/libagmclient.so",
-    "/odm/lib64/libagmclient.so",
-    "libagmclient.so",
-};
-
-// Samsung / budget Qualcomm builds sometimes rename or relocate the AGM
-// client; list every AGM-shaped library found on the device so the failure
-// becomes actionable instead of a dead end.
-std::vector<std::string> scan_for_agm_libraries() {
-    std::vector<std::string> found;
-    const char* dirs[] = {
-        "/vendor/lib64", "/vendor/lib",
-        "/system/lib64", "/system/lib",
-        "/system_ext/lib64", "/odm/lib64",
-    };
-    for (const char* dir : dirs) {
-        DIR* d = opendir(dir);
-        if (!d) continue;
-        struct dirent* entry;
-        while ((entry = readdir(d)) != nullptr) {
-            const std::string name = entry->d_name;
-            if (name.find("agm") != std::string::npos || name.find("AGM") != std::string::npos) {
-                found.push_back(std::string(dir) + "/" + name);
-            }
-        }
-        closedir(d);
-    }
-    return found;
-}
-
-// When agm_session_open fails, dump the AGM service state so the failure is
-// actionable: binder service registered? daemon running?
-void log_agm_service_status() {
-    FILE* pipe = popen("service list 2>/dev/null | grep -i agm; ps -A 2>/dev/null | grep -i agm", "r");
-    if (!pipe) return;
-    char line[256];
-    while (fgets(line, sizeof(line), pipe)) {
-        std::string s = line;
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-        if (!s.empty()) LOG_ERROR("AgmPlayer:   " << s);
-    }
-    pclose(pipe);
-}
+// Card/device pair used by the vendor's own agmplay tool for the speaker
+// backend "CODEC_DMA-LPAIF_RXTX-RX-1".
+constexpr unsigned int kAgmCard = 100;
+constexpr unsigned int kAgmDevice = 100;
 
 } // namespace
 
 namespace audiorouter {
 
-struct AgmPlayer::AgmApi {
-    void* handle = nullptr;
-    agm_aif_set_media_config_fn aif_set_media_config = nullptr;
-    agm_session_open_fn session_open = nullptr;
-    agm_session_prepare_fn session_prepare = nullptr;
-    agm_session_start_fn session_start = nullptr;
-    agm_session_write_fn session_write = nullptr;
-    agm_session_stop_fn session_stop = nullptr;
-    agm_session_close_fn session_close = nullptr;
+struct AgmPlayer::PcmApi {
+    void* tinyalsa_handle = nullptr;
+    pcm_open_fn pcm_open = nullptr;
+    pcm_close_fn pcm_close = nullptr;
+    pcm_write_fn pcm_write = nullptr;
+    pcm_is_ready_fn pcm_is_ready = nullptr;
+    pcm_get_error_fn pcm_get_error = nullptr;
+    pcm_drain_fn pcm_drain = nullptr;
+    pcm_drop_fn pcm_drop = nullptr;
 };
 
-AgmPlayer::AgmPlayer() : api_(nullptr), session_handle_(0), is_open_(false) {}
+AgmPlayer::AgmPlayer() : api_(nullptr), pcm_impl_(nullptr), is_open_(false) {}
 
 AgmPlayer::~AgmPlayer() {
     close();
-    unload_agm_library();
+    unload_tinyalsa();
 }
 
-bool AgmPlayer::load_agm_library() {
-    if (api_ && api_->handle) return true;
+bool AgmPlayer::load_tinyalsa() {
+    if (api_) return true;
     if (api_) {
         delete api_;
         api_ = nullptr;
     }
 
-    void* handle = nullptr;
-    const char* loaded_path = nullptr;
-    for (const char* path : kAgmLibCandidates) {
-        handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
-        if (handle) {
-            loaded_path = path;
-            break;
-        }
+    const char* tinyalsa_paths[] = {
+        "/vendor/lib64/libtinyalsa.so",
+        "/vendor/lib/libtinyalsa.so",
+        "/system/lib64/libtinyalsa.so",
+        "/system/lib/libtinyalsa.so",
+        "libtinyalsa.so",
+    };
+
+    auto* api = new PcmApi();
+    for (const char* path : tinyalsa_paths) {
+        api->tinyalsa_handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        if (api->tinyalsa_handle) break;
     }
-    if (!handle) {
-        LOG_ERROR("AgmPlayer: could not dlopen libagmclient.so: " << dlerror());
-        LOG_ERROR("AgmPlayer: run this binary via 'su' (root). Plain Termux processes cannot load vendor libraries.");
-
-        const std::vector<std::string> agm_libs = scan_for_agm_libraries();
-        bool found_exact = false;
-        for (const auto& lib : agm_libs) {
-            if (lib.size() >= 16 && lib.compare(lib.size() - 16, 16, "libagmclient.so") == 0) {
-                found_exact = true;
-                break;
-            }
-        }
-
-        if (found_exact) {
-            LOG_ERROR("AgmPlayer: libagmclient.so EXISTS on this device but dlopen failed - the linker "
-                      << "namespace likely blocks vendor paths and their dependencies. Run with:");
-            LOG_ERROR("AgmPlayer:   su -c \"LD_LIBRARY_PATH=/vendor/lib64 ./audiorouter_client -s <PC_IP> -d agm\"");
-        } else if (agm_libs.empty()) {
-            LOG_ERROR("AgmPlayer: no AGM libraries exist under /vendor, /system, /system_ext or /odm. This build "
-                      << "uses the classic ALSA HAL; the client will fall back to direct /dev/snd PCM nodes "
-                      << "(run: stop audioserver, then retry).");
-        } else {
-            LOG_ERROR("AgmPlayer: AGM-related libraries found, but none named libagmclient.so:");
-            for (const auto& lib : agm_libs) {
-                LOG_ERROR("    " << lib);
-            }
-        }
+    if (!api->tinyalsa_handle) {
+        LOG_ERROR("AgmPlayer: could not dlopen libtinyalsa.so: " << dlerror());
+        LOG_ERROR("AgmPlayer: run this binary via 'su' (root); if the linker namespace blocks vendor paths, "
+                  << "launch with: su -c \"LD_LIBRARY_PATH=/vendor/lib64 ./audiorouter_client -s <PC_IP> -d agm\"");
+        delete api;
         return false;
     }
 
-    auto* api = new AgmApi();
-    api->handle = handle;
-    api->aif_set_media_config =
-        reinterpret_cast<agm_aif_set_media_config_fn>(dlsym(handle, "agm_aif_set_media_config"));
-    api->session_open = reinterpret_cast<agm_session_open_fn>(dlsym(handle, "agm_session_open"));
-    api->session_prepare = reinterpret_cast<agm_session_prepare_fn>(dlsym(handle, "agm_session_prepare"));
-    api->session_start = reinterpret_cast<agm_session_start_fn>(dlsym(handle, "agm_session_start"));
-    api->session_write = reinterpret_cast<agm_session_write_fn>(dlsym(handle, "agm_session_write"));
-    api->session_stop = reinterpret_cast<agm_session_stop_fn>(dlsym(handle, "agm_session_stop"));
-    api->session_close = reinterpret_cast<agm_session_close_fn>(dlsym(handle, "agm_session_close"));
+    api->pcm_open = reinterpret_cast<pcm_open_fn>(dlsym(api->tinyalsa_handle, "pcm_open"));
+    api->pcm_close = reinterpret_cast<pcm_close_fn>(dlsym(api->tinyalsa_handle, "pcm_close"));
+    api->pcm_write = reinterpret_cast<pcm_write_fn>(dlsym(api->tinyalsa_handle, "pcm_write"));
+    api->pcm_is_ready = reinterpret_cast<pcm_is_ready_fn>(dlsym(api->tinyalsa_handle, "pcm_is_ready"));
+    api->pcm_get_error = reinterpret_cast<pcm_get_error_fn>(dlsym(api->tinyalsa_handle, "pcm_get_error"));
+    api->pcm_drain = reinterpret_cast<pcm_drain_fn>(dlsym(api->tinyalsa_handle, "pcm_drain"));
+    api->pcm_drop = reinterpret_cast<pcm_drop_fn>(dlsym(api->tinyalsa_handle, "pcm_drop"));
 
-    if (!api->aif_set_media_config || !api->session_open || !api->session_prepare || !api->session_start ||
-        !api->session_write || !api->session_stop || !api->session_close) {
-        LOG_ERROR("AgmPlayer: libagmclient.so is missing required AGM symbols: " << dlerror());
-        dlclose(handle);
+    if (!api->pcm_open || !api->pcm_write || !api->pcm_close) {
+        LOG_ERROR("AgmPlayer: libtinyalsa.so is missing required PCM symbols: " << dlerror());
+        dlclose(api->tinyalsa_handle);
         delete api;
         return false;
     }
 
     api_ = api;
-    LOG_INFO("AgmPlayer: loaded libagmclient.so from '" << loaded_path << "'");
     return true;
 }
 
-void AgmPlayer::unload_agm_library() {
+void AgmPlayer::unload_tinyalsa() {
     if (api_) {
-        if (api_->handle) dlclose(api_->handle);
+        if (api_->tinyalsa_handle) dlclose(api_->tinyalsa_handle);
         delete api_;
         api_ = nullptr;
     }
-}
-
-bool AgmPlayer::open_session(const AudioConfig& config, const std::string& backend) {
-    uint64_t handle = 0;
-    int rc = 0;
-    uint32_t session_id = 0;
-
-    for (uint32_t sid : kCandidateSessionIds) {
-        uint64_t h = 0;
-        int r = api_->session_open(sid, AGM_SESSION_MODE_RX, &h);
-        if (r == 0 && h != 0) {
-            session_id = sid;
-            handle = h;
-            rc = r;
-            break;
-        }
-        rc = r;  // remember the last error for diagnostics
-    }
-
-    if (session_id == 0 || handle == 0) {
-        LOG_ERROR("AgmPlayer: agm_session_open failed for all candidate session ids (last rc " << rc << " "
-                  << (rc == static_cast<int>(-EPIPE) ? "= -EPIPE, likely a stuck session entry" : "") << ").");
-        LOG_ERROR("AgmPlayer: free the audio stack and retry (as root):");
-        LOG_ERROR("AgmPlayer:   stop audioserver");
-        LOG_ERROR("AgmPlayer:   killall -9 android.hardware.audio.service_64 secaudiohalaidl 2>/dev/null;"
-                  << " killall -9 vendor.audio.agm 2>/dev/null");
-        log_agm_service_status();
-        return false;
-    }
-
-    LOG_INFO("AgmPlayer: session id " << session_id << " opened (handle " << handle << ")");
-
-    struct agm_media_config media_config;
-    std::memset(&media_config, 0, sizeof(media_config));
-    media_config.rate = config.sample_rate;
-    // The CODEC_DMA-LPAIF_RXTX-RX-1 graph is mono; stereo streams are downmixed
-    // in write_frames().
-    media_config.channels = 1;
-    media_config.format = AGM_MEDIA_FORMAT_PCM_16_BIT;
-
-    int ret = api_->aif_set_media_config(backend.c_str(), &media_config);
-    if (ret != 0) {
-        LOG_ERROR("AgmPlayer: agm_aif_set_media_config('" << backend << "') failed with " << ret
-                  << ". Set the backend name or stop audioserver and retry.");
-        api_->session_close(handle);
-        return false;
-    }
-
-    ret = api_->session_prepare(handle);
-    if (ret != 0) {
-        LOG_ERROR("AgmPlayer: agm_session_prepare failed with " << ret
-                  << ". The DSP graph could not be created on backend '" << backend << "'.");
-        api_->session_close(handle);
-        return false;
-    }
-
-    ret = api_->session_start(handle);
-    if (ret != 0) {
-        LOG_ERROR("AgmPlayer: agm_session_start failed with " << ret);
-        api_->session_stop(handle);
-        api_->session_close(handle);
-        return false;
-    }
-
-    session_handle_ = handle;
-    backend_ = backend;
-    LOG_INFO("AgmPlayer: session " << session_id << " started on backend '" << backend << "' ("
-             << config.to_string() << ", mono output)");
-    return true;
 }
 
 bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) {
@@ -268,23 +132,50 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
     if (is_open_) close();
 
     config_ = config;
-    std::string backend = "CODEC_DMA-LPAIF_RXTX-RX-1";
+    backend_ = "CODEC_DMA-LPAIF_RXTX-RX-1";
     const std::string name = device_name.empty() ? "agm" : device_name;
     if (name.rfind("agm:", 0) == 0) {
         std::string rest = name.substr(4);
-        if (!rest.empty()) backend = rest;
+        if (!rest.empty()) backend_ = rest;
     }
 
-    if (!load_agm_library()) return false;
+    if (!load_tinyalsa()) return false;
 
-    // Route the codec to the speaker before starting the session. Best effort:
-    // if audioserver re-routes the mixer this is redone on the next open.
+    // Route the codec to the speaker before opening the PCM. Best effort: if
+    // audioserver re-routes the mixer this is redone on the next open.
     AndroidHelpers::apply_speaker_routing();
 
-    if (!open_session(config, backend)) return false;
+    struct pcm_config cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 1;  // mono speaker backend
+    cfg.rate = config.sample_rate > 0 ? static_cast<unsigned int>(config.sample_rate) : 48000;
+    cfg.period_size = 240;  // 5 ms @ 48 kHz
+    cfg.period_count = 4;
+    cfg.format = PCM_FORMAT_S16_LE;
+    cfg.start_threshold = cfg.period_size;
+    cfg.stop_threshold = cfg.period_size * cfg.period_count;
+    cfg.silence_threshold = 0;
+    cfg.silence_size = 0;
+    cfg.avail_min = cfg.period_size;
+
+    LOG_INFO("AgmPlayer: opening AGM PCM card " << kAgmCard << " device " << kAgmDevice
+             << " (backend '" << backend_ << "', " << cfg.rate << " Hz mono S16_LE)...");
+
+    pcm_impl_ = api_->pcm_open(kAgmCard, kAgmDevice, kPcmOut, &cfg);
+    if (!pcm_impl_ || (api_->pcm_is_ready && !api_->pcm_is_ready(pcm_impl_))) {
+        const char* err = (pcm_impl_ && api_->pcm_get_error) ? api_->pcm_get_error(pcm_impl_)
+                                                             : "pcm_open returned null";
+        LOG_ERROR("AgmPlayer: pcm_open(100, 100) failed: " << err);
+        if (pcm_impl_) {
+            api_->pcm_close(pcm_impl_);
+            pcm_impl_ = nullptr;
+        }
+        return false;
+    }
 
     is_open_ = true;
-    LOG_INFO("AgmPlayer: open complete on backend '" << backend_ << "'");
+    LOG_INFO("AgmPlayer: AGM PCM open complete on backend '" << backend_ << "' (" << config.to_string()
+             << ", mono output)");
     return true;
 #else
     (void)config;
@@ -295,13 +186,12 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
 }
 
 void AgmPlayer::close() {
-    is_open_ = false;
 #if defined(__linux__) || defined(__ANDROID__)
-    if (api_ && session_handle_ != 0) {
-        api_->session_stop(session_handle_);
-        api_->session_close(session_handle_);
-        session_handle_ = 0;
-        LOG_INFO("AgmPlayer: session closed");
+    is_open_ = false;
+    if (api_ && pcm_impl_) {
+        api_->pcm_close(pcm_impl_);
+        pcm_impl_ = nullptr;
+        LOG_INFO("AgmPlayer: AGM PCM closed");
     }
 #endif
 }
@@ -313,14 +203,12 @@ bool AgmPlayer::is_open() const {
 size_t AgmPlayer::write_frames(const void* pcm_data, size_t num_frames) {
     if (!is_open_ || !pcm_data || num_frames == 0) return 0;
 #if defined(__linux__) || defined(__ANDROID__)
-    if (!api_ || session_handle_ == 0) return 0;
+    if (!api_ || !pcm_impl_) return 0;
 
-    const uint64_t handle = session_handle_;
     const size_t in_channels = (config_.channels > 0) ? config_.channels : 2;
-    const size_t out_channels = 1;  // mono backend
-    const size_t out_frame_bytes = out_channels * 2;
-
     const int16_t* src = reinterpret_cast<const int16_t*>(pcm_data);
+
+    // Downmix stereo to mono for the speaker backend.
     if (in_channels == 2) {
         downmix_buffer_.resize(num_frames);
         for (size_t i = 0; i < num_frames; ++i) {
@@ -331,20 +219,18 @@ size_t AgmPlayer::write_frames(const void* pcm_data, size_t num_frames) {
         src = downmix_buffer_.data();
     }
 
-    size_t bytes_left = num_frames * out_frame_bytes;
-    size_t chunk_bytes = 2048 * out_frame_bytes;  // ~43 ms @ 48 kHz
-
-    while (bytes_left > 0 && is_open_ && session_handle_ != 0) {
-        size_t chunk = (bytes_left < chunk_bytes) ? bytes_left : chunk_bytes;
-        size_t written = chunk;
-        int ret = api_->session_write(handle, const_cast<int16_t*>(src), &written);
-        if (ret != 0) {
-            LOG_DEBUG("AgmPlayer: agm_session_write returned " << ret << " (" << strerror(errno) << ")");
-            return (num_frames * out_frame_bytes - bytes_left) / out_frame_bytes;
+    size_t bytes = num_frames * 2;  // mono S16
+    int rc = api_->pcm_write(pcm_impl_, src, static_cast<unsigned int>(bytes));
+    if (rc != 0) {
+        LOG_DEBUG("AgmPlayer: pcm_write failed: "
+                  << (api_->pcm_get_error ? api_->pcm_get_error(pcm_impl_) : "pcm error") << " (rc " << rc << ")");
+        // Drop the current buffer content and retry once to recover from XRUN.
+        if (api_->pcm_drop) api_->pcm_drop(pcm_impl_);
+        rc = api_->pcm_write(pcm_impl_, src, static_cast<unsigned int>(bytes));
+        if (rc != 0) {
+            return 0;
         }
-        if (written == 0 || written > chunk) break;  // no progress - avoid spinning
-        src += written / out_frame_bytes * out_channels;
-        bytes_left -= written;
+        LOG_DEBUG("AgmPlayer: pcm_write recovered after drop");
     }
 
     return num_frames;
@@ -356,12 +242,16 @@ size_t AgmPlayer::write_frames(const void* pcm_data, size_t num_frames) {
 }
 
 size_t AgmPlayer::get_buffer_delay_frames() const {
-    // The AGM client does not expose the DSP buffer level; report none.
+    // The vendor PCM plugin does not expose a stable delay query; report none.
     return 0;
 }
 
 void AgmPlayer::flush() {
-    // Nothing to drop: session_write is paced by the DSP calendar.
+#if defined(__linux__) || defined(__ANDROID__)
+    if (api_ && pcm_impl_ && api_->pcm_drain) {
+        api_->pcm_drain(pcm_impl_);
+    }
+#endif
 }
 
 std::string AgmPlayer::get_device_name() const {
