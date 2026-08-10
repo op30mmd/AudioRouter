@@ -75,9 +75,9 @@ bool AudioRouterClient::start() {
 
     // Create Audio Player (ALSA or Dummy)
     if (config_.use_dummy_player) {
-        player_ = std::make_unique<DummyPlayer>();
+        player_ = std::make_shared<DummyPlayer>();
     } else {
-        player_ = std::make_unique<AlsaPlayer>();
+        player_ = std::make_shared<AlsaPlayer>();
     }
 
     // Connect & Handshake with Windows Server
@@ -118,8 +118,6 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
         return;
     }
 
-    IAudioPlayer* raw_player = player_.get();
-
     player_open_cancelled_ = false;
     player_open_result_ = false;
     {
@@ -127,9 +125,10 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
         player_open_pending_ = true;
     }
 
-    std::thread worker([this, raw_player, device_name]() {
-        player_open_worker(raw_player, device_name);
-    });
+    // The device-open thread owns its own reference to the ALSA player and
+    // retries the open in the background (a hung kernel call must not block
+    // the main thread). On success it hot-swaps player_ to the real device.
+    device_thread_ = std::thread(&AudioRouterClient::device_open_thread, this, device_name);
 
     bool completed = false;
     {
@@ -138,49 +137,78 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
                                              [this]() { return !player_open_pending_; });
     }
 
-    if (!completed) {
-        // The device driver is not responding. Abandon the open and fall back
-        // to the dummy sink so the session and shutdown stay responsive.
-        LOG_WARN("Audio device open timed out after " << timeout_ms
-                 << "ms (ALSA driver may be busy). Falling back to dummy sink...");
-        player_open_cancelled_ = true;
-        worker.detach();
-        abandoned_player_.release(); // never delete: the detached worker may still be inside open()
-        abandoned_player_ = std::move(player_);
-        player_ = std::make_unique<DummyPlayer>();
-        player_->open(audio_config_, "dummy_fallback");
-        AndroidHelpers::print_android_troubleshooting_tips();
+    if (completed && player_open_result_) {
+        LOG_INFO("Audio device opened successfully: " << player_->get_device_name());
         return;
     }
 
-    worker.join();
-
-    if (!player_open_result_) {
-        LOG_WARN("Could not open ALSA device '" << device_name << "'. Trying dummy sink fallback...");
-        player_ = std::make_unique<DummyPlayer>();
-        player_->open(audio_config_, "dummy_fallback");
-        AndroidHelpers::print_android_troubleshooting_tips();
+    if (!completed) {
+        LOG_WARN("Audio device open timed out after " << timeout_ms
+                 << "ms (ALSA driver may be busy). Using dummy sink; retrying in background...");
+    } else {
+        LOG_WARN("Could not open ALSA device '" << device_name << "'. Using dummy sink; retrying in background...");
     }
+
+    player_ = std::make_shared<DummyPlayer>();
+    player_->open(audio_config_, "dummy_fallback");
+    AndroidHelpers::print_android_troubleshooting_tips();
 }
 
-void AudioRouterClient::player_open_worker(IAudioPlayer* player, const std::string& device_name) {
-    bool opened = false;
-    if (!player_open_cancelled_) {
-        opened = player->open(audio_config_, device_name);
-        if (player_open_cancelled_) {
-            player->close();
-            opened = false;
+void AudioRouterClient::device_open_thread(const std::string& device_name) {
+    auto device = player_;  // keep the real player alive even while player_ holds the dummy
+    uint32_t backoff_ms = 3000;
+    const uint32_t max_backoff_ms = 30000;
+    int attempt = 1;
+
+    while (!stop_requested_) {
+        bool opened = false;
+        if (!stop_requested_ && !player_open_cancelled_) {
+            opened = device->open(audio_config_, device_name);
         }
+
+        if (opened && !stop_requested_) {
+            {
+                std::lock_guard<std::mutex> lock(player_open_mutex_);
+                player_ = device;
+                player_open_result_ = true;
+                player_open_pending_ = false;
+            }
+            player_open_cv_.notify_all();
+            LOG_INFO("Audio device opened successfully on attempt " << attempt
+                     << ": " << device->get_device_name());
+            return;
+        }
+
+        if (opened) {
+            device->close();  // cancelled mid-open
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(player_open_mutex_);
+            player_open_result_ = false;
+            player_open_pending_ = false;
+        }
+        player_open_cv_.notify_all();
+
+        // Wait before retrying (cancellable)
+        for (uint32_t waited = 0; waited < backoff_ms && !stop_requested_; waited += 100) {
+            sleep_ms(100);
+        }
+        if (stop_requested_) break;
+
+        backoff_ms = std::min(backoff_ms * 2, max_backoff_ms);
+        ++attempt;
+        LOG_WARN("Audio device still unavailable; retrying in background (attempt " << attempt
+                 << ", backoff " << backoff_ms << "ms)...");
     }
-    {
-        std::lock_guard<std::mutex> lock(player_open_mutex_);
-        player_open_result_ = opened;
-        player_open_pending_ = false;
-    }
-    player_open_cv_.notify_all();
+
+    device->close();
+    LOG_INFO("Audio device open thread exiting.");
 }
 
 void AudioRouterClient::stop() {
+    if (state_ == ClientState::STOPPED && !is_running_) return;  // idempotent
+
     stop_requested_ = true;
     is_running_ = false;
     player_open_cancelled_ = true;
@@ -215,8 +243,11 @@ void AudioRouterClient::stop() {
     }
 
     // Close audio player to unblock playback thread immediately
-    if (player_) {
-        player_->close();
+    {
+        std::lock_guard<std::mutex> lock(player_open_mutex_);
+        if (player_) {
+            player_->close();
+        }
     }
 
     if (playback_thread_.joinable()) {
@@ -227,6 +258,11 @@ void AudioRouterClient::stop() {
     }
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
+    }
+    if (device_thread_.joinable()) {
+        // The device open thread may be stuck in a kernel call; never join it.
+        // It self-terminates on stop_requested_ and closes whatever it opened.
+        device_thread_.detach();
     }
 
     state_ = ClientState::STOPPED;
@@ -454,13 +490,22 @@ void AudioRouterClient::audio_playback_thread() {
         // Read frames from jitter buffer
         size_t frames = jitter_buffer_.pop_frames(play_buffer.data(), period_frames);
 
-        if (frames > 0 && player_ && player_->is_open()) {
-            size_t written = player_->write_frames(play_buffer.data(), frames);
-            if (written > 0) {
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                stats_.frames_played += written;
+        if (frames > 0) {
+            std::shared_ptr<IAudioPlayer> player;
+            {
+                std::lock_guard<std::mutex> lock(player_open_mutex_);
+                player = player_;
+            }
+            if (player && player->is_open()) {
+                size_t written = player->write_frames(play_buffer.data(), frames);
+                if (written > 0) {
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    stats_.frames_played += written;
+                } else {
+                    // Audio device returned 0 frames written or was busy; pace the thread
+                    sleep_ms(fallback_sleep_ms);
+                }
             } else {
-                // Audio device returned 0 frames written or was busy; pace the thread
                 sleep_ms(fallback_sleep_ms);
             }
         } else {
