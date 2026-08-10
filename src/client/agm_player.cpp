@@ -45,6 +45,9 @@ typedef int (*pcm_drop_fn)(struct pcm* pcm);
 
 typedef struct mixer* (*mixer_open_fn)(unsigned int card);
 typedef void (*mixer_close_fn)(struct mixer* mixer);
+struct mixer_ctl;
+typedef struct mixer_ctl* (*mixer_get_ctl_fn)(struct mixer* mixer, const char* name);
+typedef int (*mixer_ctl_set_value_fn)(struct mixer_ctl* ctl, unsigned int id, int value);
 
 constexpr unsigned int kPcmOut = 0x00000000;
 
@@ -68,6 +71,8 @@ struct AgmPlayer::PcmApi {
     pcm_drop_fn pcm_drop = nullptr;
     mixer_open_fn mixer_open = nullptr;
     mixer_close_fn mixer_close = nullptr;
+    mixer_get_ctl_fn mixer_get_ctl = nullptr;
+    mixer_ctl_set_value_fn mixer_ctl_set_value = nullptr;
 };
 
 AgmPlayer::AgmPlayer() : api_(nullptr), pcm_impl_(nullptr), mixer_impl_(nullptr), is_open_(false) {}
@@ -114,8 +119,11 @@ bool AgmPlayer::load_tinyalsa() {
     api->pcm_drop = reinterpret_cast<pcm_drop_fn>(dlsym(api->tinyalsa_handle, "pcm_drop"));
     api->mixer_open = reinterpret_cast<mixer_open_fn>(dlsym(api->tinyalsa_handle, "mixer_open"));
     api->mixer_close = reinterpret_cast<mixer_close_fn>(dlsym(api->tinyalsa_handle, "mixer_close"));
+    api->mixer_get_ctl = reinterpret_cast<mixer_get_ctl_fn>(dlsym(api->tinyalsa_handle, "mixer_get_ctl"));
+    api->mixer_ctl_set_value = reinterpret_cast<mixer_ctl_set_value_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_value"));
 
-    if (!api->pcm_open || !api->pcm_write || !api->pcm_close || !api->mixer_open || !api->mixer_close) {
+    if (!api->pcm_open || !api->pcm_write || !api->pcm_close || !api->mixer_open || !api->mixer_close ||
+        !api->mixer_get_ctl || !api->mixer_ctl_set_value) {
         LOG_ERROR("AgmPlayer: libtinyalsa.so is missing required PCM symbols: " << dlerror());
         dlclose(api->tinyalsa_handle);
         delete api;
@@ -172,6 +180,24 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
                   << ") failed - libagm_pcm_plugin.so requires the card-100 mixer context (GKV) to be "
                   << "registered before pcm_open. Is the AGM mixer plugin present?");
         return false;
+    }
+
+    // Register the backend graph key vectors (GKV) that the AGM PCM plugin
+    // needs: the "<backend> rate ch fmt" mixer control carries the backend's
+    // rate / channels / bit-width. agmplay sets this before pcm_open; without
+    // it the plugin aborts with "failed to open plugin" (-32).
+    const std::string rate_ctl_name = backend_ + " rate ch fmt";
+    struct mixer_ctl* rate_ctl = api_->mixer_get_ctl(mixer_impl_, rate_ctl_name.c_str());
+    if (rate_ctl) {
+        const int set_ret = api_->mixer_ctl_set_value(rate_ctl, 0, static_cast<int>(cfg.rate));
+        api_->mixer_ctl_set_value(rate_ctl, 1, 1);   // mono
+        api_->mixer_ctl_set_value(rate_ctl, 2, 16);  // S16_LE
+        LOG_INFO("AgmPlayer: set backend control '" << rate_ctl_name << "' = " << cfg.rate
+                 << " Hz, 1 ch, 16 bit (rc " << set_ret << ")");
+    } else {
+        LOG_WARN("AgmPlayer: backend control '" << rate_ctl_name << "' not found on card " << kAgmCard
+                 << "; the AGM PCM plugin may refuse to open. List controls with: "
+                 << "tinymix -D " << kAgmCard);
     }
 
     LOG_INFO("AgmPlayer: opening AGM PCM card " << kAgmCard << " device " << kAgmDevice
