@@ -1,5 +1,6 @@
 #include "client.hpp"
 #include "alsa_player.hpp"
+#include "direct_alsa.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -7,6 +8,7 @@
 
 #include <cstring>
 #include <vector>
+#include <functional>
 #include <chrono>
 #include <algorithm>
 
@@ -22,17 +24,48 @@ namespace {
     constexpr uint32_t kDeviceAttemptPollMs = 100;
     constexpr uint32_t kDeviceRetryBackoffMs = 3000;
     constexpr uint32_t kDeviceRetryMaxBackoffMs = 30000;
+    // Node-based (direct:/dev/... or /dev/...) opens try PCM nodes one by one;
+    // stop after this many attempts so a device held by Android's audioserver
+    // doesn't stall the client forever.
+    constexpr size_t kMaxNodeOpenAttempts = 8;
 
-    // Runs one device open attempt on a fresh AlsaPlayer. May block in the
-    // kernel for a long time; on success it hot-swaps the real device into
+    // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
+    // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
+    // through the whole-chain AlsaPlayer open (ALSA-lib style).
+    bool is_node_based_device(const std::string& device_name) {
+        return device_name.rfind("direct:", 0) == 0 || device_name.rfind("/dev/", 0) == 0;
+    }
+
+    std::vector<std::string> build_node_candidates(const std::string& device_name) {
+        std::string primary = device_name;
+        if (device_name.rfind("direct:", 0) == 0) {
+            primary = device_name.substr(7);
+        }
+        if (primary.empty()) {
+            primary = "/dev/snd/pcmC0D0p";
+        }
+
+        std::vector<std::string> candidates;
+        candidates.push_back(primary);
+        candidates.push_back("/dev/snd/pcmC0D0p");
+        for (const auto& dev : DirectAlsaPlayer::enumerate_kernel_pcm_devices()) {
+            if (std::find(candidates.begin(), candidates.end(), dev) == candidates.end()) {
+                candidates.push_back(dev);
+            }
+        }
+        return candidates;
+    }
+
+    // Runs one device open attempt on a fresh player. May block in the kernel
+    // for a long time; on success it hot-swaps the real device into
     // open->player. Never touches the AudioRouterClient object, so it remains
     // safe even if the client is destroyed while this thread is stuck.
     void attempt_device_open(std::shared_ptr<DeviceOpenShared> open,
-                             AudioConfig cfg, std::string device_name,
-                             std::shared_ptr<IAudioPlayer> device) {
+                             std::shared_ptr<IAudioPlayer> device,
+                             std::function<bool()> open_fn) {
         bool opened = false;
         if (!open->shutdown.load()) {
-            opened = device->open(cfg, device_name);
+            opened = open_fn();
         }
 
         if (opened && !open->shutdown.load()) {
@@ -57,17 +90,44 @@ namespace {
     // Supervises the retry loop: spawns one attempt thread at a time, abandons
     // it if it hangs in the kernel for kDeviceAttemptTimeoutMs, and retries
     // with backoff. Abandoned attempts keep running and hot-swap the device in
-    // automatically if they eventually succeed.
+    // automatically if they eventually succeed. Node-based devices try each
+    // PCM node in turn so one hung node (e.g. held by Android's audioserver)
+    // can't hide the others; after kMaxNodeOpenAttempts total attempts the loop
+    // gives up and tells the user how to free the node.
     void device_open_supervisor(std::shared_ptr<DeviceOpenShared> open,
                                 AudioConfig cfg, std::string device_name) {
+        const std::vector<std::string> candidates =
+            is_node_based_device(device_name) ? build_node_candidates(device_name) : std::vector<std::string>{};
+        const bool node_based = !candidates.empty();
+
         uint32_t backoff_ms = kDeviceRetryBackoffMs;
         int attempt = 1;
+        size_t candidate_index = 0;
 
         while (!open->shutdown.load()) {
-            auto device = std::make_shared<AlsaPlayer>();
+            std::string candidate;
+            if (node_based) {
+                candidate = candidates[candidate_index % candidates.size()];
+                ++candidate_index;
+                LOG_INFO("Audio device open attempt " << attempt << ": trying PCM node '" << candidate
+                         << "' (node " << ((candidate_index - 1) % candidates.size()) + 1
+                         << " of " << candidates.size() << ")");
+            }
+
+            std::shared_ptr<IAudioPlayer> device =
+                node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
+                           : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
             auto finished = std::make_shared<std::atomic<bool>>(false);
-            std::thread attempt_thread([open, cfg, device_name, device, finished]() {
-                attempt_device_open(open, cfg, device_name, device);
+            std::thread attempt_thread([open, cfg, device_name, candidate, device, finished]() {
+                if (!candidate.empty()) {
+                    attempt_device_open(open, device, [&]() {
+                        return std::static_pointer_cast<DirectAlsaPlayer>(device)->open_candidate_only(cfg, candidate);
+                    });
+                } else {
+                    attempt_device_open(open, device, [&]() {
+                        return device->open(cfg, device_name);
+                    });
+                }
                 finished->store(true);
             });
 
@@ -97,17 +157,29 @@ namespace {
             }
 
             if (!finished->load()) {
-                LOG_WARN("Audio device open attempt " << attempt << " hung in a kernel call ("
-                         << kDeviceAttemptTimeoutMs << "ms). Retrying with a fresh player; "
-                         << "if the abandoned attempt later succeeds the real device is "
-                         << "hot-swapped in automatically.");
+                LOG_WARN("Audio device open attempt " << attempt
+                         << (candidate.empty() ? "" : " on '" + candidate + "'")
+                         << " hung in a kernel call (" << kDeviceAttemptTimeoutMs << "ms). Abandoning it and trying "
+                         << (node_based ? "the next PCM node" : "a fresh player") << "; if the abandoned attempt "
+                         << "later succeeds the real device is hot-swapped in automatically.");
                 attempt_thread.detach();
             } else {
                 attempt_thread.join();
-                LOG_INFO("Audio device open attempt " << attempt << " failed; retrying.");
+                LOG_INFO("Audio device open attempt " << attempt
+                         << (candidate.empty() ? "" : " on '" + candidate + "'") << " failed; retrying.");
             }
 
             ++attempt;
+            if (node_based && attempt > static_cast<int>(kMaxNodeOpenAttempts)) {
+                LOG_ERROR("Giving up on the audio device after " << kMaxNodeOpenAttempts
+                          << " attempts across " << candidates.size() << " PCM node(s).");
+                LOG_ERROR("If every node hangs or fails, Android's 'audioserver' is most likely holding the "
+                          << "primary PCM device. On a rooted phone run (as root):");
+                LOG_ERROR("    stop audioserver");
+                LOG_ERROR("then re-run the client. Re-enable Android audio later with: start audioserver");
+                break;
+            }
+
             for (waited = 0; waited < backoff_ms && !open->shutdown.load(); waited += kDeviceAttemptPollMs) {
                 sleep_ms(kDeviceAttemptPollMs);
             }

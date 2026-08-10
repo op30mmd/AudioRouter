@@ -90,6 +90,9 @@ void AndroidHelpers::print_android_troubleshooting_tips() {
     LOG_INFO("   - Check available nodes in '/dev/snd/'. Usually '/dev/snd/pcmC0D0p' is Card 0 Device 0 Playback.");
     LOG_INFO("   - Some Android Qualcomm/MediaTek devices require routing the mixer to speaker:");
     LOG_INFO("     Run: tinymix | grep -i 'speaker' or tinymix 'RX_CDC_DMA_RX_0 Audio Mixer MultiMedia1' 1");
+    LOG_INFO("   - If the PCM node hangs or fails to open, Android's 'audioserver' is usually holding it.");
+    LOG_INFO("     Free the device (root), then re-run the client:");
+    LOG_INFO("       stop audioserver      (re-enable Android audio later with: start audioserver)");
     LOG_INFO("3. You can pass a specific ALSA device using: -d direct:/dev/snd/pcmC0D0p or -d hw:0,0");
 }
 

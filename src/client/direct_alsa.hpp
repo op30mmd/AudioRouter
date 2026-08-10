@@ -13,6 +13,9 @@ public:
     ~DirectAlsaPlayer() override;
 
     bool open(const AudioConfig& config, const std::string& device_name = "/dev/snd/pcmC0D0p") override;
+    // Open exactly this single PCM node (no fallback candidate loop). Used by
+    // the device-open supervisor so one hung node can't block the others.
+    bool open_candidate_only(const AudioConfig& config, const std::string& candidate);
     void close() override;
     bool is_open() const override;
 
@@ -24,6 +27,7 @@ public:
     static std::vector<std::string> enumerate_kernel_pcm_devices();
 
 private:
+    bool try_open_candidate(const std::string& candidate, std::string& last_error);
     std::atomic<int> fd_;
     AudioConfig config_;
     std::string device_path_;
