@@ -176,8 +176,13 @@ bool AgmPlayer::load_tinyalsa() {
 
 void AgmPlayer::unload_tinyalsa() {
     if (api_) {
-        if (api_->tinyalsa_handle) dlclose(api_->tinyalsa_handle);
-        if (api_->agm_handle) dlclose(api_->agm_handle);
+        // Intentionally do NOT dlclose() the vendor libraries. They register
+        // pthread TLS destructors (libagm_mixer_plugin/libagmclient keep their
+        // GKV state in thread-local storage); dlclose'ing them while the
+        // audio-open retry thread may still exit triggers SIGSEGV inside
+        // pthread_key_clean_all() (observed: 5-frame tombstone,
+        // #00 <unknown> TLS destructor, #01 pthread_key_clean_all). Leaking
+        // the handles until process exit is the safe pattern here.
         delete api_;
         api_ = nullptr;
     }
