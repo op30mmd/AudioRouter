@@ -3,6 +3,7 @@
 #include "audio_player.hpp"
 #include <string>
 #include <vector>
+#include <mutex>
 #include <atomic>
 
 // tinyalsa handles (opaque vendor types).
@@ -58,6 +59,9 @@ private:
     // before it is written to the PCM.
     std::vector<int16_t> downmix_buffer_;
     std::atomic<bool> is_open_;
+    // Serializes pcm_* calls against close() so a stop() racing a blocked
+    // pcm_write can't free the plugin handle underneath it.
+    std::mutex io_mutex_;
 };
 
 } // namespace audiorouter
