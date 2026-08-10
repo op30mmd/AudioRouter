@@ -289,22 +289,33 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
 
     // --- 3) best-effort media config on the AIF via AGM API ---
     if (api_->agm_aif_set_media_config) {
+        // 16-byte struct matching agm_api.h; memset keeps offset 12
+        // (data_format) clean - garbage there yields -EINVAL.
         struct agm_media_config media_config;
         memset(&media_config, 0, sizeof(media_config));
         media_config.rate = cfg.rate;
         media_config.channels = 1;
-        media_config.format = 0;  // S16_LE (tinyalsa-style enum)
         media_config.data_format = 0;
-        int mc_ret = api_->agm_aif_set_media_config(backend_.c_str(), &media_config);
-        if (mc_ret != 0) {
-            // Some AGM builds number the PCM formats from 1 (S16_LE = 1);
-            // retry with the alternate numbering before concluding failure.
-            media_config.format = 1;
+        int mc_ret = -22;
+        for (uint32_t fmt = 0; fmt <= 1; ++fmt) {  // tinyalsa enum 0, alternate 1
+            memset(&media_config, 0, sizeof(media_config));
+            media_config.rate = cfg.rate;
+            media_config.channels = 1;
+            media_config.format = fmt;
+            media_config.data_format = 0;
             mc_ret = api_->agm_aif_set_media_config(backend_.c_str(), &media_config);
+            LOG_INFO("AgmPlayer: agm_aif_set_media_config('" << backend_ << "', " << cfg.rate
+                     << " Hz, 1ch, format=" << fmt << ") rc " << mc_ret);
+            if (mc_ret == 0) break;
         }
-        LOG_INFO("AgmPlayer: agm_aif_set_media_config('" << backend_ << "', " << cfg.rate << " Hz, 1ch, S16_LE) rc "
-                 << mc_ret << (mc_ret != 0 ? " (-EINVAL: wrong field layout, enum value, or unknown AIF name)"
-                                           : ""));
+        if (mc_ret != 0) {
+            // Not fatal: some builds route purely via the mixer controls
+            // above (agmplay never calls this API), so pcm_open still gets a
+            // chance. The plugin failing with "failed to open plugin" later
+            // would point back here.
+            LOG_WARN("AgmPlayer: AGM rejected the media config for AIF '" << backend_
+                     << "' (last rc " << mc_ret << "); continuing - pcm_open may fail");
+        }
     }
 
     LOG_INFO("AgmPlayer: opening AGM PCM card " << kAgmCard << " device " << kAgmDevice
