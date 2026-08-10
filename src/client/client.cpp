@@ -7,8 +7,16 @@
 
 #include <cstring>
 #include <vector>
+#include <chrono>
 
 namespace audiorouter {
+
+namespace {
+    // How long to wait for the ALSA/direct audio device to open before giving
+    // up and falling back to the dummy sink. The open can hang in a kernel
+    // ioctl on Android when the audio HAL holds the PCM node.
+    constexpr uint32_t kPlayerOpenTimeoutMs = 3000;
+}
 
 AudioRouterClient::AudioRouterClient(const ClientConfig& config)
     : config_(config),
@@ -83,32 +91,102 @@ bool AudioRouterClient::start() {
     // Configure Jitter Buffer with negotiated stream parameters
     jitter_buffer_.configure(audio_config_, config_.target_latency_ms);
 
-    // Open ALSA Player with negotiated format
-    if (!player_->open(audio_config_, config_.device_name)) {
-        LOG_WARN("Could not open ALSA device '" << config_.device_name << "'. Trying dummy sink fallback...");
-        player_ = std::make_unique<DummyPlayer>();
-        player_->open(audio_config_, "dummy_fallback");
-        AndroidHelpers::print_android_troubleshooting_tips();
-    }
-
     is_running_ = true;
     state_ = ClientState::STREAMING;
     last_packet_time_ms_ = get_time_ms();
 
-    // Start threads
+    // Start worker threads BEFORE opening the audio device. This keeps the
+    // server heartbeat alive (its watchdog would otherwise disconnect the
+    // client) and keeps Ctrl+C responsive even if the device open hangs.
     net_thread_ = std::thread(&AudioRouterClient::network_receive_thread, this);
     playback_thread_ = std::thread(&AudioRouterClient::audio_playback_thread, this);
     heartbeat_thread_ = std::thread(&AudioRouterClient::heartbeat_thread, this);
+
+    // Open the audio player on a bounded, cancellable path: a hung ALSA /
+    // kernel driver must never block the main thread or stall shutdown.
+    open_player_with_timeout(config_.device_name, kPlayerOpenTimeoutMs);
 
     LOG_INFO("AudioRouter Client connected and streaming directly to Android speakers!");
     return true;
 }
 
+void AudioRouterClient::open_player_with_timeout(const std::string& device_name, uint32_t timeout_ms) {
+    if (!player_) return;
+
+    if (config_.use_dummy_player) {
+        player_->open(audio_config_, device_name);
+        return;
+    }
+
+    IAudioPlayer* raw_player = player_.get();
+
+    player_open_cancelled_ = false;
+    player_open_result_ = false;
+    {
+        std::lock_guard<std::mutex> lock(player_open_mutex_);
+        player_open_pending_ = true;
+    }
+
+    std::thread worker([this, raw_player, device_name]() {
+        player_open_worker(raw_player, device_name);
+    });
+
+    bool completed = false;
+    {
+        std::unique_lock<std::mutex> lock(player_open_mutex_);
+        completed = player_open_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                             [this]() { return !player_open_pending_; });
+    }
+
+    if (!completed) {
+        // The device driver is not responding. Abandon the open and fall back
+        // to the dummy sink so the session and shutdown stay responsive.
+        LOG_WARN("Audio device open timed out after " << timeout_ms
+                 << "ms (ALSA driver may be busy). Falling back to dummy sink...");
+        player_open_cancelled_ = true;
+        worker.detach();
+        abandoned_player_.release(); // never delete: the detached worker may still be inside open()
+        abandoned_player_ = std::move(player_);
+        player_ = std::make_unique<DummyPlayer>();
+        player_->open(audio_config_, "dummy_fallback");
+        AndroidHelpers::print_android_troubleshooting_tips();
+        return;
+    }
+
+    worker.join();
+
+    if (!player_open_result_) {
+        LOG_WARN("Could not open ALSA device '" << device_name << "'. Trying dummy sink fallback...");
+        player_ = std::make_unique<DummyPlayer>();
+        player_->open(audio_config_, "dummy_fallback");
+        AndroidHelpers::print_android_troubleshooting_tips();
+    }
+}
+
+void AudioRouterClient::player_open_worker(IAudioPlayer* player, const std::string& device_name) {
+    bool opened = false;
+    if (!player_open_cancelled_) {
+        opened = player->open(audio_config_, device_name);
+        if (player_open_cancelled_) {
+            player->close();
+            opened = false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(player_open_mutex_);
+        player_open_result_ = opened;
+        player_open_pending_ = false;
+    }
+    player_open_cv_.notify_all();
+}
+
 void AudioRouterClient::stop() {
+    stop_requested_ = true;
     is_running_ = false;
+    player_open_cancelled_ = true;
 
     // Send DISCONNECT_REQ to Windows server so it un-mutes PC speaker immediately
-    if (server_addr_.is_valid() && socket_.is_open()) {
+    if (server_addr_.is_valid()) {
         std::vector<uint8_t> dis_buf(sizeof(protocol::CommonHeader) + sizeof(protocol::DisconnectPayload));
         auto* dis_hdr = reinterpret_cast<protocol::CommonHeader*>(dis_buf.data());
         auto* dis_pay = reinterpret_cast<protocol::DisconnectPayload*>(dis_buf.data() + sizeof(protocol::CommonHeader));
@@ -124,11 +202,17 @@ void AudioRouterClient::stop() {
         dis_pay->reason_code = 0;
         std::strncpy(dis_pay->reason, "Client closed", sizeof(dis_pay->reason) - 1);
 
-        socket_.send_to(dis_buf.data(), dis_buf.size(), server_addr_);
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        if (socket_.is_open()) {
+            socket_.send_to(dis_buf.data(), dis_buf.size(), server_addr_);
+        }
     }
 
     // Close UDP socket to unblock network receive thread
-    socket_.close();
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        socket_.close();
+    }
 
     // Close audio player to unblock playback thread immediately
     if (player_) {
@@ -224,6 +308,8 @@ bool AudioRouterClient::discover_server(SocketAddress& out_server_addr) {
 }
 
 bool AudioRouterClient::perform_handshake() {
+    if (stop_requested_) return false;
+
     LOG_INFO("Initiating handshake with server at " << server_addr_.to_string() << "...");
 
     std::vector<uint8_t> req_buf(sizeof(protocol::CommonHeader) + sizeof(protocol::ConnectReqPayload));
@@ -248,6 +334,8 @@ bool AudioRouterClient::perform_handshake() {
     std::vector<uint8_t> recv_buf(4096);
 
     for (int retry = 0; retry < 5; ++retry) {
+        if (stop_requested_) return false;
+
         LOG_DEBUG("Sending CONNECT_REQ (attempt " << (retry + 1) << "/5)...");
         socket_.send_to(req_buf.data(), req_buf.size(), server_addr_);
 
@@ -294,9 +382,14 @@ void AudioRouterClient::network_receive_thread() {
     std::vector<uint8_t> recv_buf(65536);
     socket_.set_receive_timeout_ms(200);
 
-    while (is_running_) {
+    while (is_running_ && !stop_requested_) {
         SocketAddress sender;
-        int bytes = socket_.receive_from(recv_buf.data(), recv_buf.size(), sender);
+        int bytes;
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            if (!is_running_ || stop_requested_) break;
+            bytes = socket_.receive_from(recv_buf.data(), recv_buf.size(), sender);
+        }
 
         if (bytes <= 0) {
             if (!is_running_) break;
@@ -381,7 +474,7 @@ void AudioRouterClient::heartbeat_thread() {
     auto* ping_hdr = reinterpret_cast<protocol::CommonHeader*>(ping_buf.data());
     auto* ping_pay = reinterpret_cast<protocol::HeartbeatPayload*>(ping_buf.data() + sizeof(protocol::CommonHeader));
 
-    while (is_running_) {
+    while (is_running_ && !stop_requested_) {
         auto j_stats = jitter_buffer_.get_stats();
 
         ping_hdr->magic = protocol::MAGIC;
@@ -399,12 +492,16 @@ void AudioRouterClient::heartbeat_thread() {
         ping_pay->buffer_underruns = static_cast<uint32_t>(j_stats.underruns);
         ping_pay->buffer_overruns = static_cast<uint32_t>(j_stats.overruns);
 
-        socket_.send_to(ping_buf.data(), ping_buf.size(), server_addr_);
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            if (!is_running_ || stop_requested_) break;
+            socket_.send_to(ping_buf.data(), ping_buf.size(), server_addr_);
+        }
 
         // Watchdog check for server connection timeout
         uint64_t now_ms = get_time_ms();
         uint64_t last_packet = last_packet_time_ms_.load();
-        if (last_packet > 0 && (now_ms - last_packet) > config_.reconnect_timeout_ms) {
+        if (!stop_requested_ && last_packet > 0 && (now_ms - last_packet) > config_.reconnect_timeout_ms) {
             LOG_WARN("Server packet stream timeout (" << (now_ms - last_packet) << "ms). Attempting to re-handshake...");
             perform_handshake();
             last_packet_time_ms_ = get_time_ms();

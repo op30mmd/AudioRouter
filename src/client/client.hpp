@@ -9,6 +9,7 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <memory>
 
@@ -62,14 +63,20 @@ private:
     void network_receive_thread();
     void audio_playback_thread();
     void heartbeat_thread();
+    void open_player_with_timeout(const std::string& device_name, uint32_t timeout_ms);
+    void player_open_worker(IAudioPlayer* player, const std::string& device_name);
 
     ClientConfig config_;
     std::atomic<bool> is_running_;
+    std::atomic<bool> stop_requested_{false};
     std::atomic<ClientState> state_;
 
     UdpSocket socket_;
     SocketAddress server_addr_;
     AudioConfig audio_config_;
+
+    // Guards all socket send/receive/close calls (UdpSocket is not thread-safe)
+    std::mutex socket_mutex_;
 
     std::unique_ptr<IAudioPlayer> player_;
     JitterBuffer jitter_buffer_;
@@ -85,6 +92,17 @@ private:
     std::thread net_thread_;
     std::thread playback_thread_;
     std::thread heartbeat_thread_;
+
+    // Bounded audio-device open: the ALSA/direct open can hang in a kernel
+    // ioctl, so it runs on a short-lived worker and is abandoned on timeout.
+    std::mutex player_open_mutex_;
+    std::condition_variable player_open_cv_;
+    bool player_open_pending_ = false;
+    bool player_open_result_ = false;
+    std::atomic<bool> player_open_cancelled_{false};
+    // Holds a player whose open() was abandoned after a timeout. Deliberately
+    // never deleted: a detached worker may still be executing inside it.
+    std::unique_ptr<IAudioPlayer> abandoned_player_;
 };
 
 } // namespace audiorouter
