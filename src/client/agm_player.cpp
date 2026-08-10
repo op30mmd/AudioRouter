@@ -47,8 +47,17 @@ typedef struct mixer* (*mixer_open_fn)(unsigned int card);
 typedef void (*mixer_close_fn)(struct mixer* mixer);
 struct mixer_ctl;
 typedef struct mixer_ctl* (*mixer_get_ctl_fn)(struct mixer* mixer, const char* name);
+typedef struct mixer_ctl* (*mixer_get_ctl_by_id_fn)(struct mixer* mixer, unsigned int id);
 typedef int (*mixer_ctl_set_value_fn)(struct mixer_ctl* ctl, unsigned int id, int value);
 typedef int (*mixer_ctl_set_enum_by_string_fn)(struct mixer_ctl* ctl, const char* string);
+
+// AGM media config for agm_aif_set_media_config (libagmclient).
+struct agm_media_config {
+    uint32_t rate;
+    uint32_t channels;
+    uint32_t format;
+};
+typedef int (*agm_aif_set_media_config_fn)(const char* aif_name, struct agm_media_config* media_config);
 
 constexpr unsigned int kPcmOut = 0x00000000;
 
@@ -56,6 +65,12 @@ constexpr unsigned int kPcmOut = 0x00000000;
 // backend "CODEC_DMA-LPAIF_RXTX-RX-1".
 constexpr unsigned int kAgmCard = 100;
 constexpr unsigned int kAgmDevice = 100;
+
+// Fallback control IDs verified on the A05s (tinymix -D 100):
+//   #9  = "<backend> rate"      #51 = "PCM100 connect"
+// Used only if name lookup yields nothing.
+constexpr unsigned int kRateCtlId = 9;
+constexpr unsigned int kConnectCtlId = 51;
 
 } // namespace
 
@@ -73,8 +88,12 @@ struct AgmPlayer::PcmApi {
     mixer_open_fn mixer_open = nullptr;
     mixer_close_fn mixer_close = nullptr;
     mixer_get_ctl_fn mixer_get_ctl = nullptr;
+    mixer_get_ctl_by_id_fn mixer_get_ctl_by_id = nullptr;
     mixer_ctl_set_value_fn mixer_ctl_set_value = nullptr;
     mixer_ctl_set_enum_by_string_fn mixer_ctl_set_enum_by_string = nullptr;
+    // Best-effort AGM API (libagmclient): media config on the AIF prior to open.
+    void* agm_handle = nullptr;
+    agm_aif_set_media_config_fn agm_aif_set_media_config = nullptr;
 };
 
 AgmPlayer::AgmPlayer() : api_(nullptr), pcm_impl_(nullptr), mixer_impl_(nullptr), is_open_(false) {}
@@ -122,8 +141,18 @@ bool AgmPlayer::load_tinyalsa() {
     api->mixer_open = reinterpret_cast<mixer_open_fn>(dlsym(api->tinyalsa_handle, "mixer_open"));
     api->mixer_close = reinterpret_cast<mixer_close_fn>(dlsym(api->tinyalsa_handle, "mixer_close"));
     api->mixer_get_ctl = reinterpret_cast<mixer_get_ctl_fn>(dlsym(api->tinyalsa_handle, "mixer_get_ctl"));
+    api->mixer_get_ctl_by_id = reinterpret_cast<mixer_get_ctl_by_id_fn>(dlsym(api->tinyalsa_handle, "mixer_get_ctl"));
     api->mixer_ctl_set_value = reinterpret_cast<mixer_ctl_set_value_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_value"));
     api->mixer_ctl_set_enum_by_string = reinterpret_cast<mixer_ctl_set_enum_by_string_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_enum_by_string"));
+    api->agm_handle = dlopen("/vendor/lib64/libagmclient.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!api->agm_handle) api->agm_handle = dlopen("libagmclient.so", RTLD_NOW | RTLD_GLOBAL);
+    if (api->agm_handle) {
+        api->agm_aif_set_media_config =
+            reinterpret_cast<agm_aif_set_media_config_fn>(dlsym(api->agm_handle, "agm_aif_set_media_config"));
+        if (!api->agm_aif_set_media_config) LOG_DEBUG("AgmPlayer: libagmclient.so has no agm_aif_set_media_config");
+    } else {
+        LOG_DEBUG("AgmPlayer: libagmclient.so not found; skipping AIF media config (rc from dlopen: " << dlerror() << ")");
+    }
 
     if (!api->pcm_open || !api->pcm_write || !api->pcm_close || !api->mixer_open || !api->mixer_close ||
         !api->mixer_get_ctl || !api->mixer_ctl_set_value || !api->mixer_ctl_set_enum_by_string) {
@@ -140,6 +169,7 @@ bool AgmPlayer::load_tinyalsa() {
 void AgmPlayer::unload_tinyalsa() {
     if (api_) {
         if (api_->tinyalsa_handle) dlclose(api_->tinyalsa_handle);
+        if (api_->agm_handle) dlclose(api_->agm_handle);
         delete api_;
         api_ = nullptr;
     }
@@ -193,33 +223,63 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
     //   2) "PCM<dev> connect" - enum control routing PCM session <dev> onto
     //      the backend graph (verified as control #51). Without it the plugin
     //      sees an unrouted session and pcm_open fails with -32.
+    // Successful tinymix settings from a shell do not travel into this
+    // process, so both controls are set here, in-process, on our own mixer
+    // handle.
     const unsigned int bits_per_sample = 16;  // S16_LE
+
+    // --- 1) backend rate control: by name, then by known control ID ---
     std::string rate_ctl_name = backend_ + " rate";
     struct mixer_ctl* rate_ctl = api_->mixer_get_ctl(mixer_impl_, rate_ctl_name.c_str());
+    std::string rate_lookup = "name '" + rate_ctl_name + "'";
     if (!rate_ctl) {
         rate_ctl_name = backend_ + " rate ch fmt";  // older AGM builds
         rate_ctl = api_->mixer_get_ctl(mixer_impl_, rate_ctl_name.c_str());
+        rate_lookup = "name '" + rate_ctl_name + "'";
+    }
+    if (!rate_ctl && api_->mixer_get_ctl_by_id) {
+        rate_ctl = api_->mixer_get_ctl_by_id(mixer_impl_, kRateCtlId);
+        rate_lookup = "id " + std::to_string(kRateCtlId);
     }
     if (rate_ctl) {
         const int set_ret = api_->mixer_ctl_set_value(rate_ctl, 0, static_cast<int>(cfg.rate));
         api_->mixer_ctl_set_value(rate_ctl, 1, 1);                       // mono
         api_->mixer_ctl_set_value(rate_ctl, 2, static_cast<int>(bits_per_sample));
         api_->mixer_ctl_set_value(rate_ctl, 3, 0);
-        LOG_INFO("AgmPlayer: set backend control '" << rate_ctl_name << "' = " << cfg.rate
+        LOG_INFO("AgmPlayer: rate control (by " << rate_lookup << ") = " << cfg.rate
                  << " Hz, 1 ch, " << bits_per_sample << " bit (rc " << set_ret << ")");
     } else {
         LOG_WARN("AgmPlayer: backend rate control for '" << backend_ << "' not found on card " << kAgmCard
                  << "; the AGM PCM plugin may refuse to open. List controls with: tinymix -D " << kAgmCard);
     }
 
+    // --- 2) route PCM session onto the backend: by name, then by ID ---
     const std::string connect_ctl_name = "PCM" + std::to_string(kAgmDevice) + " connect";
     struct mixer_ctl* connect_ctl = api_->mixer_get_ctl(mixer_impl_, connect_ctl_name.c_str());
+    std::string connect_lookup = "name '" + connect_ctl_name + "'";
+    if (!connect_ctl && api_->mixer_get_ctl_by_id) {
+        connect_ctl = api_->mixer_get_ctl_by_id(mixer_impl_, kConnectCtlId);
+        connect_lookup = "id " + std::to_string(kConnectCtlId);
+    }
     if (connect_ctl) {
         const int conn_ret = api_->mixer_ctl_set_enum_by_string(connect_ctl, backend_.c_str());
-        LOG_INFO("AgmPlayer: '" << connect_ctl_name << "' -> '" << backend_ << "' (rc " << conn_ret << ")");
+        LOG_INFO("AgmPlayer: '" << connect_ctl_name << "' (by " << connect_lookup << ") -> '" << backend_
+                 << "' (rc " << conn_ret << ")");
     } else {
         LOG_WARN("AgmPlayer: control '" << connect_ctl_name << "' not found on card " << kAgmCard
                  << "; list controls with: tinymix -D " << kAgmCard);
+    }
+
+    // --- 3) best-effort media config on the AIF via AGM API ---
+    if (api_->agm_aif_set_media_config) {
+        struct agm_media_config media_config;
+        memset(&media_config, 0, sizeof(media_config));
+        media_config.rate = cfg.rate;
+        media_config.channels = 1;
+        media_config.format = 0;  // PCM
+        const int mc_ret = api_->agm_aif_set_media_config(backend_.c_str(), &media_config);
+        LOG_INFO("AgmPlayer: agm_aif_set_media_config('" << backend_ << "', " << cfg.rate << " Hz, 1ch) rc "
+                 << mc_ret);
     }
 
     LOG_INFO("AgmPlayer: opening AGM PCM card " << kAgmCard << " device " << kAgmDevice
