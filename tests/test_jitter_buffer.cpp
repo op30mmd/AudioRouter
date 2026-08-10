@@ -23,7 +23,7 @@ bool run_jitter_buffer_tests() {
 
     TEST_ASSERT(!jb.is_ready());
 
-    // Create 5 sample packets
+    // Create sample packets
     std::vector<int16_t> pkt0(240 * 2, 100);
     std::vector<int16_t> pkt1(240 * 2, 200);
     std::vector<int16_t> pkt2(240 * 2, 300);
@@ -75,8 +75,47 @@ bool run_jitter_buffer_tests() {
     TEST_ASSERT(out[0] == 500); // Packet 4
 
     auto stats = jb.get_stats();
-    TEST_ASSERT(stats.packets_lost >= 1);
+    TEST_ASSERT(stats.packets_lost == 1);
     TEST_ASSERT(stats.packets_duplicate >= 1);
+
+    // Now the buffer is completely empty (starved).
+    // Test that popping repeatedly during starvation delivers silence without running away with lost_packets!
+    for (int i = 0; i < 50; ++i) {
+        size_t starv_pop = jb.pop_frames(out.data(), 240);
+        TEST_ASSERT(starv_pop == 240);
+        TEST_ASSERT(out[0] == 0);
+    }
+
+    auto stats_after_starv = jb.get_stats();
+    // packets_lost should STILL be 1 (NOT 51)!
+    TEST_ASSERT(stats_after_starv.packets_lost == 1);
+
+    // Stream resumes: sender sends packet 5, 6, 7!
+    std::vector<int16_t> pkt5(240 * 2, 600);
+    std::vector<int16_t> pkt6(240 * 2, 700);
+    std::vector<int16_t> pkt7(240 * 2, 800);
+
+    TEST_ASSERT(jb.push_packet(5, 6000, pkt5.data(), 240));
+    TEST_ASSERT(jb.push_packet(6, 7000, pkt6.data(), 240));
+    TEST_ASSERT(jb.push_packet(7, 8000, pkt7.data(), 240));
+
+    // Jitter buffer should be ready again and play packet 5 without dropping it as late
+    TEST_ASSERT(jb.is_ready());
+
+    size_t pop_resumed5 = jb.pop_frames(out.data(), 240);
+    TEST_ASSERT(pop_resumed5 == 240);
+    TEST_ASSERT(out[0] == 600);
+
+    size_t pop_resumed6 = jb.pop_frames(out.data(), 240);
+    TEST_ASSERT(pop_resumed6 == 240);
+    TEST_ASSERT(out[0] == 700);
+
+    size_t pop_resumed7 = jb.pop_frames(out.data(), 240);
+    TEST_ASSERT(pop_resumed7 == 240);
+    TEST_ASSERT(out[0] == 800);
+
+    auto stats_final = jb.get_stats();
+    TEST_ASSERT(stats_final.packets_lost == 1);
 
     return true;
 }

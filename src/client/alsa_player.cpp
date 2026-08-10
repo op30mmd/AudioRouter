@@ -5,6 +5,16 @@
 
 #if defined(__linux__) || defined(__ANDROID__)
     #include <dlfcn.h>
+
+namespace {
+    void quiet_alsa_error_handler(const char* file, int line, const char* function, int err, const char* fmt, ...) {
+        (void)file;
+        (void)line;
+        (void)function;
+        (void)err;
+        (void)fmt;
+    }
+}
 #endif
 
 namespace audiorouter {
@@ -33,6 +43,7 @@ struct AlsaPlayer::Impl {
     int (*snd_pcm_drop)(void* pcm) = nullptr;
     int (*snd_pcm_delay)(void* pcm, long* delayp) = nullptr;
     const char* (*snd_strerror)(int errnum) = nullptr;
+    int (*snd_lib_error_set_handler)(void (*handler)(const char *file, int line, const char *function, int err, const char *fmt, ...)) = nullptr;
 
     bool load_libasound() {
         if (lib_handle) return true;
@@ -89,6 +100,12 @@ struct AlsaPlayer::Impl {
         LOAD_SYM(snd_strerror);
 
         #undef LOAD_SYM
+
+        snd_lib_error_set_handler = (decltype(snd_lib_error_set_handler))dlsym(lib_handle, "snd_lib_error_set_handler");
+        if (snd_lib_error_set_handler) {
+            snd_lib_error_set_handler(quiet_alsa_error_handler);
+        }
+
         return true;
     }
 #endif

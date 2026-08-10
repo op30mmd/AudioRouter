@@ -355,6 +355,8 @@ void AudioRouterClient::network_receive_thread() {
 void AudioRouterClient::audio_playback_thread() {
     const size_t period_frames = audio_config_.frames_per_packet > 0 ? audio_config_.frames_per_packet : 240;
     std::vector<int16_t> play_buffer(period_frames * audio_config_.channels);
+    const uint32_t frame_duration_ms = static_cast<uint32_t>((period_frames * 1000) / (audio_config_.sample_rate > 0 ? audio_config_.sample_rate : 48000));
+    const uint32_t fallback_sleep_ms = (frame_duration_ms > 0) ? frame_duration_ms : 2;
 
     while (is_running_) {
         // Read frames from jitter buffer
@@ -365,9 +367,12 @@ void AudioRouterClient::audio_playback_thread() {
             if (written > 0) {
                 std::lock_guard<std::mutex> lock(stats_mutex_);
                 stats_.frames_played += written;
+            } else {
+                // Audio device returned 0 frames written or was busy; pace the thread
+                sleep_ms(fallback_sleep_ms);
             }
         } else {
-            sleep_ms(2);
+            sleep_ms(fallback_sleep_ms);
         }
     }
 }

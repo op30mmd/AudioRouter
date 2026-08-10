@@ -17,6 +17,7 @@ JitterBuffer::JitterBuffer(uint32_t target_latency_ms)
       is_buffering_(true),
       slot_frame_offset_(0),
       last_arrival_timestamp_us_(0),
+      last_transit_us_(0),
       jitter_estimate_us_(0.0) {}
 
 void JitterBuffer::configure(const AudioConfig& config, uint32_t target_latency_ms) {
@@ -38,6 +39,7 @@ void JitterBuffer::reset() {
     is_buffering_ = true;
     slot_frame_offset_ = 0;
     last_arrival_timestamp_us_ = 0;
+    last_transit_us_ = 0;
     jitter_estimate_us_ = 0.0;
 }
 
@@ -50,12 +52,11 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
     // Jitter calculation (RFC 3550 style exponential moving average)
     if (last_arrival_timestamp_us_ > 0 && timestamp_us > 0) {
         int64_t transit_diff = static_cast<int64_t>(now_us - timestamp_us);
-        static int64_t last_transit = 0;
-        if (last_transit != 0) {
-            int64_t d = std::abs(transit_diff - last_transit);
+        if (last_transit_us_ != 0) {
+            int64_t d = std::abs(transit_diff - last_transit_us_);
             jitter_estimate_us_ += (static_cast<double>(d) - jitter_estimate_us_) / 16.0;
         }
-        last_transit = transit_diff;
+        last_transit_us_ = transit_diff;
     }
     last_arrival_timestamp_us_ = now_us;
 
@@ -71,16 +72,35 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
     int32_t diff = static_cast<int32_t>(seq_num - next_play_seq_);
 
     if (diff < 0) {
-        // Late packet arriving after slot has already played
-        stats_.packets_out_of_order++;
-        return false;
+        if (diff > -static_cast<int32_t>(MAX_SLOTS)) {
+            // Late packet arriving after slot has already played
+            stats_.packets_out_of_order++;
+            return false;
+        } else {
+            // Massive backward sequence jump (server restart or client sequence desync)
+            LOG_WARN("JitterBuffer: Massive backward sequence jump (diff=" << diff << "). Resyncing play pointer.");
+            for (auto& s : slots_) {
+                s.is_valid = false;
+                s.pcm_data.clear();
+            }
+            next_play_seq_ = seq_num;
+            is_buffering_ = true;
+            slot_frame_offset_ = 0;
+            diff = 0;
+        }
     }
 
     if (diff >= static_cast<int32_t>(MAX_SLOTS)) {
         // Too far ahead (buffer overrun or major gap) -> resync
         LOG_WARN("JitterBuffer: Massive sequence jump (diff=" << diff << "). Resyncing play pointer.");
         stats_.overruns++;
+        for (auto& s : slots_) {
+            s.is_valid = false;
+            s.pcm_data.clear();
+        }
         next_play_seq_ = seq_num;
+        is_buffering_ = true;
+        slot_frame_offset_ = 0;
         diff = 0;
     }
 
@@ -114,10 +134,17 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
             }
         }
 
-        if (buffered >= target_buffer_frames_) {
+        size_t total_valid_frames = 0;
+        for (const auto& s : slots_) {
+            if (s.is_valid) {
+                total_valid_frames += s.num_frames;
+            }
+        }
+
+        if (buffered >= target_buffer_frames_ || total_valid_frames >= target_buffer_frames_) {
             is_buffering_ = false;
             LOG_DEBUG("JitterBuffer: Pre-buffering complete (" << buffered << " frames, "
-                      << (buffered * 1000 / config_.sample_rate) << " ms). Starting ALSA playback.");
+                      << (config_.sample_rate > 0 ? (buffered * 1000 / config_.sample_rate) : 0) << " ms). Starting ALSA playback.");
         }
     }
 
@@ -157,24 +184,49 @@ size_t JitterBuffer::pop_frames(int16_t* dest, size_t num_frames) {
             if (slot_frame_offset_ >= slot.num_frames) {
                 // Done with this slot
                 slot.is_valid = false;
+                slot.pcm_data.clear();
                 slot_frame_offset_ = 0;
                 next_play_seq_++;
             }
         } else {
-            // Packet loss or gap! Conceal loss with silence / interpolation
-            stats_.packets_lost++;
-            stats_.underruns++;
+            // Check if any valid future packets exist in the jitter buffer
+            bool has_future_packets = false;
+            for (size_t i = 1; i < MAX_SLOTS; ++i) {
+                size_t s = (next_play_seq_ + i) % MAX_SLOTS;
+                if (slots_[s].is_valid) {
+                    has_future_packets = true;
+                    break;
+                }
+            }
 
-            size_t needed = num_frames - frames_delivered;
-            size_t conceal_frames = std::min(needed, static_cast<size_t>(config_.frames_per_packet > 0 ? config_.frames_per_packet : 240));
+            if (has_future_packets) {
+                // Packet loss or gap! Conceal loss with silence / interpolation
+                stats_.packets_lost++;
+                stats_.underruns++;
 
-            int16_t* dst_ptr = dest + (frames_delivered * config_.channels);
-            std::fill(dst_ptr, dst_ptr + (conceal_frames * config_.channels), 0);
+                size_t needed = num_frames - frames_delivered;
+                size_t conceal_frames = std::min(needed, static_cast<size_t>(config_.frames_per_packet > 0 ? config_.frames_per_packet : 240));
 
-            frames_delivered += conceal_frames;
-            slot.is_valid = false;
-            slot_frame_offset_ = 0;
-            next_play_seq_++; // Skip the missing packet slot
+                int16_t* dst_ptr = dest + (frames_delivered * config_.channels);
+                std::fill(dst_ptr, dst_ptr + (conceal_frames * config_.channels), 0);
+
+                frames_delivered += conceal_frames;
+                slot.is_valid = false;
+                slot.pcm_data.clear();
+                slot_frame_offset_ = 0;
+                next_play_seq_++; // Skip the missing packet slot
+            } else {
+                // No future packets exist -> buffer ran dry (underrun / pause).
+                // Enter buffering mode, output silence, and keep play pointer intact
+                is_buffering_ = true;
+                stats_.underruns++;
+
+                size_t needed = num_frames - frames_delivered;
+                int16_t* dst_ptr = dest + (frames_delivered * config_.channels);
+                std::fill(dst_ptr, dst_ptr + (needed * config_.channels), 0);
+                frames_delivered += needed;
+                break;
+            }
         }
     }
 

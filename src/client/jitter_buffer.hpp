@@ -70,6 +70,7 @@ private:
     // Metrics & Skew tracking
     JitterBufferStats stats_;
     uint64_t last_arrival_timestamp_us_;
+    int64_t last_transit_us_;
     double jitter_estimate_us_;
     mutable std::mutex mutex_;
 };

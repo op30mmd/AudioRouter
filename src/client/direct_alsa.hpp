@@ -28,6 +28,7 @@ private:
     std::string device_path_;
     size_t period_size_frames_;
     size_t buffer_size_frames_;
+    std::vector<int16_t> staging_buffer_;
     bool is_open_;
 };
 

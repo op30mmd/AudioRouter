@@ -462,7 +462,7 @@ void AudioRouterServer::on_audio_captured(const void* data, size_t num_frames, c
         hdr->common.flags = protocol::FLAG_NONE;
         hdr->common.seq_num = sequence_number_.fetch_add(1);
         hdr->common.timestamp_us = get_time_us();
-        hdr->common.payload_size = sizeof(protocol::AudioPacketHeader) - sizeof(protocol::CommonHeader) + target_chunk_bytes;
+        hdr->common.payload_size = static_cast<uint32_t>(sizeof(protocol::AudioPacketHeader) - sizeof(protocol::CommonHeader) + target_chunk_bytes);
 
         hdr->sample_rate = config.sample_rate;
         hdr->channels = config.channels;
