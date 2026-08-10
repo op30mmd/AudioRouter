@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <algorithm>
 #include <vector>
 
@@ -47,8 +48,11 @@ typedef int (*pcm_drop_fn)(struct pcm* pcm);
 typedef struct mixer* (*mixer_open_fn)(unsigned int card);
 typedef void (*mixer_close_fn)(struct mixer* mixer);
 struct mixer_ctl;
-typedef struct mixer_ctl* (*mixer_get_ctl_fn)(struct mixer* mixer, const char* name);
-typedef struct mixer_ctl* (*mixer_get_ctl_by_id_fn)(struct mixer* mixer, unsigned int id);
+// NOTE: in tinyalsa (both AOSP and qcom's fork) mixer_get_ctl() is indexed by
+// unsigned id; the by-name API is the separate mixer_get_ctl_by_name() symbol.
+typedef struct mixer_ctl* (*mixer_get_ctl_fn)(struct mixer* mixer, unsigned int id);
+typedef struct mixer_ctl* (*mixer_get_ctl_by_name_fn)(struct mixer* mixer, const char* name);
+typedef unsigned int (*mixer_get_num_ctls_fn)(struct mixer* mixer);
 typedef const char* (*mixer_ctl_get_name_fn)(const struct mixer_ctl* ctl);
 typedef int (*mixer_ctl_set_value_fn)(struct mixer_ctl* ctl, unsigned int id, int value);
 typedef int (*mixer_ctl_set_enum_by_string_fn)(struct mixer_ctl* ctl, const char* string);
@@ -169,7 +173,8 @@ struct AgmPlayer::PcmApi {
     mixer_open_fn mixer_open = nullptr;
     mixer_close_fn mixer_close = nullptr;
     mixer_get_ctl_fn mixer_get_ctl = nullptr;
-    mixer_get_ctl_by_id_fn mixer_get_ctl_by_id = nullptr;
+    mixer_get_ctl_by_name_fn mixer_get_ctl_by_name = nullptr;
+    mixer_get_num_ctls_fn mixer_get_num_ctls = nullptr;
     mixer_ctl_get_name_fn mixer_ctl_get_name = nullptr;
     mixer_ctl_set_value_fn mixer_ctl_set_value = nullptr;
     mixer_ctl_set_enum_by_string_fn mixer_ctl_set_enum_by_string = nullptr;
@@ -178,6 +183,26 @@ struct AgmPlayer::PcmApi {
     void* agm_handle = nullptr;
     agm_aif_set_media_config_fn agm_aif_set_media_config = nullptr;
 };
+
+// Result of a mixer control lookup: the resolved handle plus how it was found,
+// so the open() log shows exactly which path succeeded.
+struct CtlLookup {
+    struct mixer_ctl* ctl = nullptr;
+    std::string resolved = "?";
+    std::string how = "not found";
+};
+
+bool NameEqualsIgnoreCase(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        const char la = static_cast<char>(std::tolower(static_cast<unsigned char>(*a)));
+        const char lb = static_cast<char>(std::tolower(static_cast<unsigned char>(*b)));
+        if (la != lb) return false;
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
 
 AgmPlayer::AgmPlayer() : api_(nullptr), pcm_impl_(nullptr), mixer_impl_(nullptr), is_open_(false) {}
 
@@ -224,7 +249,10 @@ bool AgmPlayer::load_tinyalsa() {
     api->mixer_open = reinterpret_cast<mixer_open_fn>(dlsym(api->tinyalsa_handle, "mixer_open"));
     api->mixer_close = reinterpret_cast<mixer_close_fn>(dlsym(api->tinyalsa_handle, "mixer_close"));
     api->mixer_get_ctl = reinterpret_cast<mixer_get_ctl_fn>(dlsym(api->tinyalsa_handle, "mixer_get_ctl"));
-    api->mixer_get_ctl_by_id = reinterpret_cast<mixer_get_ctl_by_id_fn>(dlsym(api->tinyalsa_handle, "mixer_get_ctl"));
+    api->mixer_get_ctl_by_name =
+        reinterpret_cast<mixer_get_ctl_by_name_fn>(dlsym(api->tinyalsa_handle, "mixer_get_ctl_by_name"));
+    api->mixer_get_num_ctls =
+        reinterpret_cast<mixer_get_num_ctls_fn>(dlsym(api->tinyalsa_handle, "mixer_get_num_ctls"));
     api->mixer_ctl_get_name = reinterpret_cast<mixer_ctl_get_name_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_get_name"));
     api->mixer_ctl_set_value = reinterpret_cast<mixer_ctl_set_value_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_value"));
     api->mixer_ctl_set_enum_by_string = reinterpret_cast<mixer_ctl_set_enum_by_string_fn>(dlsym(api->tinyalsa_handle, "mixer_ctl_set_enum_by_string"));
@@ -305,6 +333,64 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
         return false;
     }
 
+    if (api_->mixer_get_num_ctls && api_->mixer_get_ctl && api_->mixer_ctl_get_name) {
+        const unsigned int num = api_->mixer_get_num_ctls(mixer_impl_);
+        LOG_DEBUG("AgmPlayer: card " << kAgmCard << " exposes " << num << " mixer controls:");
+        for (unsigned int id = 0; id < num; ++id) {
+            struct mixer_ctl* c = api_->mixer_get_ctl(mixer_impl_, id);
+            const char* n = c ? api_->mixer_ctl_get_name(c) : nullptr;
+            LOG_DEBUG("AgmPlayer:   ctl[" << id << "] '" << (n ? n : "?") << "'");
+        }
+    }
+
+    // Resolve a control by name. qcom's tinyalsa exposes mixer_get_ctl() by
+    // index and the separate mixer_get_ctl_by_name(); on builds without the
+    // by-name symbol, fall back to an index walk comparing names (exact, then
+    // case-insensitive) so control lookup still works.
+    auto find_ctl = [this](const std::string& ctl_name) -> CtlLookup {
+        CtlLookup out;
+        if (!mixer_impl_) return out;
+        if (api_->mixer_get_ctl_by_name) {
+            out.ctl = api_->mixer_get_ctl_by_name(mixer_impl_, ctl_name.c_str());
+            out.how = "name '" + ctl_name + "'";
+            if (out.ctl) {
+                if (api_->mixer_ctl_get_name) {
+                    const char* n = api_->mixer_ctl_get_name(out.ctl);
+                    if (n) out.resolved = n;
+                }
+                return out;
+            }
+        }
+        if (api_->mixer_get_ctl && api_->mixer_ctl_get_name && api_->mixer_get_num_ctls) {
+            const unsigned int num = api_->mixer_get_num_ctls(mixer_impl_);
+            for (unsigned int id = 0; id < num; ++id) {
+                struct mixer_ctl* c = api_->mixer_get_ctl(mixer_impl_, id);
+                if (!c) continue;
+                const char* n = api_->mixer_ctl_get_name(c);
+                if (!n) continue;
+                if (std::strcmp(n, ctl_name.c_str()) == 0) {
+                    out.ctl = c;
+                    out.resolved = n;
+                    out.how = "index " + std::to_string(id);
+                    return out;
+                }
+            }
+            for (unsigned int id = 0; id < num; ++id) {
+                struct mixer_ctl* c = api_->mixer_get_ctl(mixer_impl_, id);
+                if (!c) continue;
+                const char* n = api_->mixer_ctl_get_name(c);
+                if (!n) continue;
+                if (NameEqualsIgnoreCase(n, ctl_name.c_str())) {
+                    out.ctl = c;
+                    out.resolved = n;
+                    out.how = "index " + std::to_string(id) + " (case-insensitive)";
+                    return out;
+                }
+            }
+        }
+        return out;
+    };
+
     // Register the backend graph keys (GKV) the AGM PCM plugin needs, exactly
     // as agmplay does on this device:
     //   1) "<backend> rate ch fmt" - integer control carrying
@@ -328,28 +414,25 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
     // handle.
     // --- 1) backend rate control: by name, then by known control ID ---
     std::string rate_ctl_name = backend_ + " rate";
-    struct mixer_ctl* rate_ctl = api_->mixer_get_ctl(mixer_impl_, rate_ctl_name.c_str());
-    std::string rate_lookup = "name '" + rate_ctl_name + "'";
-    if (!rate_ctl) {
+    CtlLookup rate = find_ctl(rate_ctl_name);
+    if (!rate.ctl) {
         rate_ctl_name = backend_ + " rate ch fmt";  // older AGM builds
-        rate_ctl = api_->mixer_get_ctl(mixer_impl_, rate_ctl_name.c_str());
-        rate_lookup = "name '" + rate_ctl_name + "'";
+        rate = find_ctl(rate_ctl_name);
     }
-    if (!rate_ctl && api_->mixer_get_ctl_by_id) {
-        rate_ctl = api_->mixer_get_ctl_by_id(mixer_impl_, kRateCtlId);
-        rate_lookup = "id " + std::to_string(kRateCtlId);
-    }
-    if (rate_ctl) {
-        std::string resolved_name = "?";
-        if (api_->mixer_ctl_get_name) {
-            const char* n = api_->mixer_ctl_get_name(rate_ctl);
-            if (n) resolved_name = n;
+    if (!rate.ctl && api_->mixer_get_ctl) {
+        rate.ctl = api_->mixer_get_ctl(mixer_impl_, kRateCtlId);
+        rate.how = "id " + std::to_string(kRateCtlId);
+        if (rate.ctl && api_->mixer_ctl_get_name) {
+            const char* n = api_->mixer_ctl_get_name(rate.ctl);
+            if (n) rate.resolved = n;
         }
-        const int set_ret = api_->mixer_ctl_set_value(rate_ctl, 0, static_cast<int>(cfg.rate));
-        api_->mixer_ctl_set_value(rate_ctl, 1, 1);                              // mono
-        api_->mixer_ctl_set_value(rate_ctl, 2, static_cast<int>(kAlsaFormatS16Le));
-        api_->mixer_ctl_set_value(rate_ctl, 3, static_cast<int>(kAgmDataFormatFixedPoint));
-        LOG_INFO("AgmPlayer: rate control (by " << rate_lookup << ", resolved '" << resolved_name
+    }
+    if (rate.ctl) {
+        const int set_ret = api_->mixer_ctl_set_value(rate.ctl, 0, static_cast<int>(cfg.rate));
+        api_->mixer_ctl_set_value(rate.ctl, 1, 1);                              // mono
+        api_->mixer_ctl_set_value(rate.ctl, 2, static_cast<int>(kAlsaFormatS16Le));
+        api_->mixer_ctl_set_value(rate.ctl, 3, static_cast<int>(kAgmDataFormatFixedPoint));
+        LOG_INFO("AgmPlayer: rate control (by " << rate.how << ", resolved '" << rate.resolved
                  << "') = " << cfg.rate << " Hz, 1 ch, fmt " << kAlsaFormatS16Le
                  << " (S16_LE), data_fmt " << kAgmDataFormatFixedPoint
                  << " (FIXED_POINT) (rc " << set_ret << ")");
@@ -360,11 +443,12 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
 
     // --- 2) backend metadata (device sub-graph KV pair registration) ---
     const std::string be_mtd_ctl_name = backend_ + " metadata";
-    struct mixer_ctl* be_mtd_ctl = api_->mixer_get_ctl(mixer_impl_, be_mtd_ctl_name.c_str());
-    if (be_mtd_ctl && api_->mixer_ctl_set_array) {
+    const CtlLookup be_mtd = find_ctl(be_mtd_ctl_name);
+    if (be_mtd.ctl && api_->mixer_ctl_set_array) {
         const std::vector<uint8_t> payload = BuildBackendMetadataPayload(cfg.rate, 16);
-        const int mtd_ret = api_->mixer_ctl_set_array(be_mtd_ctl, payload.data(), payload.size());
-        LOG_INFO("AgmPlayer: '" << be_mtd_ctl_name << "' metadata (" << payload.size()
+        const int mtd_ret = api_->mixer_ctl_set_array(be_mtd.ctl, payload.data(), payload.size());
+        LOG_INFO("AgmPlayer: '" << be_mtd_ctl_name << "' metadata (by " << be_mtd.how << ", "
+                 << payload.size()
                  << " bytes: DEVICERX:SPEAKER, SAMPLINGRATE:" << cfg.rate << ", BITWIDTH:16) rc "
                  << mtd_ret);
     } else if (!api_->mixer_ctl_set_array) {
@@ -376,20 +460,22 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
 
     // --- 3) stream metadata: "PCM<dev> control" = ZERO, then "PCM<dev> metadata" ---
     const std::string pcm_ctl_name = "PCM" + std::to_string(kAgmDevice) + " control";
-    struct mixer_ctl* pcm_ctl = api_->mixer_get_ctl(mixer_impl_, pcm_ctl_name.c_str());
-    if (pcm_ctl) {
-        const int zero_ret = api_->mixer_ctl_set_enum_by_string(pcm_ctl, "ZERO");
-        LOG_INFO("AgmPlayer: '" << pcm_ctl_name << "' -> ZERO (rc " << zero_ret << ")");
+    const CtlLookup pcm_ctl = find_ctl(pcm_ctl_name);
+    if (pcm_ctl.ctl) {
+        const int zero_ret = api_->mixer_ctl_set_enum_by_string(pcm_ctl.ctl, "ZERO");
+        LOG_INFO("AgmPlayer: '" << pcm_ctl_name << "' (by " << pcm_ctl.how << ") -> ZERO (rc "
+                 << zero_ret << ")");
     } else {
         LOG_WARN("AgmPlayer: control '" << pcm_ctl_name << "' not found on card " << kAgmCard);
     }
     const std::string pcm_mtd_ctl_name = "PCM" + std::to_string(kAgmDevice) + " metadata";
-    struct mixer_ctl* pcm_mtd_ctl = api_->mixer_get_ctl(mixer_impl_, pcm_mtd_ctl_name.c_str());
-    if (pcm_mtd_ctl && api_->mixer_ctl_set_array) {
+    const CtlLookup pcm_mtd = find_ctl(pcm_mtd_ctl_name);
+    if (pcm_mtd.ctl && api_->mixer_ctl_set_array) {
         const bool include_devicepp = getenv("AUDIOROUTER_AGM_DEVICEPP_KV") != nullptr;
         const std::vector<uint8_t> payload = BuildStreamMetadataPayload(include_devicepp);
-        const int mtd_ret = api_->mixer_ctl_set_array(pcm_mtd_ctl, payload.data(), payload.size());
-        LOG_INFO("AgmPlayer: '" << pcm_mtd_ctl_name << "' metadata (" << payload.size()
+        const int mtd_ret = api_->mixer_ctl_set_array(pcm_mtd.ctl, payload.data(), payload.size());
+        LOG_INFO("AgmPlayer: '" << pcm_mtd_ctl_name << "' metadata (by " << pcm_mtd.how << ", "
+                 << payload.size()
                  << " bytes: STREAMRX:PCM_LL_PLAYBACK, INSTANCE:1" << (include_devicepp
                  ? ", DEVICEPP_RX:AUDIO_MBDRC" : "") << ", VOLUME:0) rc " << mtd_ret);
     } else if (!api_->mixer_ctl_set_array) {
@@ -401,21 +487,19 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
 
     // --- 4) route PCM session onto the backend: by name, then by ID ---
     const std::string connect_ctl_name = "PCM" + std::to_string(kAgmDevice) + " connect";
-    struct mixer_ctl* connect_ctl = api_->mixer_get_ctl(mixer_impl_, connect_ctl_name.c_str());
-    std::string connect_lookup = "name '" + connect_ctl_name + "'";
-    if (!connect_ctl && api_->mixer_get_ctl_by_id) {
-        connect_ctl = api_->mixer_get_ctl_by_id(mixer_impl_, kConnectCtlId);
-        connect_lookup = "id " + std::to_string(kConnectCtlId);
-    }
-    if (connect_ctl) {
-        const int conn_ret = api_->mixer_ctl_set_enum_by_string(connect_ctl, backend_.c_str());
-        std::string resolved_name = "?";
-        if (api_->mixer_ctl_get_name) {
-            const char* n = api_->mixer_ctl_get_name(connect_ctl);
-            if (n) resolved_name = n;
+    CtlLookup connect_ctl = find_ctl(connect_ctl_name);
+    if (!connect_ctl.ctl && api_->mixer_get_ctl) {
+        connect_ctl.ctl = api_->mixer_get_ctl(mixer_impl_, kConnectCtlId);
+        connect_ctl.how = "id " + std::to_string(kConnectCtlId);
+        if (connect_ctl.ctl && api_->mixer_ctl_get_name) {
+            const char* n = api_->mixer_ctl_get_name(connect_ctl.ctl);
+            if (n) connect_ctl.resolved = n;
         }
-        LOG_INFO("AgmPlayer: '" << connect_ctl_name << "' (by " << connect_lookup << ", resolved '"
-                 << resolved_name << "') -> '" << backend_ << "' (rc " << conn_ret << ")");
+    }
+    if (connect_ctl.ctl) {
+        const int conn_ret = api_->mixer_ctl_set_enum_by_string(connect_ctl.ctl, backend_.c_str());
+        LOG_INFO("AgmPlayer: '" << connect_ctl_name << "' (by " << connect_ctl.how << ", resolved '"
+                 << connect_ctl.resolved << "') -> '" << backend_ << "' (rc " << conn_ret << ")");
     } else {
         LOG_WARN("AgmPlayer: control '" << connect_ctl_name << "' not found on card " << kAgmCard
                  << "; list controls with: tinymix -D " << kAgmCard);
