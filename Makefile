@@ -47,7 +47,6 @@ CLIENT_SRCS = src/client/main.cpp \
               src/client/client.cpp \
               src/client/alsa_player.cpp \
               src/client/direct_alsa.cpp \
-              src/client/agm_player.cpp \
               src/client/agm_fifo_player.cpp \
               src/client/dummy_player.cpp \
               src/client/jitter_buffer.cpp \

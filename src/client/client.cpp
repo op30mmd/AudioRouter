@@ -1,7 +1,6 @@
 #include "client.hpp"
 #include "alsa_player.hpp"
 #include "direct_alsa.hpp"
-#include "agm_player.hpp"
 #include "agm_fifo_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
@@ -173,11 +172,8 @@ namespace {
 
                 std::shared_ptr<IAudioPlayer> device =
                     node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
-                    : strategy == OpenStrategy::AGM
-                        ? (device_name.rfind("agm:direct", 0) == 0
-                               ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmPlayer>())
-                               : std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>()))
-                        : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
+                    : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>())
+                                                    : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
                 auto finished = std::make_shared<std::atomic<bool>>(false);
                 std::thread attempt_thread([open, cfg, device_name, candidate, device, finished]() {
                     if (!candidate.empty()) {

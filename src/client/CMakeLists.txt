@@ -3,7 +3,7 @@ set(CLIENT_SOURCES
     client.cpp
     alsa_player.cpp
     direct_alsa.cpp
-    agm_player.cpp
+    agm_fifo_player.cpp
     dummy_player.cpp
     jitter_buffer.cpp
     android_helpers.cpp
@@ -15,7 +15,7 @@ set(CLIENT_HEADERS
     audio_player.hpp
     alsa_player.hpp
     direct_alsa.hpp
-    agm_player.hpp
+    agm_fifo_player.hpp
     dummy_player.hpp
     jitter_buffer.hpp
     android_helpers.hpp
