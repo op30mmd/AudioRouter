@@ -119,7 +119,8 @@ Audio configuration uses `AudioConfig` with sample rate, channels, format (`PCM_
 
 ### Windows Server
 - Windows 10/11 with WASAPI support.
-- Visual Studio 2022 (17) or 2019 (16) with C++23 support for MSVC build, or MinGW-w64 with `g++`.
+- Visual Studio 2022 (17) or 2019 (16) with C++23 support for MSVC build, or MinGW-w64 with `g++` (GCC 13+).
+- CMake 3.20+ recommended (required for MSVC build scripts).
 - Firewall rule allowing UDP inbound on configured port (default 44100).
 
 ### Android Client
@@ -127,7 +128,7 @@ Audio configuration uses `AudioConfig` with sample rate, channels, format (`PCM_
 - Termux from F-Droid.
 - Packages: `clang`, `make`, `alsa-lib`, `alsa-utils`, `sudo` (installed by `termux_setup.sh`).
 - Kernel must expose `/dev/snd/` PCM nodes. For Qualcomm AGM devices, vendor binary `agmplay` should be present in `/vendor/bin` or PATH.
-- For `tinymix` mixer setup: root package `tinyalsa` or vendor `tinymix`.
+- For `tinymix` mixer setup: `tinyalsa` / `alsa-utils` (provides `tinymix`).
 
 ### Linux (Testing / Development)
 - GCC 13+ or Clang 16+ with C++23 support.
@@ -142,7 +143,7 @@ Audio configuration uses `AudioConfig` with sample rate, channels, format (`PCM_
 
 1. Enable Personal Hotspot / Wi-Fi Hotspot on Android.
 2. Connect Windows PC to Android hotspot.
-3. On Windows, run `audiorouter_server.exe` or `bin/audiorouter_server -l` to list interface IPs. Note the PC IP (e.g., `192.168.43.45`).
+3. On Windows, run the server (via launcher or directly) and note the PC IP from interface list (e.g., `192.168.43.45`).
 4. On Android in Termux, connect via PC IP.
 
 **Scenario B: Android Connected to Windows Mobile Hotspot**
@@ -151,44 +152,104 @@ Audio configuration uses `AudioConfig` with sample rate, channels, format (`PCM_
 2. Connect Android phone to PC hotspot. Gateway is typically `192.168.137.1`.
 3. On Android in Termux, connect to `192.168.137.1`.
 
-### Building and Running
+### Building and Running - Quick Commands
 
-#### Windows Server - MSVC (Recommended)
+**Windows ( easiest - unified ):**
+```bat
+scripts\build_all.bat
+scripts\start_server.bat
+:: or PowerShell:
+powershell -ExecutionPolicy Bypass -File scripts\start_server.ps1
+```
+
+**Linux / Termux ( easiest - unified ):**
+```bash
+./scripts/build_all.sh
+./scripts/build_all.sh --tests
+./scripts/check_env.sh
+```
+
+**Termux full flow:**
+```bash
+git clone https://github.com/op30mmd/AudioRouter.git
+cd AudioRouter
+chmod +x scripts/*.sh
+./scripts/termux_setup.sh
+./scripts/android_diagnose.sh   # optional but recommended
+./scripts/termux_run.sh 192.168.43.45
+```
+
+## Building - Detailed
+
+### Windows Server - Unified Build
+
+```bat
+:: Clean, configure with VS2022 (fallback VS2019), build all targets
+scripts\build_all.bat
+scripts\build_all.bat --clean --server-only
+scripts\build_all.bat --debug
+```
+
+Artifacts are copied to `bin\audiorouter_server.exe`, `bin\audiorouter_client.exe`, `bin\audiorouter_tests.exe`.
+
+### Windows Server - MSVC (Focused)
 
 ```bat
 scripts\build_server_msvc.bat
-bin\audiorouter_server.exe
+scripts\build_server_msvc.bat --clean
+scripts\build_server_msvc.bat --debug
+bin\audiorouter_server.exe --list-if
+bin\audiorouter_server.exe --help
 ```
 
-The script generates `build_msvc/` with Visual Studio 2022 (fallback to 2019) and copies the executable to `bin\audiorouter_server.exe`.
+The script checks for `cmake`, creates `build_msvc/`, tries VS2022 then VS2019 generators, builds `Release` by default, and copies the executable to `bin\`.
 
-#### Windows Server - MinGW
+### Windows Server - MinGW
 
 ```bat
 scripts\build_server_mingw.bat
+scripts\build_server_mingw.bat --clean --debug
 bin\audiorouter_server.exe
 ```
 
-#### Linux / Android Client - Makefile
+Updated to C++23, with hardening flags, and proper g++ version check.
+
+### Linux / Android - Unified Build
 
 ```bash
-# Server and client and tests
+# Build server + client + tests
+./scripts/build_all.sh
+./scripts/build_all.sh --clean
+./scripts/build_all.sh --server-only
+./scripts/build_all.sh --client-only --compiler clang++
+./scripts/build_all.sh --tests-only
+./scripts/build_all.sh --cmake --verbose
+
+# Direct Makefile still available
 make all
-# Server only
 make server
-# Client only (Linux / Termux)
 make client
-# Run unit tests
 make test
+make sanitize DEBUG=1 SANITIZE=address,undefined
 ```
 
-Build system auto-detects platform (Windows vs Linux) and links `ws2_32`, `iphlpapi`, `avrt`, `ole32` on Windows, `pthread`/`dl` elsewhere. Binaries output to `bin/`.
+Detects `clang++` or `g++`, verifies C++23 support, and uses Makefile with hardening flags. With `--cmake`, uses CMake build system.
 
-#### CMake Build
+### Linux / Android - Client Only
+
+```bash
+./scripts/build_client.sh
+./scripts/build_client.sh --clean --tests --verbose
+./scripts/build_client.sh --compiler clang++ --debug
+```
+
+Builds `bin/audiorouter_client` only, with optional tests and sanitizer support.
+
+### CMake Build (Cross-Platform)
 
 ```bash
 # Linux / general
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
 cmake --build build --parallel
 
 # Windows MSVC x64 explicitly
@@ -204,7 +265,7 @@ cmake -B build-android \
 cmake --build build-android --target audiorouter_client --parallel
 ```
 
-#### Termux Setup
+### Termux Setup and Diagnostics
 
 In Termux:
 
@@ -212,23 +273,59 @@ In Termux:
 git clone https://github.com/op30mmd/AudioRouter.git
 cd AudioRouter
 chmod +x scripts/*.sh
+
+# Install dependencies and build
 ./scripts/termux_setup.sh
-```
+./scripts/termux_setup.sh --verbose --force
+./scripts/termux_setup.sh --no-build   # only install packages
+./scripts/termux_setup.sh --tests
 
-`termux_setup.sh` updates package lists, installs `clang`, `make`, `alsa-lib`, `alsa-utils`, `sudo`, and compiles `bin/audiorouter_client` if not present.
+# Check environment
+./scripts/check_env.sh
 
-Then run with root:
-
-```bash
+# Detailed Android audio diagnostics (requires root)
 su
-./bin/audiorouter_client -s 192.168.43.45 -p 44100
+./scripts/android_diagnose.sh
+./scripts/android_mixer_setup.sh
+./scripts/android_mixer_setup.sh --list --dry-run
 ```
 
-Or automated helper (handles `chmod 666 /dev/snd/*` and `LD_LIBRARY_PATH` setup for AGM vendor libraries):
+`termux_setup.sh` now:
+- Detects Termux environment, checks for `pkg`
+- Installs `clang`, `make`, `alsa-lib`, `alsa-utils`, `sudo`, `termux-tools`, `pkg-config`
+- Verifies compiler C++23 support
+- Builds client unless `--no-build`
+- Supports `--force` to rebuild existing binary
+
+## Scripts Reference
+
+All helper scripts are in `scripts/` and designed to be user-friendly with `--help` flags and professional logging.
+
+| Script | Platform | Purpose |
+|--------|----------|---------|
+| `build_all.sh` | Linux, Termux, macOS | Unified build: server, client, tests. Supports `--clean`, `--debug`, `--sanitize`, `--server-only`, `--client-only`, `--tests-only`, `--cmake`, `--compiler`, `--verbose`. Detects compiler and verifies C++23. |
+| `build_all.bat` | Windows | Unified Windows build via CMake. Tries VS2022 then VS2019. Supports `--clean`, `--debug`, `--server-only`, `--client-only`, `--tests-only`. Copies artifacts to `bin\`. |
+| `build_server_msvc.bat` | Windows | Focused MSVC build using CMake. Robust generator fallback, config selection (`Release`/`Debug`), clean support, helpful error messages if `cmake` missing. |
+| `build_server_mingw.bat` | Windows | MinGW direct `g++` build with C++23 and hardening flags. Checks g++ version, supports `--clean`, `--debug`. Updated from C++17 to C++23. |
+| `build_client.sh` | Linux, Termux | Client-only build wrapper. Auto-detects `clang++`/`g++`, checks C++23, supports `--clean`, `--tests`, `--sanitize`, `--debug`, `--verbose`, `--compiler`. |
+| `termux_setup.sh` | Termux | Termux environment setup. Updates `pkg`, installs all dependencies, builds client if missing. Options: `--no-build`, `--force`, `--verbose`, `--tests`. Improved from original with better detection and logging. |
+| `termux_run.sh` | Termux | User-friendly client runner. Auto-discovers or builds binary, fixes `/dev/snd/*` permissions via `su`, sets `LD_LIBRARY_PATH` for vendor libs, supports full client options: `-s IP`, `-p PORT`, `-d DEVICE`, `-l LATENCY`, `-b IFACE`, `--discover`, `--verbose`, `--list-devices`. Interactive prompt if no IP given. |
+| `check_env.sh` | Linux, Termux, Android | Environment diagnostics. Checks: OS/arch, compiler C++23 support, cmake/make, alsa-lib, Termux/Root, `/dev/snd` nodes and permissions, `tinymix`/`agmplay`, network interfaces and VPN `tun0` detection, existing binaries. Color-coded OK/WARN/FAIL. |
+| `android_diagnose.sh` | Android (root) | Comprehensive Android audio diagnostics. Checks root, `tinymix`/`agmplay` location, `/dev/snd` PCM nodes and permissions, `/proc/asound/cards`, SoC detection via `/proc/cpuinfo`, mixer controls dump, client `--list-devices`, libasound presence, network interfaces and VPN detection, and prints actionable recommendations. |
+| `android_mixer_setup.sh` | Android (root) | ALSA speaker routing helper. Must run as root. Fixes permissions, detects SoC (Qualcomm/MediaTek or forced via `--qualcomm`/`--mediatek`), lists cards, applies common routing controls (`RX_CDC_DMA_RX_0`, `PRI_MI2S_RX`, `Speaker Function`, volumes) with dry-run and list-only modes. Improved with more controls and detailed logging. |
+| `start_server.bat` | Windows | Interactive server launcher. Lists interfaces via `audiorouter_server --list-if` (fallback to `ipconfig`), prompts for port and mute mode, then runs server with chosen args. Supports `-p PORT -b IP` non-interactively. Also prints firewall hint. |
+| `start_server.ps1` | Windows | PowerShell version of interactive launcher. Uses `Get-NetIPAddress` fallback, prompts for port/mute/test tone, shows firewall rule creation hint (`New-NetFirewallRule`), supports parameters `-Port`, `-Bind`, `-MuteMode`, `-NoMute`, `-TestTone`, `-Freq`. |
+
+Make all shell scripts executable:
 
 ```bash
-./scripts/termux_run.sh 192.168.43.45
-./scripts/termux_run.sh 192.168.43.45 44100 --verbose
+chmod +x scripts/*.sh
+```
+
+On Windows, run `.bat` files directly in CMD, or `.ps1` via PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start_server.ps1 -Port 44100 -MuteMode both
 ```
 
 ## Usage
@@ -252,12 +349,24 @@ Usage: audiorouter_server [options]
 
 Server prints banner, binds UDP, enters listening state, then streaming state after `CONNECT_REQ` / `CONNECT_ACK`. Periodic stats logged every 5 seconds during streaming (packets sent, bytes, client-reported loss). Clean shutdown restores volume.
 
-Example:
+**Via launcher scripts (recommended for Windows beginners):**
+
+```bat
+:: Interactive prompts for port/mute mode, lists interfaces
+scripts\start_server.bat
+scripts\start_server.bat --port 44100 --bind 0.0.0.0
+
+:: PowerShell version
+powershell -ExecutionPolicy Bypass -File scripts\start_server.ps1
+powershell -ExecutionPolicy Bypass -File scripts\start_server.ps1 -Port 44100 -MuteMode both
+```
+
+**Direct examples:**
 
 ```bat
 audiorouter_server.exe -p 44100 -b 0.0.0.0 -f 240 --mute-mode both
 audiorouter_server.exe -l
-audiorouter_server.exe -t --freq 1000
+audiorouter_server.exe -t --freq 1000 --no-mute
 ```
 
 ### Client CLI
@@ -279,10 +388,21 @@ Usage: audiorouter_client [options]
   -h, --help                Show this help message
 ```
 
-Examples:
+**Via Termux runner (recommended for Android):**
 
 ```bash
-# List devices
+# Interactive IP prompt if not provided
+./scripts/termux_run.sh
+./scripts/termux_run.sh 192.168.43.45
+./scripts/termux_run.sh -s 192.168.43.45 -p 44100 -d direct:/dev/snd/pcmC0D0p -l 35 -b auto --verbose
+./scripts/termux_run.sh --discover --verbose
+./scripts/termux_run.sh --list-devices
+```
+
+**Direct examples:**
+
+```bash
+# List devices (diagnostic, no server needed)
 ./bin/audiorouter_client --list-devices
 
 # Default libasound path
@@ -340,6 +460,9 @@ On many Qualcomm and MediaTek devices, the audio HAL powers down mixer paths whe
 su
 chmod 666 /dev/snd/*
 ./scripts/android_mixer_setup.sh
+./scripts/android_mixer_setup.sh --list
+./scripts/android_mixer_setup.sh --qualcomm --dry-run
+
 # Manual controls example:
 tinymix "Speaker Function" "On"
 tinymix "RX_CDC_DMA_RX_0 Audio Mixer MultiMedia1" 1
@@ -348,7 +471,15 @@ tinymix "RX1 Digital Volume" 84
 tinymix "RX2 Digital Volume" 84
 ```
 
-`android_mixer_setup.sh` performs permission fix, dumps `/proc/asound/cards`, and attempts common routing controls.
+`android_mixer_setup.sh` now supports `--list` (only list controls), `--dry-run` (show what would be done), `--qualcomm`/`--mediatek` forcing, and more comprehensive controls (including QUAT, PRI, SEC, TERT MI2S, SpkrLeft/Right, Ext Spk).
+
+For full diagnostics:
+
+```bash
+su
+./scripts/android_diagnose.sh
+./scripts/check_env.sh
+```
 
 ## Networking and Configuration
 
@@ -363,20 +494,32 @@ tinymix "RX2 Digital Volume" 84
 
 Unit test suite covers protocol serialization, ring buffer, jitter buffer with packet loss concealment and reordering, socket address parsing, audio conversion/downmixing, thread safety, memory safety, and type safety.
 
-Makefile:
+**Via unified script:**
+
+```bash
+./scripts/build_all.sh --tests-only
+./scripts/build_all.sh --tests-only --sanitize address
+```
+
+**Via Makefile:**
 
 ```bash
 make test
-# Sanitizer build
 make sanitize DEBUG=1 SANITIZE=address,undefined
 ```
 
-CMake / CTest:
+**Via CMake / CTest:**
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
+```
+
+**Via check script:**
+
+```bash
+./scripts/check_env.sh   # verifies toolchain before building
 ```
 
 Expected output:
@@ -454,45 +597,64 @@ AudioRouter/
 │   ├── test_thread_safety.cpp
 │   ├── test_type_safety.cpp
 │   └── test_memory_safety.cpp
-└── scripts/
-    ├── build_server_msvc.bat      # MSVC x64 build
-    ├── build_server_mingw.bat     # MinGW build
-    ├── build_client.sh            # Linux / Termux client build
-    ├── termux_setup.sh            # Termux env setup (pkg install + build)
-    ├── termux_run.sh              # Termux root runner (chmod, LD_LIBRARY_PATH, connect)
-    └── android_mixer_setup.sh     # ALSA mixer routing helper for speaker path
+└── scripts/                       # Setup, build, run, and diagnostic scripts
+    ├── build_all.sh               # Unified build for Linux/Termux/macOS (server+client+tests, --clean --debug --sanitize etc.)
+    ├── build_all.bat              # Unified Windows build via CMake (VS2022/2019 fallback)
+    ├── build_server_msvc.bat      # Focused MSVC build (professional rewrite, C++23 check)
+    ├── build_server_mingw.bat     # Focused MinGW build (updated to C++23, hardening flags)
+    ├── build_client.sh            # Client-only build (auto-detects clang++/g++, C++23 verification)
+    ├── termux_setup.sh            # Termux env setup (pkg update, deps, build - improved with --force --verbose)
+    ├── termux_run.sh              # Termux runner (binary discovery, perm fix, LD_LIBRARY_PATH, full CLI --discover --bind etc.)
+    ├── check_env.sh               # NEW: Environment diagnostics (compiler, cmake, ALSA libs, root, /dev/snd, network, binaries)
+    ├── android_diagnose.sh        # NEW: Deep Android audio diagnostics (PCM nodes, cards, mixer dump, AGM, libasound, VPN)
+    ├── android_mixer_setup.sh     # Mixer routing helper (now with --list, --dry-run, --qualcomm/--mediatek, more controls)
+    ├── start_server.bat           # NEW: Windows interactive server launcher (lists ifaces, prompts port/mute, firewall hint)
+    └── start_server.ps1           # NEW: PowerShell launcher (Get-NetIPAddress fallback, -Port -MuteMode -TestTone params)
 ```
 
 ## Troubleshooting
 
 **No audio on Android but client shows streaming:**
+- Run diagnostics:
+  ```bash
+  su
+  ./scripts/check_env.sh
+  ./scripts/android_diagnose.sh
+  ```
 - Verify root: `id` should show `uid=0`. Run `su` first.
-- Check `/dev/snd` permissions: `ls -l /dev/snd/` and run `chmod 666 /dev/snd/*`.
-- Run `android_mixer_setup.sh` or `tinymix` controls listed above.
+- Check `/dev/snd` permissions: `ls -l /dev/snd/` and run `chmod 666 /dev/snd/*` or `./scripts/android_mixer_setup.sh`.
+- Try detailed mixer modes: `./scripts/android_mixer_setup.sh --list`, `--qualcomm`, `--dry-run`.
 - Try alternative device: `direct:/dev/snd/pcmC0D0p`, `hw:0,0`, `agm`.
-- List devices: `./bin/audiorouter_client --list-devices`.
+- List devices: `./bin/audiorouter_client --list-devices` or `./scripts/termux_run.sh --list-devices`.
 - Check if another app holds PCM device exclusively.
 
 **Windows server build fails:**
-- Ensure C++23 capable compiler. For MSVC, VS 2022 17.6+. For MinGW, GCC 13+.
-- For MSVC, run from x64 Native Tools Prompt or rely on `build_server_msvc.bat` which attempts VS2022 then VS2019.
+- Run `scripts/check_env.sh` or `scripts/build_all.bat --clean`.
+- Ensure C++23 capable compiler: VS 2022 17.6+ or MinGW GCC 13+. Run `g++ --version` or check Visual Studio Installer - C++ Desktop Workload.
+- Ensure CMake 3.20+ in PATH: `cmake --version`.
+- For MSVC, run from x64 Native Tools Prompt or use `scripts/build_server_msvc.bat` which auto-fallbacks VS2022->VS2019.
+- Check Windows SDK headers for WASAPI (`audioclient.h`).
 
 **Client cannot connect / discovery finds nothing:**
+- Run `./scripts/check_env.sh` to verify network.
 - Verify both devices on same hotspot subnet.
-- Check firewall on Windows: allow UDP 44100 inbound (or your custom port).
+- Check firewall on Windows: allow UDP 44100 inbound. Launcher hints: `New-NetFirewallRule -DisplayName AudioRouter -Direction Inbound -Protocol UDP -LocalPort 44100 -Action Allow`.
 - Use explicit IP (`-s 192.168.x.x`) instead of `--discover`.
-- List server interfaces (`audiorouter_server -l`) and client routing (`ip addr` in Termux).
-- VPN on Android can hijack routing: use `-b auto` or `-b wlan0`.
+- List server interfaces: `audiorouter_server -l` or `scripts/start_server.bat` shows them.
+- List client routing: `ip addr` in Termux, or `check_env.sh` output.
+- VPN on Android can hijack routing: use `-b auto` or `-b wlan0` via `./scripts/termux_run.sh -b auto`.
 
 **High latency or frequent underruns:**
-- Reduce jitter buffer (`-l 35`) for good Wi-Fi, increase (`-l 80` or higher) for lossy hotspot.
-- Reduce frames per packet (`-f 240` = 5 ms) to lower serialization delay, but increases packet rate.
-- Check RTT logs; >50 ms RTT suggests hotspot congestion.
+- Check diagnostics RTT: `./scripts/termux_run.sh --verbose` shows RTT.
+- Reduce jitter buffer for good Wi-Fi (`-l 35`), increase (`-l 80` or higher) for lossy hotspot.
+- Reduce frames per packet server side (`-f 240` = 5 ms) to lower serialization delay, but increases packet rate.
 - Use 5 GHz hotspot if device supports it.
+- Check VPN interference via `check_env.sh` tun0 detection.
 
 **Android audio is distorted or channels swapped:**
 - Verify sample rate matches (server default 48 kHz). Use `-r 48000`.
 - Direct ALSA may need period size adjustment (handled internally). Try libasound backend as fallback.
+- Run `./scripts/android_diagnose.sh` to see mixer volume controls (RX Digital Volume too high causes clipping).
 
 ## CI/CD and Releases
 
@@ -503,12 +665,19 @@ GitHub Actions workflow `.github/workflows/ci.yml`:
 - **Windows Server:** Windows latest, CMake MSVC x64, builds `audiorouter_server.exe`, packages into `audiorouter_server_windows_x64` artifact and `audiorouter-<tag>-windows-x64.zip`.
 - **Release:** On push to `main` (not PRs) and manual dispatch, generates tag `v1.0.<run_number>` and publishes GitHub Release with both archives, using `softprops/action-gh-release`.
 
+New helper scripts are included in release archives:
+- `check_env.sh` for environment verification
+- `android_diagnose.sh` for deep Android diagnostics
+- `start_server.bat` / `start_server.ps1` for easy Windows launching
+- `build_all.sh` / `build_all.bat` for unified builds
+
 ## Security Considerations
 
 - Root on Android is required for direct ALSA access; Termux running as root bypasses Android sandboxing. Only run trusted binaries.
-- UDP audio is unencrypted. Do not use on untrusted public networks without VPN.
+- UDP audio is unencrypted. Do not use on untrusted public networks without VPN (or use `-b` binding carefully).
 - `SO_BINDTODEVICE` pinning requires `CAP_NET_RAW`; using `su` satisfies this but implies full device access.
-- Server intentionally mutes local speakers; ensure `--no-mute` or `--mute-mode` is understood when debugging on shared systems.
+- Server intentionally mutes local speakers; ensure `--no-mute` or `--mute-mode` is understood when debugging on shared systems. Launcher scripts prompt for mute mode.
+- Diagnostic scripts (`check_env.sh`, `android_diagnose.sh`) only read system state and do not modify audio routing unless explicitly running `android_mixer_setup.sh`.
 
 ## License
 
