@@ -29,11 +29,19 @@ fi
 
 # Update package lists
 echo "[1/4] Updating Termux package lists..."
-pkg update -y || true
+if [ "$(id -u)" -ne 0 ]; then
+    pkg update -y || true
+else
+    echo "     Skipped: pkg cannot run as root. Run 'pkg update' as the Termux user (without su)."
+fi
 
 # Install required build packages
 echo "[2/4] Installing compiler and ALSA tools..."
-pkg install -y clang make alsa-utils || true
+if [ "$(id -u)" -ne 0 ]; then
+    pkg install -y clang make alsa-utils || true
+else
+    echo "     Skipped: pkg cannot run as root. Run 'pkg install clang make alsa-utils' as the Termux user."
+fi
 
 # Build AudioRouter Client if not present
 if [ -n "$BIN_PATH" ]; then
