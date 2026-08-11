@@ -33,6 +33,22 @@ namespace {
                 return FALSE;
         }
     }
+
+    // The banner and the logger use UTF-8 box-drawing/block characters and
+    // ANSI color escapes. The Windows console renders those only when the
+    // output codepage is UTF-8 and virtual terminal (VT) processing is on;
+    // without this the logo shows as mojibake in Windows Terminal/cmd.
+    void setup_console() {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+        HANDLE h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (h_out != INVALID_HANDLE_VALUE) {
+            DWORD mode = 0;
+            if (GetConsoleMode(h_out, &mode)) {
+                SetConsoleMode(h_out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
 #endif
 }
 
@@ -75,6 +91,9 @@ void print_usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+#if defined(_WIN32)
+    setup_console();
+#endif
     audiorouter::ServerConfig config;
     bool list_ifaces_only = false;
 
