@@ -12,6 +12,7 @@ public:
     static std::vector<std::string> get_proc_asound_cards();
     static std::vector<std::string> get_dev_snd_nodes();
     static bool run_tinymix_command(const std::string& control_name, const std::string& value);
+    static bool apply_speaker_routing();
     static void print_android_troubleshooting_tips();
 };
 

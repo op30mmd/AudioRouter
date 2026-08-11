@@ -23,7 +23,7 @@ struct ServerConfig {
     uint32_t frames_per_packet = 240; // 5ms at 48kHz (960 bytes PCM) -> single MTU
     bool auto_mute_pc_speaker = true;
     MuteMethod mute_method = MuteMethod::EndpointMute;
-    uint32_t client_timeout_ms = 3500;
+    uint32_t client_timeout_ms = 8000;
     bool use_test_tone = false;
     double test_tone_freq = 440.0;
 };

@@ -1,14 +1,95 @@
 #include "direct_alsa.hpp"
 #include "../common/logger.hpp"
+#include "../common/time_util.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <cstring>
 #include <dirent.h>
+#include <algorithm>
+#include <climits>
 
 #if defined(__linux__) || defined(__ANDROID__)
     #include <sound/asound.h>
+
+namespace {
+
+// Fill an snd_pcm_hw_params struct with "any" masks/intervals, i.e. no
+// constraints, exactly like alsa-lib's snd_pcm_hw_params_any().
+void init_any_params(struct snd_pcm_hw_params& params) {
+    std::memset(&params, 0, sizeof(params));
+
+    for (int k = SNDRV_PCM_HW_PARAM_FIRST_MASK; k <= SNDRV_PCM_HW_PARAM_LAST_MASK; ++k) {
+        auto& mask = params.masks[k - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+        for (size_t b = 0; b < sizeof(mask.bits) / sizeof(mask.bits[0]); ++b) {
+            mask.bits[b] = 0xFFFFFFFFu;
+        }
+    }
+
+    for (int k = SNDRV_PCM_HW_PARAM_FIRST_INTERVAL; k <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL; ++k) {
+        auto& iv = params.intervals[k - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        iv.min = 0;
+        iv.max = UINT32_MAX;
+        iv.openmin = 0;
+        iv.openmax = 0;
+        iv.integer = 0;
+        iv.empty = 0;
+    }
+}
+
+// Set a single hw param to an exact value.
+void set_param_value(struct snd_pcm_hw_params& params, int param, unsigned int value) {
+    if (param >= SNDRV_PCM_HW_PARAM_FIRST_MASK && param <= SNDRV_PCM_HW_PARAM_LAST_MASK) {
+        auto& mask = params.masks[param - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+        for (size_t b = 0; b < sizeof(mask.bits) / sizeof(mask.bits[0]); ++b) {
+            mask.bits[b] = 0;
+        }
+        mask.bits[value / 32] = (1u << (value % 32));
+    } else if (param >= SNDRV_PCM_HW_PARAM_FIRST_INTERVAL && param <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL) {
+        auto& iv = params.intervals[param - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        iv.min = value;
+        iv.max = value;
+    }
+}
+
+// Re-open the primary candidate and ask the kernel (HW_REFINE with "any"
+// params) what this device actually supports, so failures become actionable.
+void log_device_capabilities(const std::vector<std::string>& candidates, const std::string& last_error) {
+    if (candidates.empty()) return;
+
+    const std::string& probe_path = candidates.front();
+    int probe_fd = ::open(probe_path.c_str(), O_WRONLY | O_NONBLOCK);
+    if (probe_fd < 0) {
+        LOG_DEBUG("DirectAlsaPlayer: Could not re-open '" << probe_path << "' for capability probe: " << strerror(errno));
+        return;
+    }
+
+    struct snd_pcm_hw_params probe;
+    init_any_params(probe);
+    if (ioctl(probe_fd, SNDRV_PCM_IOCTL_HW_REFINE, &probe) == 0) {
+        const auto& rate = probe.intervals[SNDRV_PCM_HW_PARAM_RATE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        const auto& channels = probe.intervals[SNDRV_PCM_HW_PARAM_CHANNELS - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        const auto& period = probe.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        const auto& buffer = probe.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+        const auto& access = probe.masks[SNDRV_PCM_HW_PARAM_ACCESS - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+        const auto& formats = probe.masks[SNDRV_PCM_HW_PARAM_FORMAT - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+
+        LOG_WARN("DirectAlsaPlayer: Device '" << probe_path << "' capabilities (probe failed with: " << last_error << "):");
+        LOG_WARN("  rate [" << rate.min << ", " << rate.max << "] Hz, channels [" << channels.min << ", " << channels.max
+                 << "], period [" << period.min << ", " << period.max << "] frames, buffer [" << buffer.min << ", "
+                 << buffer.max << "] frames");
+        LOG_WARN("  supports RW_INTERLEAVED: " << ((access.bits[SNDRV_PCM_ACCESS_RW_INTERLEAVED / 32] >> (SNDRV_PCM_ACCESS_RW_INTERLEAVED % 32)) & 1u)
+                 << ", supports S16_LE: " << ((formats.bits[SNDRV_PCM_FORMAT_S16_LE / 32] >> (SNDRV_PCM_FORMAT_S16_LE % 32)) & 1u));
+    } else {
+        LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_REFINE probe failed for '" << probe_path << "': " << strerror(errno));
+    }
+
+    ::close(probe_fd);
+}
+
+} // namespace
 #endif
 
 namespace audiorouter {
@@ -35,6 +116,7 @@ std::vector<std::string> DirectAlsaPlayer::enumerate_kernel_pcm_devices() {
         }
     }
     closedir(dir);
+    std::sort(devices.begin(), devices.end());
 #endif
     return devices;
 }
@@ -46,76 +128,56 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
 
     config_ = config;
     device_path_ = device_name.empty() ? "/dev/snd/pcmC0D0p" : device_name;
+    staging_buffer_.clear();
 
 #if defined(__linux__) || defined(__ANDROID__)
-    fd_ = ::open(device_path_.c_str(), O_RDWR);
-    if (fd_ < 0) {
-        // Try fallback to standard Android Card 0 Device 0 Playback
-        if (device_path_ != "/dev/snd/pcmC0D0p") {
-            LOG_WARN("Could not open " << device_path_ << ", trying /dev/snd/pcmC0D0p");
-            device_path_ = "/dev/snd/pcmC0D0p";
-            fd_ = ::open(device_path_.c_str(), O_RDWR);
+    // Build a prioritized list of fallback candidates
+    std::vector<std::string> candidates;
+    std::string primary_path = device_name.empty() ? "/dev/snd/pcmC0D0p" : device_name;
+    candidates.push_back(primary_path);
+    if (primary_path != "/dev/snd/pcmC0D0p") {
+        candidates.push_back("/dev/snd/pcmC0D0p");
+    }
+
+    std::vector<std::string> all_devices = enumerate_kernel_pcm_devices();
+    for (const auto& dev : all_devices) {
+        bool already_added = false;
+        for (const auto& c : candidates) {
+            if (c == dev) {
+                already_added = true;
+                break;
+            }
+        }
+        if (!already_added) {
+            candidates.push_back(dev);
         }
     }
 
-    if (fd_ < 0) {
-        LOG_ERROR("DirectAlsaPlayer: Failed to open device '" << device_path_
-                  << "': " << strerror(errno) << " (Are you running with root privileges 'su' in Termux?)");
-        return false;
+    bool success = false;
+    std::string last_error;
+    uint64_t loop_start_ms = get_time_ms();
+
+    for (const auto& candidate : candidates) {
+        if (try_open_candidate(candidate, last_error)) {
+            success = true;
+            break;
+        }
     }
 
-    // Set hardware parameters via ioctl
-    struct snd_pcm_hw_params params;
-    std::memset(&params, 0, sizeof(params));
+    uint64_t loop_total_ms = get_time_ms() - loop_start_ms;
+    LOG_INFO("DirectAlsaPlayer: open loop over " << candidates.size() << " candidate(s) took "
+             << loop_total_ms << "ms" << (success ? "" : " (no usable device)"));
 
-    // Initialize hw params mask/intervals to any
-    for (int i = 0; i <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL; ++i) {
-        params.intervals[i - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = 0;
-        params.intervals[i - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = UINT32_MAX;
-    }
-    for (int i = 0; i <= SNDRV_PCM_HW_PARAM_LAST_MASK; ++i) {
-        params.masks[i - SNDRV_PCM_HW_PARAM_FIRST_MASK].bits[0] = 0xFFFFFFFF;
-        params.masks[i - SNDRV_PCM_HW_PARAM_FIRST_MASK].bits[1] = 0xFFFFFFFF;
-    }
-
-    // Access: RW interleaved
-    params.masks[SNDRV_PCM_HW_PARAM_ACCESS - SNDRV_PCM_HW_PARAM_FIRST_MASK].bits[0] = (1 << SNDRV_PCM_ACCESS_RW_INTERLEAVED);
-
-    // Format: S16_LE
-    params.masks[SNDRV_PCM_HW_PARAM_FORMAT - SNDRV_PCM_HW_PARAM_FIRST_MASK].bits[0] = (1 << SNDRV_PCM_FORMAT_S16_LE);
-
-    // Channels
-    params.intervals[SNDRV_PCM_HW_PARAM_CHANNELS - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = config_.channels;
-    params.intervals[SNDRV_PCM_HW_PARAM_CHANNELS - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = config_.channels;
-
-    // Rate
-    params.intervals[SNDRV_PCM_HW_PARAM_RATE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = config_.sample_rate;
-    params.intervals[SNDRV_PCM_HW_PARAM_RATE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = config_.sample_rate;
-
-    // Period size & buffer size
-    period_size_frames_ = config_.frames_per_packet > 0 ? config_.frames_per_packet : 240;
-    buffer_size_frames_ = period_size_frames_ * 4;
-
-    params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = period_size_frames_;
-    params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = period_size_frames_ * 2;
-    params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = buffer_size_frames_;
-    params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = buffer_size_frames_ * 4;
-
-    if (ioctl(fd_, SNDRV_PCM_IOCTL_HW_PARAMS, &params) < 0) {
-        LOG_WARN("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_PARAMS failed: " << strerror(errno)
-                 << ". Trying SNDRV_PCM_IOCTL_PREPARE anyway.");
-    }
-
-    // Prepare PCM
-    if (ioctl(fd_, SNDRV_PCM_IOCTL_PREPARE) < 0) {
-        LOG_ERROR("DirectAlsaPlayer: SNDRV_PCM_IOCTL_PREPARE failed: " << strerror(errno));
-        ::close(fd_);
-        fd_ = -1;
+    if (!success) {
+        log_device_capabilities(candidates, last_error);
+        LOG_ERROR("DirectAlsaPlayer: Failed to open and configure any fallback kernel PCM devices in /dev/snd/ (Last error: " << last_error << ")");
         return false;
     }
 
     is_open_ = true;
-    LOG_INFO("DirectAlsaPlayer: Opened kernel ALSA device '" << device_path_ << "' (" << config_.to_string() << ")");
+    LOG_INFO("DirectAlsaPlayer: Successfully opened and configured kernel ALSA device '" << device_path_
+             << "' (" << config_.to_string() << ", period " << period_size_frames_
+             << " frames, buffer " << buffer_size_frames_ << " frames)");
     return true;
 #else
     LOG_INFO("DirectAlsaPlayer: Mock open on non-Linux platform");
@@ -124,18 +186,186 @@ bool DirectAlsaPlayer::open(const AudioConfig& config, const std::string& device
 #endif
 }
 
-void DirectAlsaPlayer::close() {
-    if (is_open_) {
+bool DirectAlsaPlayer::try_open_candidate(const std::string& candidate, std::string& last_error) {
 #if defined(__linux__) || defined(__ANDROID__)
-        if (fd_ >= 0) {
-            ioctl(fd_, SNDRV_PCM_IOCTL_DROP);
-            ::close(fd_);
-            fd_ = -1;
-        }
-#endif
-        is_open_ = false;
-        LOG_INFO("DirectAlsaPlayer: Device closed");
+    LOG_DEBUG("DirectAlsaPlayer: attempting candidate '" << candidate << "' (open O_WRONLY|O_NONBLOCK)...");
+
+    uint64_t step_start_ms = get_time_ms();
+    int opened_fd = ::open(candidate.c_str(), O_WRONLY | O_NONBLOCK);
+    uint64_t step_ms = get_time_ms() - step_start_ms;
+    if (step_ms > 1000) {
+        LOG_WARN("DirectAlsaPlayer: open() of '" << candidate << "' took " << step_ms << "ms");
     }
+    if (opened_fd < 0) {
+        last_error = "open: " + std::string(strerror(errno));
+        LOG_DEBUG("DirectAlsaPlayer: open failed for candidate " << candidate << " after " << step_ms
+                  << "ms: " << strerror(errno));
+        return false;
+    }
+
+    // Set hardware parameters via ioctl
+    struct snd_pcm_hw_params params;
+    init_any_params(params);
+
+    // Access: RW interleaved (required for SNDRV_PCM_IOCTL_WRITEI_FRAMES)
+    set_param_value(params, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+
+    // Format: S16_LE
+    set_param_value(params, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+
+    // Channels (exact - stream is stereo)
+    set_param_value(params, SNDRV_PCM_HW_PARAM_CHANNELS, config_.channels);
+
+    // Rate (exact - this path performs no resampling)
+    set_param_value(params, SNDRV_PCM_HW_PARAM_RATE, config_.sample_rate);
+
+    const unsigned int period_req = config_.frames_per_packet > 0 ? static_cast<unsigned int>(config_.frames_per_packet) : 240;
+    const unsigned int buffer_req = period_req * 4;
+
+    params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = period_req;
+    params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = period_req * 2;
+    params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min = buffer_req;
+    params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max = buffer_req * 4;
+
+    step_start_ms = get_time_ms();
+    LOG_DEBUG("DirectAlsaPlayer:   -> SNDRV_PCM_IOCTL_HW_PARAMS (constrained)...");
+    int hw_params_ret = ioctl(opened_fd, SNDRV_PCM_IOCTL_HW_PARAMS, &params);
+    step_ms = get_time_ms() - step_start_ms;
+    if (step_ms > 1000) {
+        LOG_WARN("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_PARAMS on '" << candidate
+                 << "' took " << step_ms << "ms (errno " << errno << ")");
+    }
+
+    if (hw_params_ret < 0) {
+        last_error = "hw_params: " + std::string(strerror(errno));
+        LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_PARAMS with requested period/buffer failed for candidate "
+                  << candidate << ": " << strerror(errno) << " (" << step_ms << "ms). Retrying with unconstrained period/buffer...");
+
+        init_any_params(params);
+        set_param_value(params, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+        set_param_value(params, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+        set_param_value(params, SNDRV_PCM_HW_PARAM_CHANNELS, config_.channels);
+        set_param_value(params, SNDRV_PCM_HW_PARAM_RATE, config_.sample_rate);
+
+        step_start_ms = get_time_ms();
+        LOG_DEBUG("DirectAlsaPlayer:   -> SNDRV_PCM_IOCTL_HW_PARAMS (relaxed)...");
+        hw_params_ret = ioctl(opened_fd, SNDRV_PCM_IOCTL_HW_PARAMS, &params);
+        step_ms = get_time_ms() - step_start_ms;
+        if (step_ms > 1000) {
+            LOG_WARN("DirectAlsaPlayer: relaxed SNDRV_PCM_IOCTL_HW_PARAMS on '" << candidate
+                     << "' took " << step_ms << "ms (errno " << errno << ")");
+        }
+        if (hw_params_ret < 0) {
+            last_error = "hw_params (relaxed): " + std::string(strerror(errno));
+            LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_HW_PARAMS failed for candidate " << candidate
+                      << ": " << strerror(errno) << " (" << step_ms << "ms)");
+            ::close(opened_fd);
+            return false;
+        }
+    }
+
+    // The kernel copies the chosen configuration back into 'params' (the
+    // ioctl is _IOWR). Read back the values it actually selected.
+    period_size_frames_ = params.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+    buffer_size_frames_ = params.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].min;
+
+    // Software parameters configuration
+    struct snd_pcm_sw_params swparams;
+    std::memset(&swparams, 0, sizeof(swparams));
+    swparams.tstamp_mode = SNDRV_PCM_TSTAMP_NONE;
+    swparams.period_step = 1;
+    swparams.avail_min = (period_size_frames_ > 0) ? period_size_frames_ : 240;
+    swparams.start_threshold = (period_size_frames_ > 0) ? period_size_frames_ : 240;
+    swparams.stop_threshold = (buffer_size_frames_ > 0) ? buffer_size_frames_ : 4096;
+    swparams.silence_threshold = 0;
+    swparams.silence_size = 0;
+    swparams.boundary = (buffer_size_frames_ > 0) ? buffer_size_frames_ : 4096;
+    while (swparams.boundary * 2 <= ULONG_MAX - ((buffer_size_frames_ > 0) ? buffer_size_frames_ : 4096)) {
+        swparams.boundary *= 2;
+    }
+
+    step_start_ms = get_time_ms();
+    LOG_DEBUG("DirectAlsaPlayer:   -> SNDRV_PCM_IOCTL_SW_PARAMS...");
+    int sw_params_ret = ioctl(opened_fd, SNDRV_PCM_IOCTL_SW_PARAMS, &swparams);
+    step_ms = get_time_ms() - step_start_ms;
+    if (step_ms > 1000) {
+        LOG_WARN("DirectAlsaPlayer: SNDRV_PCM_IOCTL_SW_PARAMS on '" << candidate
+                 << "' took " << step_ms << "ms (errno " << errno << ")");
+    }
+    if (sw_params_ret < 0) {
+        LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_SW_PARAMS returned non-zero (continuing): " << strerror(errno));
+    }
+
+    // Prepare PCM
+    step_start_ms = get_time_ms();
+    LOG_DEBUG("DirectAlsaPlayer:   -> SNDRV_PCM_IOCTL_PREPARE...");
+    int prepare_ret = ioctl(opened_fd, SNDRV_PCM_IOCTL_PREPARE);
+    step_ms = get_time_ms() - step_start_ms;
+    if (step_ms > 1000) {
+        LOG_WARN("DirectAlsaPlayer: SNDRV_PCM_IOCTL_PREPARE on '" << candidate
+                 << "' took " << step_ms << "ms (errno " << errno << ")");
+    }
+    if (prepare_ret < 0) {
+        last_error = "prepare: " + std::string(strerror(errno));
+        LOG_DEBUG("DirectAlsaPlayer: SNDRV_PCM_IOCTL_PREPARE failed for candidate " << candidate << ": " << strerror(errno));
+        ::close(opened_fd);
+        return false;
+    }
+
+    // Restore blocking mode for audio writes
+    int flags = fcntl(opened_fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(opened_fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
+
+    fd_ = opened_fd;
+    device_path_ = candidate;
+    return true;
+#else
+    (void)candidate;
+    (void)last_error;
+    return false;
+#endif
+}
+
+bool DirectAlsaPlayer::open_candidate_only(const AudioConfig& config, const std::string& candidate) {
+    if (candidate.empty()) return false;
+#if defined(__linux__) || defined(__ANDROID__)
+    if (is_open_) close();
+    config_ = config;
+    staging_buffer_.clear();
+    device_path_ = candidate;
+
+    std::string last_error;
+    if (!try_open_candidate(candidate, last_error)) {
+        std::vector<std::string> only = {candidate};
+        log_device_capabilities(only, last_error);
+        return false;
+    }
+
+    is_open_ = true;
+    LOG_INFO("DirectAlsaPlayer: Successfully opened and configured kernel ALSA device '" << device_path_
+             << "' (" << config_.to_string() << ", period " << period_size_frames_
+             << " frames, buffer " << buffer_size_frames_ << " frames)");
+    return true;
+#else
+    (void)config;
+    (void)candidate;
+    return false;
+#endif
+}
+
+void DirectAlsaPlayer::close() {
+    is_open_ = false;
+#if defined(__linux__) || defined(__ANDROID__)
+    int old_fd = fd_.exchange(-1);
+    if (old_fd >= 0) {
+        ioctl(old_fd, SNDRV_PCM_IOCTL_DROP);
+        ::close(old_fd);
+    }
+#endif
+    staging_buffer_.clear();
+    LOG_INFO("DirectAlsaPlayer: Device closed");
 }
 
 bool DirectAlsaPlayer::is_open() const {
@@ -146,31 +376,79 @@ size_t DirectAlsaPlayer::write_frames(const void* pcm_data, size_t num_frames) {
     if (!is_open_ || !pcm_data || num_frames == 0) return 0;
 
 #if defined(__linux__) || defined(__ANDROID__)
-    if (fd_ < 0) return 0;
+    int curr_fd = fd_.load();
+    if (curr_fd < 0) return 0;
 
-    struct snd_xferi xferi;
-    xferi.result = 0;
-    xferi.buf = const_cast<void*>(pcm_data);
-    xferi.frames = num_frames;
+    const size_t channels = (config_.channels > 0) ? config_.channels : 2;
+    const int16_t* src = reinterpret_cast<const int16_t*>(pcm_data);
+    staging_buffer_.insert(staging_buffer_.end(), src, src + (num_frames * channels));
 
-    int ret = ioctl(fd_, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xferi);
-    if (ret < 0) {
-        if (errno == EPIPE) {
-            // Underrun - prepare device again
-            LOG_DEBUG("DirectAlsaPlayer: Kernel buffer underrun (XRUN), recovering...");
-            ioctl(fd_, SNDRV_PCM_IOCTL_PREPARE);
-            ret = ioctl(fd_, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xferi);
-        } else if (errno == ESTRPIPE) {
-            // Suspended
-            ioctl(fd_, SNDRV_PCM_IOCTL_RESUME);
-            ioctl(fd_, SNDRV_PCM_IOCTL_PREPARE);
+    size_t chunk_frames = (period_size_frames_ > 0) ? period_size_frames_ : num_frames;
+    size_t chunk_samples = chunk_frames * channels;
+
+    while (staging_buffer_.size() >= chunk_samples && is_open_ && fd_.load() >= 0) {
+        int active_fd = fd_.load();
+        if (active_fd < 0 || !is_open_) break;
+
+        // Poll with 50ms timeout to avoid hanging if the hardware clock stalls or on shutdown
+        struct pollfd pfd;
+        pfd.fd = active_fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        int poll_res = poll(&pfd, 1, 50);
+
+        if (poll_res <= 0) {
+            if (!is_open_ || fd_.load() < 0) break;
+            if (poll_res == 0) {
+                // Buffer full, device draining
+                break;
+            }
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        active_fd = fd_.load();
+        if (active_fd < 0 || !is_open_) break;
+
+        struct snd_xferi xferi;
+        xferi.result = 0;
+        xferi.buf = staging_buffer_.data();
+        xferi.frames = chunk_frames;
+
+        int ret = ioctl(active_fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xferi);
+        if (ret < 0) {
+            if (!is_open_ || fd_.load() < 0) break;
+            if (errno == EPIPE) {
+                // Underrun - prepare device again
+                LOG_DEBUG("DirectAlsaPlayer: Kernel buffer underrun (XRUN), recovering...");
+                ioctl(active_fd, SNDRV_PCM_IOCTL_PREPARE);
+                ret = ioctl(active_fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xferi);
+            } else if (errno == ESTRPIPE) {
+                // Suspended
+                ioctl(active_fd, SNDRV_PCM_IOCTL_RESUME);
+                ioctl(active_fd, SNDRV_PCM_IOCTL_PREPARE);
+                ret = ioctl(active_fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xferi);
+            } else {
+                ioctl(active_fd, SNDRV_PCM_IOCTL_PREPARE);
+                ret = ioctl(active_fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xferi);
+            }
+        }
+
+        if (ret >= 0) {
+            size_t written_frames = (xferi.result > 0) ? static_cast<size_t>(xferi.result) : chunk_frames;
+            size_t written_samples = written_frames * channels;
+            if (written_samples > staging_buffer_.size()) {
+                written_samples = staging_buffer_.size();
+            }
+            staging_buffer_.erase(staging_buffer_.begin(), staging_buffer_.begin() + written_samples);
+        } else {
+            LOG_DEBUG("DirectAlsaPlayer: writei failed with errno " << errno << " (" << strerror(errno) << ")");
+            staging_buffer_.clear();
+            break;
         }
     }
 
-    if (ret >= 0) {
-        return xferi.result > 0 ? xferi.result : num_frames;
-    }
-    return 0;
+    return num_frames;
 #else
     return num_frames;
 #endif
@@ -179,9 +457,10 @@ size_t DirectAlsaPlayer::write_frames(const void* pcm_data, size_t num_frames) {
 size_t DirectAlsaPlayer::get_buffer_delay_frames() const {
     if (!is_open_) return 0;
 #if defined(__linux__) || defined(__ANDROID__)
-    if (fd_ < 0) return 0;
+    int curr_fd = fd_.load();
+    if (curr_fd < 0) return 0;
     snd_pcm_sframes_t delay = 0;
-    if (ioctl(fd_, SNDRV_PCM_IOCTL_DELAY, &delay) >= 0) {
+    if (ioctl(curr_fd, SNDRV_PCM_IOCTL_DELAY, &delay) >= 0) {
         return delay > 0 ? static_cast<size_t>(delay) : 0;
     }
 #endif
@@ -191,11 +470,13 @@ size_t DirectAlsaPlayer::get_buffer_delay_frames() const {
 void DirectAlsaPlayer::flush() {
     if (!is_open_) return;
 #if defined(__linux__) || defined(__ANDROID__)
-    if (fd_ >= 0) {
-        ioctl(fd_, SNDRV_PCM_IOCTL_DROP);
-        ioctl(fd_, SNDRV_PCM_IOCTL_PREPARE);
+    int curr_fd = fd_.load();
+    if (curr_fd >= 0) {
+        ioctl(curr_fd, SNDRV_PCM_IOCTL_DROP);
+        ioctl(curr_fd, SNDRV_PCM_IOCTL_PREPARE);
     }
 #endif
+    staging_buffer_.clear();
 }
 
 std::string DirectAlsaPlayer::get_device_name() const {

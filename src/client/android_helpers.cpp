@@ -82,14 +82,51 @@ bool AndroidHelpers::run_tinymix_command(const std::string& control_name, const 
 #endif
 }
 
+bool AndroidHelpers::apply_speaker_routing() {
+#if defined(__linux__) || defined(__ANDROID__)
+    // Qualcomm RX_MACRO speaker path (Samsung A05s / Snapdragon 680 verified):
+    // route the LPASS digital audio output to the speaker and switch it on.
+    struct {
+        const char* control;
+        const char* value;
+    } const routes[] = {
+        {"RX_MACRO RX2 MUX", "AIF2_PB"},
+        {"RX INT2_1 MIX1 INP0", "RX2"},
+        {"AUX_RDAC Switch", "1"},
+    };
+
+    bool all_ok = true;
+    for (const auto& route : routes) {
+        if (!run_tinymix_command(route.control, route.value)) {
+            LOG_WARN("AndroidHelpers: tinymix '" << route.control << "' '" << route.value
+                     << "' failed (control name may differ on this device)");
+            all_ok = false;
+        }
+    }
+
+    if (all_ok) {
+        LOG_INFO("AndroidHelpers: speaker routing applied (RX_MACRO RX2 -> AUX_RDAC)");
+    }
+    return all_ok;
+#else
+    return false;
+#endif
+}
+
 void AndroidHelpers::print_android_troubleshooting_tips() {
     LOG_INFO("=== Android ALSA / Termux Root Tips ===");
-    LOG_INFO("1. Make sure to run Termux with root: type 'su' or 'tsu' before launching.");
+    LOG_INFO("1. Make sure to run Termux with root: type 'su' or 'sudo' before launching.");
     LOG_INFO("2. If no sound is heard on the phone speaker:");
     LOG_INFO("   - Check '/proc/asound/cards' to see the audio card name.");
     LOG_INFO("   - Check available nodes in '/dev/snd/'. Usually '/dev/snd/pcmC0D0p' is Card 0 Device 0 Playback.");
     LOG_INFO("   - Some Android Qualcomm/MediaTek devices require routing the mixer to speaker:");
     LOG_INFO("     Run: tinymix | grep -i 'speaker' or tinymix 'RX_CDC_DMA_RX_0 Audio Mixer MultiMedia1' 1");
+    LOG_INFO("   - If the PCM node hangs or fails to open, Android's 'audioserver' is usually holding it.");
+    LOG_INFO("     Free the device (root), then re-run the client:");
+    LOG_INFO("       stop audioserver      (re-enable Android audio later with: start audioserver)");
+    LOG_INFO("   - If the AGM path (-d agm) cannot dlopen libagmclient.so, the linker namespace blocks");
+    LOG_INFO("     vendor libraries. Run with LD_LIBRARY_PATH set (as root):");
+    LOG_INFO("       su -c 'LD_LIBRARY_PATH=/vendor/lib64 ./audiorouter_client -s <PC_IP> -d agm'");
     LOG_INFO("3. You can pass a specific ALSA device using: -d direct:/dev/snd/pcmC0D0p or -d hw:0,0");
 }
 

@@ -1,5 +1,7 @@
 #include "client.hpp"
 #include "alsa_player.hpp"
+#include "direct_alsa.hpp"
+#include "agm_fifo_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -7,13 +9,253 @@
 
 #include <cstring>
 #include <vector>
+#include <functional>
+#include <chrono>
+#include <algorithm>
+#include <limits>
 
 namespace audiorouter {
+
+namespace {
+    // How long to wait for the ALSA/direct audio device to open before giving
+    // up and falling back to the dummy sink.
+    constexpr uint32_t kPlayerOpenTimeoutMs = 3000;
+    // A single open attempt that exceeds this is considered hung in a kernel
+    // call and is abandoned (a new attempt is started on a fresh player).
+    constexpr uint32_t kDeviceAttemptTimeoutMs = 20000;
+    constexpr uint32_t kDeviceAttemptPollMs = 100;
+    constexpr uint32_t kDeviceRetryBackoffMs = 3000;
+    constexpr uint32_t kDeviceRetryMaxBackoffMs = 30000;
+    // Node-based (direct:/dev/... or /dev/...) opens try PCM nodes one by one;
+    // stop after this many attempts so a device held by Android's audioserver
+    // doesn't stall the client forever.
+    constexpr size_t kMaxNodeOpenAttempts = 8;
+    // AGM is tried first for "agm"/"agm:<backend>" devices. If the vendor
+    // library is absent (many Samsung/entry-level builds ship the classic ALSA
+    // HAL instead) those attempts fail fast and the client falls back.
+    constexpr size_t kMaxAgmOpenAttempts = 2;
+
+    // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
+    // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
+    // through the whole-chain AlsaPlayer open (ALSA-lib style).
+    bool is_node_based_device(const std::string& device_name) {
+        return device_name.rfind("direct:", 0) == 0 || device_name.rfind("/dev/", 0) == 0;
+    }
+
+    // "agm" / "agm:..." streams straight into Qualcomm's Audio Graph Manager
+    // (vendor libagmclient.so) instead of raw PCM nodes.
+    bool is_agm_device(const std::string& device_name) {
+        return device_name.rfind("agm:", 0) == 0 || device_name == "agm";
+    }
+
+    std::vector<std::string> build_node_candidates(const std::string& device_name) {
+        std::string primary = "/dev/snd/pcmC0D0p";
+        if (device_name.rfind("direct:", 0) == 0) {
+            primary = device_name.substr(7);
+        } else if (device_name.rfind("/dev/", 0) == 0) {
+            primary = device_name;
+        }
+        if (primary.empty()) {
+            primary = "/dev/snd/pcmC0D0p";
+        }
+
+        std::vector<std::string> candidates;
+        candidates.push_back(primary);
+        candidates.push_back("/dev/snd/pcmC0D0p");
+        for (const auto& dev : DirectAlsaPlayer::enumerate_kernel_pcm_devices()) {
+            if (std::find(candidates.begin(), candidates.end(), dev) == candidates.end()) {
+                candidates.push_back(dev);
+            }
+        }
+        return candidates;
+    }
+
+    // Runs one device open attempt on a fresh player. May block in the kernel
+    // for a long time; on success it hot-swaps the real device into
+    // open->player. Never touches the AudioRouterClient object, so it remains
+    // safe even if the client is destroyed while this thread is stuck.
+    void attempt_device_open(std::shared_ptr<DeviceOpenShared> open,
+                             std::shared_ptr<IAudioPlayer> device,
+                             std::function<bool()> open_fn) {
+        bool opened = false;
+        if (!open->shutdown.load()) {
+            opened = open_fn();
+        }
+
+        if (opened && !open->shutdown.load()) {
+            {
+                std::lock_guard<std::mutex> lock(open->mutex);
+                open->player = device;
+                open->result = true;
+                open->pending = false;
+            }
+            open->cv.notify_all();
+        } else {
+            if (opened) device->close();  // shutdown raced the open
+            {
+                std::lock_guard<std::mutex> lock(open->mutex);
+                open->result = false;
+                open->pending = false;
+            }
+            open->cv.notify_all();
+        }
+    }
+
+    enum class OpenStrategy { AGM, NODES, LEGACY };
+
+    // "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds don't ship
+    // libagmclient.so at all), then direct kernel PCM nodes, then ALSA-lib.
+    // Node-based names open PCM nodes only; everything else is ALSA-lib only.
+    std::vector<OpenStrategy> build_open_strategies(const std::string& device_name) {
+        if (is_agm_device(device_name)) {
+            return {OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
+        }
+        if (is_node_based_device(device_name)) {
+            return {OpenStrategy::NODES};
+        }
+        return {OpenStrategy::LEGACY};
+    }
+
+    const char* strategy_label(OpenStrategy strategy, bool node_based) {
+        switch (strategy) {
+            case OpenStrategy::AGM: return "AGM playback via vendor agmplay subprocess (FIFO)";
+            case OpenStrategy::NODES: return node_based ? "direct kernel PCM nodes (/dev/snd)" : "direct kernel PCM nodes";
+            default: return "ALSA-lib device (default/hw:0,0)";
+        }
+    }
+
+    // Supervises the retry loop: spawns one attempt thread at a time, abandons
+    // it if it hangs in the kernel for kDeviceAttemptTimeoutMs, and retries
+    // with backoff. Abandoned attempts keep running and hot-swap the device in
+    // automatically if they eventually succeed. Node-based opens try each PCM
+    // node in turn so one hung node (e.g. held by Android's audioserver) can't
+    // hide the others; when a strategy exhausts its attempt budget the next
+    // strategy (if any) takes over.
+    void device_open_supervisor(std::shared_ptr<DeviceOpenShared> open,
+                                AudioConfig cfg, std::string device_name) {
+        const std::vector<OpenStrategy> strategies = build_open_strategies(device_name);
+        size_t strategy_index = 0;
+        uint32_t backoff_ms = kDeviceRetryBackoffMs;
+        int attempt = 1;
+
+        while (!open->shutdown.load() && strategy_index < strategies.size()) {
+            const OpenStrategy strategy = strategies[strategy_index];
+            const size_t max_attempts = strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
+                                      : strategy == OpenStrategy::NODES ? kMaxNodeOpenAttempts
+                                                                        : std::numeric_limits<size_t>::max();
+            const bool node_based = strategy == OpenStrategy::NODES;
+
+            std::vector<std::string> candidates;
+            size_t candidate_index = 0;
+            if (node_based) {
+                candidates = build_node_candidates(device_name);
+            }
+
+            if (strategy_index > 0) {
+                LOG_WARN("Audio device: previous strategy failed, falling back to "
+                         << strategy_label(strategy, node_based));
+                backoff_ms = kDeviceRetryBackoffMs;
+            }
+
+            size_t attempts_in_strategy = 0;
+            while (!open->shutdown.load() && attempts_in_strategy < max_attempts) {
+                ++attempts_in_strategy;
+
+                std::string candidate;
+                if (node_based) {
+                    candidate = candidates[candidate_index % candidates.size()];
+                    ++candidate_index;
+                    LOG_INFO("Audio device open attempt " << attempt << ": trying PCM node '" << candidate
+                             << "' (node " << ((candidate_index - 1) % candidates.size()) + 1
+                             << " of " << candidates.size() << ")");
+                }
+
+                std::shared_ptr<IAudioPlayer> device =
+                    node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
+                    : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>())
+                                                    : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
+                auto finished = std::make_shared<std::atomic<bool>>(false);
+                std::thread attempt_thread([open, cfg, device_name, candidate, device, finished]() {
+                    if (!candidate.empty()) {
+                        attempt_device_open(open, device, [&]() {
+                            return std::static_pointer_cast<DirectAlsaPlayer>(device)->open_candidate_only(cfg, candidate);
+                        });
+                    } else {
+                        attempt_device_open(open, device, [&]() {
+                            return device->open(cfg, device_name);
+                        });
+                    }
+                    finished->store(true);
+                });
+
+                uint32_t waited = 0;
+                for (; waited < kDeviceAttemptTimeoutMs && !open->shutdown.load() && !finished->load();
+                     waited += kDeviceAttemptPollMs) {
+                    sleep_ms(kDeviceAttemptPollMs);
+                }
+
+                if (!open->shutdown.load()) {
+                    bool ok = false;
+                    {
+                        std::lock_guard<std::mutex> lock(open->mutex);
+                        ok = open->result;
+                    }
+                    if (finished->load() && ok) {
+                        attempt_thread.join();
+                        LOG_INFO("Audio device opened successfully on attempt " << attempt
+                                 << ": " << device->get_device_name());
+                        return;
+                    }
+                }
+
+                if (open->shutdown.load()) {
+                    if (attempt_thread.joinable()) attempt_thread.detach();
+                    break;
+                }
+
+                if (!finished->load()) {
+                    LOG_WARN("Audio device open attempt " << attempt
+                             << (candidate.empty() ? "" : " on '" + candidate + "'")
+                             << " hung in a kernel call (" << kDeviceAttemptTimeoutMs << "ms). Abandoning it and trying "
+                             << (node_based ? "the next PCM node" : "again with a fresh player") << "; if the abandoned "
+                             << "attempt later succeeds the real device is hot-swapped in automatically.");
+                    attempt_thread.detach();
+                } else {
+                    attempt_thread.join();
+                    LOG_INFO("Audio device open attempt " << attempt
+                             << (candidate.empty() ? "" : " on '" + candidate + "'") << " failed; retrying.");
+                }
+
+                ++attempt;
+                for (waited = 0; waited < backoff_ms && !open->shutdown.load(); waited += kDeviceAttemptPollMs) {
+                    sleep_ms(kDeviceAttemptPollMs);
+                }
+                backoff_ms = std::min(backoff_ms * 2, kDeviceRetryMaxBackoffMs);
+            }
+
+            if (!open->shutdown.load()) {
+                ++strategy_index;
+            }
+        }
+
+        // Reached only when every strategy exhausted its budget (a plain
+        // node-based device with all nodes hung).
+        if (!open->shutdown.load()) {
+            LOG_ERROR("Could not open any audio device after exhausting all strategies.");
+            LOG_ERROR("If every PCM node hangs or fails while running as root, Android's 'audioserver' is "
+                      << "most likely holding the primary PCM device. Run (as root):");
+            LOG_ERROR("    stop audioserver");
+            LOG_ERROR("then re-run the client. Re-enable Android audio later with: start audioserver");
+        }
+        LOG_INFO("Audio device open thread exiting.");
+    }
+}
 
 AudioRouterClient::AudioRouterClient(const ClientConfig& config)
     : config_(config),
       is_running_(false),
       state_(ClientState::STOPPED),
+      open_(std::make_shared<DeviceOpenShared>()),
       jitter_buffer_(config.target_latency_ms),
       last_packet_time_ms_(0),
       last_rtt_us_(0) {}
@@ -34,7 +276,7 @@ bool AudioRouterClient::start() {
         LOG_INFO("Running with root privileges (UID 0). Direct ALSA access enabled.");
         AndroidHelpers::fix_snd_permissions();
     } else {
-        LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'tsu' in Termux.");
+        LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'sudo' in Termux.");
     }
 
     // Open UDP Socket
@@ -45,6 +287,35 @@ bool AudioRouterClient::start() {
 
     socket_.set_buffer_sizes(1024 * 1024, 1024 * 1024);
     socket_.set_qos_priority(true);
+
+    // Optional VPN bypass: pin the socket to the physical Wi-Fi interface so
+    // an Android VPN tunnel (tun0) cannot swallow the LAN traffic to the PC.
+    // Requires root (SO_BINDTODEVICE / CAP_NET_RAW); best-effort otherwise.
+    if (!config_.bind_iface.empty()) {
+        std::string iface = config_.bind_iface;
+        if (iface == "auto") {
+            iface = UdpSocket::pick_physical_interface();
+            if (iface.empty()) {
+                LOG_WARN("No physical interface found to bind to; continuing with default routing");
+            } else {
+                LOG_INFO("Auto-selected physical interface '" << iface << "' for VPN bypass");
+            }
+        }
+        if (!iface.empty()) {
+            socket_.bind_to_interface(iface);
+        }
+    } else {
+        auto ifaces = UdpSocket::get_local_interfaces();
+        bool vpn_active = false;
+        for (const auto& info : ifaces) {
+            if (info.is_loopback || !info.is_up) continue;
+            if (info.name.rfind("tun", 0) == 0 || info.name.rfind("ppp", 0) == 0) vpn_active = true;
+        }
+        if (vpn_active) {
+            LOG_WARN("VPN tunnel detected but no -b/--bind given. If the handshake fails, rerun with "
+                     << "'-b auto' (or '-b wlan0') to bypass the VPN: e.g. -b auto");
+        }
+    }
 
     // Auto-discovery if requested
     if (config_.auto_discover) {
@@ -66,10 +337,9 @@ bool AudioRouterClient::start() {
     LOG_INFO("Target Server: " << server_addr_.to_string());
 
     // Create Audio Player (ALSA or Dummy)
-    if (config_.use_dummy_player) {
-        player_ = std::make_unique<DummyPlayer>();
-    } else {
-        player_ = std::make_unique<AlsaPlayer>();
+    {
+        std::lock_guard<std::mutex> lock(open_->mutex);
+        open_->player = config_.use_dummy_player ? std::make_shared<DummyPlayer>() : nullptr;
     }
 
     // Connect & Handshake with Windows Server
@@ -83,32 +353,83 @@ bool AudioRouterClient::start() {
     // Configure Jitter Buffer with negotiated stream parameters
     jitter_buffer_.configure(audio_config_, config_.target_latency_ms);
 
-    // Open ALSA Player with negotiated format
-    if (!player_->open(audio_config_, config_.device_name)) {
-        LOG_WARN("Could not open ALSA device '" << config_.device_name << "'. Trying dummy sink fallback...");
-        player_ = std::make_unique<DummyPlayer>();
-        player_->open(audio_config_, "dummy_fallback");
-        AndroidHelpers::print_android_troubleshooting_tips();
-    }
-
     is_running_ = true;
     state_ = ClientState::STREAMING;
     last_packet_time_ms_ = get_time_ms();
 
-    // Start threads
+    // Start worker threads BEFORE opening the audio device. This keeps the
+    // server heartbeat alive (its watchdog would otherwise disconnect the
+    // client) and keeps Ctrl+C responsive even if the device open hangs.
     net_thread_ = std::thread(&AudioRouterClient::network_receive_thread, this);
     playback_thread_ = std::thread(&AudioRouterClient::audio_playback_thread, this);
     heartbeat_thread_ = std::thread(&AudioRouterClient::heartbeat_thread, this);
+
+    // Open the audio player on a bounded, cancellable path: a hung ALSA /
+    // kernel driver must never block the main thread or stall shutdown.
+    open_player_with_timeout(config_.device_name, kPlayerOpenTimeoutMs);
 
     LOG_INFO("AudioRouter Client connected and streaming directly to Android speakers!");
     return true;
 }
 
-void AudioRouterClient::stop() {
-    if (!is_running_) return;
+void AudioRouterClient::open_player_with_timeout(const std::string& device_name, uint32_t timeout_ms) {
+    if (config_.use_dummy_player) {
+        std::lock_guard<std::mutex> lock(open_->mutex);
+        open_->player->open(audio_config_, device_name);
+        return;
+    }
 
-    LOG_INFO("Stopping AudioRouter Client...");
+    // Route the codec to the speaker before any open attempt so a successful
+    // open has an audible path right away. Best effort: some devices name the
+    // mixer controls differently.
+    AndroidHelpers::apply_speaker_routing();
+
+    {
+        std::lock_guard<std::mutex> lock(open_->mutex);
+        open_->pending = true;
+        open_->result = false;
+    }
+
+    // The supervisor owns its own references to the device-open state and
+    // never touches this object, so a hung kernel call cannot block shutdown.
+    device_thread_ = std::thread(device_open_supervisor, open_, audio_config_, device_name);
+
+    bool completed = false;
+    bool opened_ok = false;
+    {
+        std::unique_lock<std::mutex> lock(open_->mutex);
+        completed = open_->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                       [this]() { return !open_->pending; });
+        opened_ok = completed && open_->result;
+    }
+
+    if (opened_ok) {
+        std::lock_guard<std::mutex> lock(open_->mutex);
+        LOG_INFO("Audio device opened successfully: " << open_->player->get_device_name());
+        return;
+    }
+
+    if (!completed) {
+        LOG_WARN("Audio device open timed out after " << timeout_ms
+                 << "ms (ALSA driver may be busy). Using dummy sink; retrying in background...");
+    } else {
+        LOG_WARN("Could not open ALSA device '" << device_name << "'. Using dummy sink; retrying in background...");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(open_->mutex);
+        open_->player = std::make_shared<DummyPlayer>();
+        open_->player->open(audio_config_, "dummy_fallback");
+    }
+    AndroidHelpers::print_android_troubleshooting_tips();
+}
+
+void AudioRouterClient::stop() {
+    if (state_ == ClientState::STOPPED && !is_running_) return;  // idempotent
+
+    stop_requested_ = true;
     is_running_ = false;
+    open_->shutdown.store(true);
 
     // Send DISCONNECT_REQ to Windows server so it un-mutes PC speaker immediately
     if (server_addr_.is_valid()) {
@@ -127,11 +448,25 @@ void AudioRouterClient::stop() {
         dis_pay->reason_code = 0;
         std::strncpy(dis_pay->reason, "Client closed", sizeof(dis_pay->reason) - 1);
 
-        socket_.send_to(dis_buf.data(), dis_buf.size(), server_addr_);
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        if (socket_.is_open()) {
+            socket_.send_to(dis_buf.data(), dis_buf.size(), server_addr_);
+        }
     }
 
-    // Close UDP socket
-    socket_.close();
+    // Close UDP socket to unblock network receive thread
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        socket_.close();
+    }
+
+    // Close audio player to unblock playback thread immediately
+    {
+        std::lock_guard<std::mutex> lock(open_->mutex);
+        if (open_->player) {
+            open_->player->close();
+        }
+    }
 
     if (playback_thread_.joinable()) {
         playback_thread_.join();
@@ -142,9 +477,10 @@ void AudioRouterClient::stop() {
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
-
-    if (player_) {
-        player_->close();
+    if (device_thread_.joinable()) {
+        // The device open thread may be stuck in a kernel call; never join it.
+        // It self-terminates on stop_requested_ and closes whatever it opened.
+        device_thread_.detach();
     }
 
     state_ = ClientState::STOPPED;
@@ -160,9 +496,10 @@ ClientState AudioRouterClient::get_state() const {
 }
 
 ClientStats AudioRouterClient::get_stats() const {
+    auto j_stats = jitter_buffer_.get_stats();
     std::lock_guard<std::mutex> lock(stats_mutex_);
     ClientStats s = stats_;
-    s.jitter_stats = jitter_buffer_.get_stats();
+    s.jitter_stats = j_stats;
     s.round_trip_time_us = last_rtt_us_.load();
     return s;
 }
@@ -225,6 +562,8 @@ bool AudioRouterClient::discover_server(SocketAddress& out_server_addr) {
 }
 
 bool AudioRouterClient::perform_handshake() {
+    if (stop_requested_) return false;
+
     LOG_INFO("Initiating handshake with server at " << server_addr_.to_string() << "...");
 
     std::vector<uint8_t> req_buf(sizeof(protocol::CommonHeader) + sizeof(protocol::ConnectReqPayload));
@@ -249,6 +588,8 @@ bool AudioRouterClient::perform_handshake() {
     std::vector<uint8_t> recv_buf(4096);
 
     for (int retry = 0; retry < 5; ++retry) {
+        if (stop_requested_) return false;
+
         LOG_DEBUG("Sending CONNECT_REQ (attempt " << (retry + 1) << "/5)...");
         socket_.send_to(req_buf.data(), req_buf.size(), server_addr_);
 
@@ -295,9 +636,14 @@ void AudioRouterClient::network_receive_thread() {
     std::vector<uint8_t> recv_buf(65536);
     socket_.set_receive_timeout_ms(200);
 
-    while (is_running_) {
+    while (is_running_ && !stop_requested_) {
         SocketAddress sender;
-        int bytes = socket_.receive_from(recv_buf.data(), recv_buf.size(), sender);
+        int bytes;
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            if (!is_running_ || stop_requested_) break;
+            bytes = socket_.receive_from(recv_buf.data(), recv_buf.size(), sender);
+        }
 
         if (bytes <= 0) {
             if (!is_running_) break;
@@ -355,19 +701,33 @@ void AudioRouterClient::network_receive_thread() {
 void AudioRouterClient::audio_playback_thread() {
     const size_t period_frames = audio_config_.frames_per_packet > 0 ? audio_config_.frames_per_packet : 240;
     std::vector<int16_t> play_buffer(period_frames * audio_config_.channels);
+    const uint32_t frame_duration_ms = static_cast<uint32_t>((period_frames * 1000) / (audio_config_.sample_rate > 0 ? audio_config_.sample_rate : 48000));
+    const uint32_t fallback_sleep_ms = (frame_duration_ms > 0) ? frame_duration_ms : 2;
 
     while (is_running_) {
         // Read frames from jitter buffer
         size_t frames = jitter_buffer_.pop_frames(play_buffer.data(), period_frames);
 
-        if (frames > 0 && player_ && player_->is_open()) {
-            size_t written = player_->write_frames(play_buffer.data(), frames);
-            if (written > 0) {
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                stats_.frames_played += written;
+        if (frames > 0) {
+            std::shared_ptr<IAudioPlayer> player;
+            {
+                std::lock_guard<std::mutex> lock(open_->mutex);
+                player = open_->player;
+            }
+            if (player && player->is_open()) {
+                size_t written = player->write_frames(play_buffer.data(), frames);
+                if (written > 0) {
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    stats_.frames_played += written;
+                } else {
+                    // Audio device returned 0 frames written or was busy; pace the thread
+                    sleep_ms(fallback_sleep_ms);
+                }
+            } else {
+                sleep_ms(fallback_sleep_ms);
             }
         } else {
-            sleep_ms(2);
+            sleep_ms(fallback_sleep_ms);
         }
     }
 }
@@ -377,10 +737,7 @@ void AudioRouterClient::heartbeat_thread() {
     auto* ping_hdr = reinterpret_cast<protocol::CommonHeader*>(ping_buf.data());
     auto* ping_pay = reinterpret_cast<protocol::HeartbeatPayload*>(ping_buf.data() + sizeof(protocol::CommonHeader));
 
-    while (is_running_) {
-        sleep_ms(1000);
-        if (!is_running_) break;
-
+    while (is_running_ && !stop_requested_) {
         auto j_stats = jitter_buffer_.get_stats();
 
         ping_hdr->magic = protocol::MAGIC;
@@ -398,16 +755,22 @@ void AudioRouterClient::heartbeat_thread() {
         ping_pay->buffer_underruns = static_cast<uint32_t>(j_stats.underruns);
         ping_pay->buffer_overruns = static_cast<uint32_t>(j_stats.overruns);
 
-        socket_.send_to(ping_buf.data(), ping_buf.size(), server_addr_);
+        {
+            std::lock_guard<std::mutex> lock(socket_mutex_);
+            if (!is_running_ || stop_requested_) break;
+            socket_.send_to(ping_buf.data(), ping_buf.size(), server_addr_);
+        }
 
         // Watchdog check for server connection timeout
         uint64_t now_ms = get_time_ms();
         uint64_t last_packet = last_packet_time_ms_.load();
-        if (last_packet > 0 && (now_ms - last_packet) > config_.reconnect_timeout_ms) {
+        if (!stop_requested_ && last_packet > 0 && (now_ms - last_packet) > config_.reconnect_timeout_ms) {
             LOG_WARN("Server packet stream timeout (" << (now_ms - last_packet) << "ms). Attempting to re-handshake...");
             perform_handshake();
             last_packet_time_ms_ = get_time_ms();
         }
+
+        sleep_ms(1000);
     }
 }
 

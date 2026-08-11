@@ -9,10 +9,24 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <memory>
 
 namespace audiorouter {
+
+// Heap-allocated state shared between the client and the background
+// device-open threads. It (and the player objects it references) safely
+// outlive the client: a device thread can still be stuck inside a kernel
+// open() when the client is destroyed, and must never touch other members.
+struct DeviceOpenShared {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool pending = false;
+    bool result = false;
+    std::atomic<bool> shutdown{false};
+    std::shared_ptr<IAudioPlayer> player;
+};
 
 struct ClientConfig {
     std::string server_ip = "127.0.0.1";
@@ -22,6 +36,9 @@ struct ClientConfig {
     bool auto_discover = false;
     bool use_dummy_player = false;
     uint32_t reconnect_timeout_ms = 5000;
+    // Network interface to pin the UDP socket to ("auto" = detect physical
+    // NIC, "" = leave routing to the OS). Bypasses Android VPN tunnels.
+    std::string bind_iface = "";
 };
 
 enum class ClientState {
@@ -62,16 +79,21 @@ private:
     void network_receive_thread();
     void audio_playback_thread();
     void heartbeat_thread();
+    void open_player_with_timeout(const std::string& device_name, uint32_t timeout_ms);
 
     ClientConfig config_;
     std::atomic<bool> is_running_;
+    std::atomic<bool> stop_requested_{false};
     std::atomic<ClientState> state_;
 
     UdpSocket socket_;
     SocketAddress server_addr_;
     AudioConfig audio_config_;
 
-    std::unique_ptr<IAudioPlayer> player_;
+    // Guards all socket send/receive/close calls (UdpSocket is not thread-safe)
+    std::mutex socket_mutex_;
+
+    std::shared_ptr<DeviceOpenShared> open_;
     JitterBuffer jitter_buffer_;
 
     std::atomic<uint64_t> last_packet_time_ms_;
@@ -85,6 +107,9 @@ private:
     std::thread net_thread_;
     std::thread playback_thread_;
     std::thread heartbeat_thread_;
+
+    // Device-open supervisor thread (never joined; detached on shutdown).
+    std::thread device_thread_;
 };
 
 } // namespace audiorouter

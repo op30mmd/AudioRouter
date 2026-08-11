@@ -11,14 +11,10 @@
 
 namespace {
     std::atomic<bool> g_shutdown_requested{false};
-    audiorouter::AudioRouterClient* g_client_ptr = nullptr;
 
     void signal_handler(int sig) {
-        LOG_INFO("Caught termination signal (" << sig << "), disconnecting gracefully...");
-        g_shutdown_requested = true;
-        if (g_client_ptr) {
-            g_client_ptr->stop();
-        }
+        (void)sig;
+        g_shutdown_requested.store(true);
     }
 }
 
@@ -39,8 +35,11 @@ void print_usage(const char* prog) {
               << "Options:\n"
               << "  -s, --server <ip>         Windows PC Server IP address (e.g. 192.168.43.45 or 192.168.137.1)\n"
               << "  -p, --port <port>         Server UDP port (default: 44100)\n"
-              << "  -d, --device <dev>        ALSA device name (default: 'default', 'hw:0,0', 'direct:/dev/snd/pcmC0D0p')\n"
+              << "  -d, --device <dev>        ALSA device name (default: 'default', 'hw:0,0', 'direct:/dev/snd/pcmC0D0p',\n"
+              << "                              'agm' = Qualcomm AGM backend 'CODEC_DMA-LPAIF_RXTX-RX-1', 'agm:<backend>')\n"
               << "  -l, --latency <ms>        Target Jitter Buffer latency in ms (default: 35ms)\n"
+              << "  -b, --bind <iface>        Pin UDP socket to a network interface (bypasses Android VPN tunnels):\n"
+              << "                              'auto' = detect physical NIC (e.g. wlan0), or specify e.g. 'wlan0'\n"
               << "      --discover            Auto-discover server on local Wi-Fi Hotspot subnet\n"
               << "      --dummy               Use dummy audio player instead of ALSA (for testing/benchmarks)\n"
               << "      --list-devices        List detected ALSA and kernel PCM devices and exit\n"
@@ -81,6 +80,8 @@ int main(int argc, char* argv[]) {
             config.device_name = argv[++i];
         } else if ((arg == "-l" || arg == "--latency") && i + 1 < argc) {
             config.target_latency_ms = static_cast<uint32_t>(std::stoi(argv[++i]));
+        } else if ((arg == "-b" || arg == "--bind") && i + 1 < argc) {
+            config.bind_iface = argv[++i];
         } else if (arg == "--discover") {
             config.auto_discover = true;
         } else if (arg == "--dummy") {
@@ -118,7 +119,6 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, signal_handler);
 
     audiorouter::AudioRouterClient client(config);
-    g_client_ptr = &client;
 
     if (!client.start()) {
         LOG_FATAL("Failed to start AudioRouter Client.");
@@ -147,7 +147,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (g_shutdown_requested) {
+        LOG_INFO("Termination requested, disconnecting gracefully...");
+    }
+
     client.stop();
-    g_client_ptr = nullptr;
     return 0;
 }

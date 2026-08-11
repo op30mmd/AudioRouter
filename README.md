@@ -143,7 +143,7 @@ Inside Termux on your Android phone:
 git clone https://github.com/op30mmd/AudioRouter.git
 cd AudioRouter
 
-# 2. Run automated setup script (installs clang, make, alsa-lib, tsu)
+# 2. Run automated setup script (installs clang, make, alsa-lib, sudo)
 chmod +x scripts/*.sh
 ./scripts/termux_setup.sh
 ```
@@ -259,6 +259,7 @@ AudioRouter/
 │       ├── client.hpp/.cpp        # Client receiver engine & NAT heartbeat
 │       ├── alsa_player.hpp/.cpp   # ALSA player (dynamic libasound)
 │       ├── direct_alsa.hpp/.cpp   # Direct kernel /dev/snd/pcmC0D0p ioctl driver
+│       ├── agm_fifo_player.hpp/.cpp # AGM playback via vendor agmplay subprocess + FIFO
 │       ├── dummy_player.hpp/.cpp  # Simulated audio sink (benchmarks/CI)
 │       ├── jitter_buffer.hpp/.cpp # Adaptive Jitter Buffer with PLC
 │       ├── android_helpers.hpp/.cpp # Root verification & tinymix helpers

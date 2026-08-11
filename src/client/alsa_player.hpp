@@ -5,6 +5,7 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <atomic>
 
 namespace audiorouter {
 
@@ -28,10 +29,12 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     std::unique_ptr<DirectAlsaPlayer> direct_fallback_;
-    bool using_direct_fallback_;
-    bool is_open_;
+    std::atomic<bool> using_direct_fallback_;
+    std::atomic<bool> is_open_;
     std::string device_name_;
     AudioConfig config_;
+
+    bool try_open_via_libasound(const AudioConfig& config, const std::string& device_name);
 };
 
 } // namespace audiorouter

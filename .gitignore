@@ -23,3 +23,6 @@ build_msvc/
 .idea/
 CMakeSettings.json
 *.user
+
+build-host/
+

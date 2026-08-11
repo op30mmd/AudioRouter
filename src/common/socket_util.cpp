@@ -328,14 +328,64 @@ bool UdpSocket::set_qos_priority(bool enable) {
 #endif
 }
 
-SocketAddress UdpSocket::get_local_address() const {
-    if (!is_open()) return SocketAddress();
-    struct sockaddr_in addr;
-    socklen_t len = sizeof(addr);
-    if (getsockname(handle_, reinterpret_cast<struct sockaddr*>(&addr), &len) == 0) {
-        return SocketAddress(addr);
+bool UdpSocket::bind_to_interface(const std::string& ifname) {
+    if (!is_open()) {
+        if (!open()) return false;
     }
-    return SocketAddress();
+#if defined(_WIN32)
+    (void)ifname;
+    return false;
+#else
+    // SO_BINDTODEVICE bypasses the routing table (including Android VPN tun
+    // interfaces) by pinning this socket to a physical device. Requires root.
+    struct ifreq ifr;
+    std::memset(&ifr, 0, sizeof(ifr));
+    if (ifname.size() >= sizeof(ifr.ifr_name)) return false;
+    std::strncpy(ifr.ifr_name, ifname.c_str(), sizeof(ifr.ifr_name) - 1);
+    if (setsockopt(handle_, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) != 0) {
+        LOG_WARN("bind_to_interface('" << ifname << "') failed: " << get_last_error_string()
+                 << " (needs root / CAP_NET_RAW)");
+        return false;
+    }
+    LOG_INFO("UDP socket pinned to interface '" << ifname << "' (bypasses VPN tunnel routing)");
+    return true;
+#endif
+}
+
+std::string UdpSocket::pick_physical_interface() {
+    std::vector<NetworkInterfaceInfo> ifaces = get_local_interfaces();
+    for (const auto& info : ifaces) {
+        if (info.is_loopback || !info.is_up) continue;
+
+        const std::string& n = info.name;
+        // Skip virtual / tunnel / cellular-datalink interfaces: Android VPNs
+        // are tunNN, hotspot clients use rmnet/ppp, tunnels use sit/gre/ip_vti.
+        const char* virtual_prefixes[] = {"lo",  "tun", "tap", "ppp", "rmnet",
+                                          "dum", "sit", "gre", "vti", "ip6tnl",
+                                          "ip_vti", "wlan", "wifi"};
+        bool virtual_iface = false;
+        for (const char* p : virtual_prefixes) {
+            if (n.rfind(p, 0) == 0) {
+                virtual_iface = true;
+                break;
+            }
+        }
+        // "wlan" is in the exclusion list only so the loop below prefers real
+        // Ethernet; but on phones there is no Ethernet, so accept wlanNN here.
+        if (virtual_iface) {
+            if (n.rfind("wlan", 0) == 0 || n.rfind("wifi", 0) == 0) virtual_iface = false;
+        }
+        if (virtual_iface) continue;
+
+        return n;
+    }
+    // Fallback: any non-loopback, up, IPv4-bearing interface.
+    for (const auto& info : ifaces) {
+        if (info.is_loopback || !info.is_up) continue;
+        if (info.ip_address == "0.0.0.0") continue;
+        return info.name;
+    }
+    return "";
 }
 
 std::vector<NetworkInterfaceInfo> UdpSocket::get_local_interfaces() {
@@ -409,6 +459,16 @@ std::vector<NetworkInterfaceInfo> UdpSocket::get_local_interfaces() {
 #endif
 
     return list;
+}
+
+SocketAddress UdpSocket::get_local_address() const {
+    if (!is_open()) return SocketAddress();
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(handle_, reinterpret_cast<struct sockaddr*>(&addr), &len) == 0) {
+        return SocketAddress(addr);
+    }
+    return SocketAddress();
 }
 
 } // namespace audiorouter
