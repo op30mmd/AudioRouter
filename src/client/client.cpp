@@ -106,12 +106,26 @@ namespace {
     // "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds don't ship
     // libagmclient.so at all), then direct kernel PCM nodes, then ALSA-lib.
     // Node-based names open PCM nodes only; everything else is ALSA-lib only.
+    // On Bengal boards (SD662/680, WCD937x, bengal-idp-snd-card with 7 playback
+    // nodes and no pcmC0D0p), the AGM FIFO named pipe via agmplay should be
+    // the default because direct PCM mapping is non-standard and mixer routing
+    // requires RX_MACRO setup. We auto-detect Bengal and treat "default" as AGM.
     std::vector<OpenStrategy> build_open_strategies(const std::string& device_name) {
         if (is_agm_device(device_name)) {
             return {OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
         }
         if (is_node_based_device(device_name)) {
             return {OpenStrategy::NODES};
+        }
+        // Bengal boards: agmplay named pipe should be default
+        // User request: "agmplay named pipe should be the default on bengal"
+        // If device_name is "default" (or empty) and we are on Bengal with agmplay available,
+        // treat as AGM device (AGM -> NODES -> LEGACY fallback chain)
+        if (device_name == "default" || device_name.empty()) {
+            if (AndroidHelpers::should_default_to_agm()) {
+                // Log once - this will be seen in device open supervisor logs via strategy label
+                return {OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
+            }
         }
         return {OpenStrategy::LEGACY};
     }
@@ -133,6 +147,15 @@ namespace {
     // strategy (if any) takes over.
     void device_open_supervisor(std::shared_ptr<DeviceOpenShared> open,
                                 AudioConfig cfg, std::string device_name) {
+        // Bengal boards: default should be AGM named pipe (user request)
+        // If device_name is "default" on Bengal, use recommended AGM device for AGM strategy
+        std::string effective_device_for_agm = device_name;
+        if ((device_name == "default" || device_name.empty()) && AndroidHelpers::should_default_to_agm()) {
+            effective_device_for_agm = AndroidHelpers::get_recommended_default_device();
+            LOG_INFO("Bengal board detected (bengal-idp-snd-card), default audio device auto-selected to AGM named pipe: "
+                     << effective_device_for_agm << " (was '" << device_name << "'). Direct PCM nodes: no pcmC0D0p, 7 playback nodes, WCD937x requires RX_MACRO routing.");
+        }
+
         const std::vector<OpenStrategy> strategies = build_open_strategies(device_name);
         size_t strategy_index = 0;
         uint32_t backoff_ms = kDeviceRetryBackoffMs;
@@ -174,15 +197,28 @@ namespace {
                     node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
                     : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>())
                                                     : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
+
+                // For Bengal default -> AGM, use the recommended AGM device string (e.g., agm:CODEC_DMA-LPAIF_RXTX-RX-1)
+                // instead of literal "default"
+                std::string effective_open_name = device_name;
+                if (strategy == OpenStrategy::AGM && (device_name == "default" || device_name.empty())) {
+                    if (!effective_device_for_agm.empty() && effective_device_for_agm != "default") {
+                        effective_open_name = effective_device_for_agm;
+                    }
+                }
+
                 auto finished = std::make_shared<std::atomic<bool>>(false);
-                std::thread attempt_thread([open, cfg, device_name, candidate, device, finished]() {
+                std::thread attempt_thread([open, cfg, device_name, effective_open_name, candidate, device, finished, strategy]() {
                     if (!candidate.empty()) {
                         attempt_device_open(open, device, [&]() {
                             return std::static_pointer_cast<DirectAlsaPlayer>(device)->open_candidate_only(cfg, candidate);
                         });
                     } else {
-                        attempt_device_open(open, device, [&]() {
-                            return device->open(cfg, device_name);
+                        // For AGM on Bengal, use effective_open_name (recommended device) if original was default
+                        std::string name_to_use = (strategy == OpenStrategy::AGM && device_name == "default") ? effective_open_name : device_name;
+                        if (name_to_use.empty()) name_to_use = effective_open_name;
+                        attempt_device_open(open, device, [&, name_to_use]() {
+                            return device->open(cfg, name_to_use);
                         });
                     }
                     finished->store(true);

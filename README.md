@@ -397,6 +397,12 @@ Usage: audiorouter_client [options]
 ./scripts/termux_run.sh -s 192.168.43.45 -p 44100 -d direct:/dev/snd/pcmC0D0p -l 35 -b auto --verbose
 ./scripts/termux_run.sh --discover --verbose
 ./scripts/termux_run.sh --list-devices
+
+# On Bengal (bengal-idp-snd-card, SD662/680) default is now AGM named pipe (agmplay FIFO)
+# So you can just run without -d and it will auto-select AGM:
+./scripts/termux_run.sh 192.168.43.45 -b auto -v
+# Which is equivalent to:
+./scripts/termux_run.sh -s 192.168.43.45 -d agm:CODEC_DMA-LPAIF_RXTX-RX-1 -b auto -v
 ```
 
 **Direct examples:**

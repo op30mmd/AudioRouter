@@ -163,6 +163,19 @@ if [[ "$NEEDS_SERVER" == "1" && -z "$SERVER_IP" && "$AUTO_DISCOVER" == "0" ]]; t
     fi
 fi
 
+# Auto-detect Bengal board and set AGM as default (user request: agmplay named pipe should be default on bengal)
+# If device is still default and we are on Bengal with agmplay present, use AGM named pipe
+EFFECTIVE_DEVICE="$DEVICE"
+if [[ "$DEVICE" == "default" ]]; then
+    if [[ -f /proc/asound/cards ]] && grep -qi "bengal" /proc/asound/cards 2>/dev/null; then
+        if [[ -x /vendor/bin/agmplay || -f /vendor/bin/agmplay || -x /system/bin/agmplay ]]; then
+            EFFECTIVE_DEVICE="agm:CODEC_DMA-LPAIF_RXTX-RX-1"
+            log_info "Bengal board detected (bengal-idp-snd-card) - auto-selecting AGM named pipe as default: $EFFECTIVE_DEVICE (was default)"
+            log_info "  You can override with -d direct:/dev/snd/pcmC0D1p or -d hw:0,0 etc. if AGM fails"
+        fi
+    fi
+fi
+
 # Build client args
 CLIENT_ARGS=()
 
@@ -176,8 +189,8 @@ fi
 
 CLIENT_ARGS+=("-p" "$PORT")
 
-if [[ "$DEVICE" != "default" ]]; then
-    CLIENT_ARGS+=("-d" "$DEVICE")
+if [[ "$EFFECTIVE_DEVICE" != "default" ]]; then
+    CLIENT_ARGS+=("-d" "$EFFECTIVE_DEVICE")
 fi
 
 if [[ -n "$LATENCY" ]]; then
@@ -190,7 +203,7 @@ fi
 
 CLIENT_ARGS+=("${EXTRA_ARGS[@]}")
 
-log_info "Server: ${SERVER_IP:-auto-discover} Port: $PORT Device: $DEVICE ${LATENCY:+Latency: ${LATENCY}ms} ${BIND_IFACE:+Bind: $BIND_IFACE}"
+log_info "Server: ${SERVER_IP:-auto-discover} Port: $PORT Device: $EFFECTIVE_DEVICE (original: $DEVICE) ${LATENCY:+Latency: ${LATENCY}ms} ${BIND_IFACE:+Bind: $BIND_IFACE}"
 if [[ "$VERBOSE" == "1" ]]; then
     log_info "Full command: $BIN_PATH ${CLIENT_ARGS[*]}"
 fi

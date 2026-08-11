@@ -7,6 +7,8 @@
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 
 namespace audiorouter {
 
@@ -151,6 +153,51 @@ bool AndroidHelpers::apply_speaker_routing() {
 #endif
 }
 
+bool AndroidHelpers::is_bengal_board() {
+#if defined(__linux__) || defined(__ANDROID__)
+    std::ifstream file("/proc/asound/cards");
+    if (!file.is_open()) return false;
+    std::string line;
+    while (std::getline(file, line)) {
+        std::string lower = line;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("bengal") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+bool AndroidHelpers::should_default_to_agm() {
+#if defined(__linux__) || defined(__ANDROID__)
+    // Bengal boards have 7 playback nodes, no pcmC0D0p, and WCD937x codec where
+    // AGM FIFO via agmplay named pipe is more reliable than direct PCM.
+    // Also check if agmplay binary exists.
+    if (!is_bengal_board()) return false;
+
+    // Check if agmplay exists at known paths
+    if (::access("/vendor/bin/agmplay", F_OK) == 0 || ::access("/system/bin/agmplay", F_OK) == 0) {
+        return true;
+    }
+    return false;
+#else
+    return false;
+#endif
+}
+
+std::string AndroidHelpers::get_recommended_default_device() {
+    if (should_default_to_agm()) {
+        // On Bengal, RX-1 is the most commonly successful speaker backend,
+        // but we return generic "agm" which will try RX-1 then fallback.
+        // User can override with -d agm:CODEC_DMA-LPAIF_RXTX-RX-0 etc.
+        return "agm:CODEC_DMA-LPAIF_RXTX-RX-1";
+    }
+    return "default";
+}
+
 void AndroidHelpers::print_android_troubleshooting_tips() {
     LOG_INFO("=== Android ALSA / Termux Root Tips ===");
     LOG_INFO("1. Make sure to run Termux with root: type 'su' first. Check with 'id' showing uid=0");
@@ -159,22 +206,24 @@ void AndroidHelpers::print_android_troubleshooting_tips() {
     LOG_INFO("   AgmFifoPlayer uses env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib to spawn agmplay cleanly");
     LOG_INFO("   For manual test, use: env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib PATH=/vendor/bin:/system/bin /vendor/bin/agmplay --help");
     LOG_INFO("3. If no sound on speaker (common on Bengal SD662/680 with 7 PCM nodes, no pcmC0D0p):");
+    LOG_INFO("   - Bengal defaults to AGM named pipe (agmplay FIFO) which is more reliable than direct PCM");
     LOG_INFO("   - Check '/proc/asound/cards' (bengal-idp-snd-card has no pcmC0D0p, primary may be pcmC0D1p/D5p)");
     LOG_INFO("   - List nodes: ./bin/audiorouter_client --list-devices");
-    LOG_INFO("   - Try each playback node: -d direct:/dev/snd/pcmC0D1p, D2p, D5p, D6p, D7p, D8p, D14p");
+    LOG_INFO("   - Default on Bengal is now agm:CODEC_DMA-LPAIF_RXTX-RX-1, fallback to agm:RX-0, RX-2 etc.");
+    LOG_INFO("   - Try each playback node if AGM fails: -d direct:/dev/snd/pcmC0D1p, D2p, D5p, D6p, D7p, D8p, D14p");
     LOG_INFO("   - Try AGM backends: -d agm:CODEC_DMA-LPAIF_RXTX-RX-0 / RX-1 / RX-2");
-    LOG_INFO("   - Run mixer setup: ./scripts/android_mixer_setup.sh --qualcomm or --bengal (as root)");
+    LOG_INFO("   - Run mixer setup: ./scripts/android_mixer_setup.sh --bengal (as root)");
     LOG_INFO("   - Manual tinymix for Bengal:");
     LOG_INFO("     tinymix 'RX_MACRO RX0 MUX' 'AIF1_PB'; tinymix 'RX MIX TX0 MUX' 'RX0'; tinymix 'HPHL_RDAC Switch' 1");
     LOG_INFO("4. VPN tun0 active breaks hotspot audio (MTU 1300, routing through tunnel):");
     LOG_INFO("   - Disable VPN or bypass with: -b auto or -b wlan0");
-    LOG_INFO("   - Example: ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D1p -b auto -v");
-    LOG_INFO("   - Or with runner: ./scripts/termux_run.sh <PC_IP> -- -b auto -d direct:/dev/snd/pcmC0D1p");
+    LOG_INFO("   - Example: ./bin/audiorouter_client -s <PC_IP> -d agm -b auto -v");
+    LOG_INFO("   - Or with runner: ./scripts/termux_run.sh <PC_IP> -- -b auto -d agm");
     LOG_INFO("5. WiFi DOWN (wlan0 DOWN) - AudioRouter needs local hotspot:");
     LOG_INFO("   Scenario A: Android hotspot ON, PC connected to phone (192.168.43.x) - RECOMMENDED");
     LOG_INFO("   Scenario B: Windows hotspot ON, Android connected to PC (192.168.137.1)");
     LOG_INFO("6. If PCM node hangs: Android audioserver may hold it. Try (root): stop audioserver, test, then start audioserver");
-    LOG_INFO("7. You can pass device: -d direct:/dev/snd/pcmC0D0p or -d hw:0,0 or -d agm");
+    LOG_INFO("7. You can pass device: -d agm (default on Bengal), -d direct:/dev/snd/pcmC0D0p or -d hw:0,0");
 }
 
 } // namespace audiorouter
