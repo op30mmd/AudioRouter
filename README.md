@@ -309,10 +309,10 @@ All helper scripts are in `scripts/` and designed to be user-friendly with `--he
 | `build_server_mingw.bat` | Windows | MinGW direct `g++` build with C++23 and hardening flags. Checks g++ version, supports `--clean`, `--debug`. Updated from C++17 to C++23. |
 | `build_client.sh` | Linux, Termux | Client-only build wrapper. Auto-detects `clang++`/`g++`, checks C++23, supports `--clean`, `--tests`, `--sanitize`, `--debug`, `--verbose`, `--compiler`. |
 | `termux_setup.sh` | Termux | Termux environment setup. Updates `pkg`, installs all dependencies, builds client if missing. Options: `--no-build`, `--force`, `--verbose`, `--tests`. Improved from original with better detection and logging. |
-| `termux_run.sh` | Termux | User-friendly client runner. Auto-discovers or builds binary, fixes `/dev/snd/*` permissions via `su`, sets `LD_LIBRARY_PATH` for vendor libs, supports full client options: `-s IP`, `-p PORT`, `-d DEVICE`, `-l LATENCY`, `-b IFACE`, `--discover`, `--verbose`, `--list-devices`. Interactive prompt if no IP given. |
-| `check_env.sh` | Linux, Termux, Android | Environment diagnostics. Checks: OS/arch, compiler C++23 support, cmake/make, alsa-lib, Termux/Root, `/dev/snd` nodes and permissions, `tinymix`/`agmplay`, network interfaces and VPN `tun0` detection, existing binaries. Color-coded OK/WARN/FAIL. |
-| `android_diagnose.sh` | Android (root) | Comprehensive Android audio diagnostics. Checks root, `tinymix`/`agmplay` location, `/dev/snd` PCM nodes and permissions, `/proc/asound/cards`, SoC detection via `/proc/cpuinfo`, mixer controls dump, client `--list-devices`, libasound presence, network interfaces and VPN detection, and prints actionable recommendations. |
-| `android_mixer_setup.sh` | Android (root) | ALSA speaker routing helper. Must run as root. Fixes permissions, detects SoC (Qualcomm/MediaTek or forced via `--qualcomm`/`--mediatek`), lists cards, applies common routing controls (`RX_CDC_DMA_RX_0`, `PRI_MI2S_RX`, `Speaker Function`, volumes) with dry-run and list-only modes. Improved with more controls and detailed logging. |
+| `termux_run.sh` | Termux | User-friendly client runner. Auto-discovers or builds binary, fixes `/dev/snd/*` permissions via `su`, sets `LD_LIBRARY_PATH` for vendor libs and clears `LD_PRELOAD` to fix `libtermux-exec.so` linking error for `agmplay` children. Supports full client options: `-s IP`, `-p PORT`, `-d DEVICE`, `-l LATENCY`, `-b IFACE`, `--discover`, `--verbose`, `--list-devices`. Detects `tun0` VPN and `wlan0 DOWN` and warns with `-b auto` bypass suggestion. Interactive IP prompt if needed. Updated with Bengal-friendly examples. |
+| `check_env.sh` | Linux, Termux, Android | Environment diagnostics. Checks: OS/arch, compiler C++23 support, cmake/make, alsa-lib, Termux/Root, `/dev/snd` nodes and permissions, `tinymix`/`agmplay` (now with clean env `env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib` to avoid Termux `libtermux-exec.so` false failure), network interfaces with `tun0` VPN and `wlan0 DOWN` detection plus bypass suggestion. Color-coded OK/WARN/FAIL. Updated with Bengal awareness. |
+| `android_diagnose.sh` | Android (root) | Comprehensive Android audio diagnostics. Checks root, `tinymix`/`agmplay` via clean vendor env (fixes libtermux-exec linking error), `/dev/snd` PCM nodes with tailored analysis for Bengal 7-node no-D0p case, `/proc/asound/cards` with Bengal detection, SoC from `/proc/cpuinfo`, mixer dump with expanded filter (RX_MACRO, RX MIX, RDAC etc.) and manual routing suggestions for Bengal, libasound presence, network with `tun0` VPN + `wlan0 DOWN` tailored recommendations, and prints actionable steps. Most detailed script - use first for debugging. |
+| `android_mixer_setup.sh` | Android (root) | ALSA speaker routing helper. Must run as root. Fixes permissions, detects SoC (Qualcomm/Bengal SD662/680 via `bengal-idp-snd-card`, MediaTek, or forced via `--qualcomm`/`--bengal`/`--mediatek`), lists cards, applies common routing plus Bengal-specific routing (RX_MACRO RX0 MUX->AIF1_PB, RX MIX->RX0, INT MIX, RDAC Switches, volumes) with `--list`, `--dry-run`, `--qualcomm`/`--bengal`. Improved with more controls and detailed logging. Now includes tailored Bengal workaround from real diagnostic. |
 | `start_server.bat` | Windows | Interactive server launcher. Lists interfaces via `audiorouter_server --list-if` (fallback to `ipconfig`), prompts for port and mute mode, then runs server with chosen args. Supports `-p PORT -b IP` non-interactively. Also prints firewall hint. |
 | `start_server.ps1` | Windows | PowerShell version of interactive launcher. Uses `Get-NetIPAddress` fallback, prompts for port/mute/test tone, shows firewall rule creation hint (`New-NetFirewallRule`), supports parameters `-Port`, `-Bind`, `-MuteMode`, `-NoMute`, `-TestTone`, `-Freq`. |
 
@@ -445,9 +445,15 @@ The client selects playback backend based on device string and runtime fallback:
 
 3. **AgmFifoPlayer (Qualcomm AGM)** - `agm` or `agm:<backend>`
    - Used on devices with AGM audio HAL (card 100, device 100).
-   - Creates a named pipe (FIFO) and spawns vendor `agmplay` subprocess. Client writes 44-byte WAV header + S16LE PCM into FIFO; `agmplay` owns AGM graph registration via HIDL binder and ADSP session management.
+   - Creates a named pipe (FIFO) and spawns vendor `agmplay` subprocess via `fork()` + `execve()` with clean environment (`LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib:/system/lib64:/system/lib`, no `LD_PRELOAD`) to fix Termux `libtermux-exec.so not accessible` linker namespace issue. Previously running `/vendor/bin/agmplay` directly in Termux shell failed with `CANNOT LINK EXECUTABLE agmplay: library libtermux-exec.so...`. Fixed in this update by clean env spawn.
+   - Client writes 44-byte WAV header + S16LE PCM into FIFO; `agmplay` owns AGM graph registration via HIDL binder and ADSP session management.
    - Input is downmixed to mono because AGM speaker graph is mono-oriented.
-   - Example backends: `CODEC_DMA-LPAIF_RXTX-RX-1`, auto-detected default.
+   - Example backends for Bengal (SD662/680) observed in diagnostic: `CODEC_DMA-LPAIF_RXTX-RX-0`, `RX-1`, `RX-2`, `RX-3` (controls 164-167 in tinymix). Try each if default fails.
+   - Manual clean-env test:
+     ```
+     su
+     env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib:/system/lib64:/system/lib PATH=/vendor/bin:/system/bin /vendor/bin/agmplay --help
+     ```
 
 4. **DummyPlayer** - `--dummy`
    - Simulates audio sink for benchmarking and headless CI, calculates buffer level without hardware.
@@ -615,46 +621,111 @@ AudioRouter/
 ## Troubleshooting
 
 **No audio on Android but client shows streaming:**
-- Run diagnostics:
+- Run full diagnostics (as root):
   ```bash
   su
   ./scripts/check_env.sh
   ./scripts/android_diagnose.sh
+  ./scripts/android_mixer_setup.sh --qualcomm   # or --bengal for SD662/680
   ```
 - Verify root: `id` should show `uid=0`. Run `su` first.
 - Check `/dev/snd` permissions: `ls -l /dev/snd/` and run `chmod 666 /dev/snd/*` or `./scripts/android_mixer_setup.sh`.
-- Try detailed mixer modes: `./scripts/android_mixer_setup.sh --list`, `--qualcomm`, `--dry-run`.
-- Try alternative device: `direct:/dev/snd/pcmC0D0p`, `hw:0,0`, `agm`.
+- Try detailed mixer modes: `./scripts/android_mixer_setup.sh --list`, `--qualcomm`, `--bengal`, `--dry-run`.
+- Try alternative ALSA devices: `direct:/dev/snd/pcmC0D0p`, `hw:0,0`, `agm`, or specific nodes like `direct:/dev/snd/pcmC0D1p`.
 - List devices: `./bin/audiorouter_client --list-devices` or `./scripts/termux_run.sh --list-devices`.
-- Check if another app holds PCM device exclusively.
+- Check if another app holds PCM device exclusively: `stop audioserver` (test, then `start audioserver` to restore Android audio).
+
+**Bengal device (bengal-idp-snd-card, SD662/SD680, WCD937x, 7 playback nodes, no pcmC0D0p):**
+- This device family (diagnostic example from real device) has no `pcmC0D0p` playback node. `DirectAlsaPlayer` automatically tries fallback candidates, but you should explicitly test each:
+  ```bash
+  su
+  ./bin/audiorouter_client --list-devices
+  ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D1p -b auto -v
+  ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D5p -b auto -v
+  ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D6p -b auto -v
+  ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D14p -b auto -v
+  ./bin/audiorouter_client -s <PC_IP> -d agm:CODEC_DMA-LPAIF_RXTX-RX-1 -b auto -v
+  ./bin/audiorouter_client -s <PC_IP> -d agm:CODEC_DMA-LPAIF_RXTX-RX-0 -b auto -v
+  ```
+- Mixer routing for Bengal requires more than generic Qualcomm controls. Use `./scripts/android_mixer_setup.sh --bengal` which applies:
+  ```
+  RX_MACRO RX0/RX1/RX2 MUX -> AIF1_PB/AIF2_PB
+  RX MIX TX0/1/2 MUX -> RX0/1/2
+  RX INT0_1 MIX1 INP0 -> RX0 etc.
+  HPHL_RDAC, HPHR_RDAC, AUX_RDAC, EAR_RDAC Switch -> 1
+  RX_RX0/RX1/RX2 Mix Digital Volume -> 84
+  ```
+- Manual test:
+  ```bash
+  su
+  tinymix "RX_MACRO RX0 MUX" "AIF1_PB"
+  tinymix "RX MIX TX0 MUX" "RX0"
+  tinymix "RX INT0_1 MIX1 INP0" "RX0"
+  tinymix "HPHL_RDAC Switch" 1
+  tinymix "AUX_RDAC Switch" 1
+  tinyplay /system/media/audio/ui/camera_click.ogg  # or test.wav
+  ```
+- The ALSA card has 184 controls (seen via `tinymix`). If `android_mixer_setup.sh` doesn't enable speaker, run `./scripts/android_diagnose.sh` which prints tailored suggestions for Bengal.
+
+**VPN tun0 active (e.g., 10.183.115.4/32, MTU 1300) and wlan0 DOWN:**
+- The diagnostic you posted shows `tun0: POINTOPOINT,UP,LOWER_UP mtu 1300` and `wlan0: BROADCAST,MULTICAST mtu 1500 DOWN`. Means VPN app active and WiFi/hotspot off, connected via mobile data `rmnet_data0`/`rmnet_data2`.
+- AudioRouter needs local hotspot, not mobile data:
+  - **Scenario A (recommended):** Android hotspot ON, PC connected to phone (192.168.43.x). `wlan0` or `swlan0` should be UP as AP.
+  - **Scenario B:** Windows hotspot ON, Android connected to PC (192.168.137.x). `wlan0` should be UP with 192.168.137.x.
+- VPN routes all traffic through tunnel, adds latency and causes MTU fragmentation (MTU 1300 vs default server ~996 byte packets still OK but RTT high). Solutions:
+  - Disable VPN temporarily for testing
+  - Or keep VPN but bypass local traffic: use client bind option `-b auto` or `-b wlan0` to force packet out physical WiFi interface:
+    ```bash
+    ./scripts/termux_run.sh 192.168.43.45 -- -b auto -v
+    ./bin/audiorouter_client -s 192.168.43.45 -d direct:/dev/snd/pcmC0D1p -b auto -v
+    ```
+  - Some VPN apps support split-tunnel: exclude local subnet 192.168.0.0/16
+- `check_env.sh` and `android_diagnose.sh` now detect `tun0` and `wlan0 DOWN` and warn with remediation steps (fixed in this update).
+
+**agmplay linking error `CANNOT LINK EXECUTABLE agmplay: library libtermux-exec.so not accessible`:**
+- This occurs when running `/vendor/bin/agmplay` directly inside Termux shell because Termux sets `LD_PRELOAD=libtermux-exec.so` which lives in Termux private data dir, not accessible to vendor linker namespace (default). The error is expected if you run agmplay from Termux shell directly.
+- **Fix applied in this update:**
+  - `AgmFifoPlayer` now spawns agmplay via `fork()` + `execve()` with clean `envp` containing only `LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib:/system/lib64:/system/lib` and `PATH=/vendor/bin:/system/bin`, no `LD_PRELOAD`. This clears `libtermux-exec.so` and vendor binary loads correctly.
+  - `android_diagnose.sh` and `check_env.sh` now test agmplay with `env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib:/system/lib64:/system/lib PATH=/vendor/bin:/system/bin /vendor/bin/agmplay --help` to avoid false failure.
+  - `termux_run.sh` now explicitly sets `LD_PRELOAD=""` in its `su -c` command and adds vendor lib paths.
+- To manually test AGM backend after fix:
+  ```bash
+  su
+  env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib:/system/lib64:/system/lib PATH=/vendor/bin:/system/bin /vendor/bin/agmplay --help
+  ./bin/audiorouter_client -s <PC_IP> -d agm:CODEC_DMA-LPAIF_RXTX-RX-1 -b auto -v
+  ./bin/audiorouter_client -s <PC_IP> -d agm:CODEC_DMA-LPAIF_RXTX-RX-0 -b auto -v
+  ```
+- If AGM still fails, fallback to direct ALSA nodes listed above.
 
 **Windows server build fails:**
-- Run `scripts/check_env.sh` or `scripts/build_all.bat --clean`.
+- Run `./scripts/check_env.sh` on Linux or `scripts/build_all.bat --clean` on Windows.
 - Ensure C++23 capable compiler: VS 2022 17.6+ or MinGW GCC 13+. Run `g++ --version` or check Visual Studio Installer - C++ Desktop Workload.
 - Ensure CMake 3.20+ in PATH: `cmake --version`.
 - For MSVC, run from x64 Native Tools Prompt or use `scripts/build_server_msvc.bat` which auto-fallbacks VS2022->VS2019.
 - Check Windows SDK headers for WASAPI (`audioclient.h`).
 
 **Client cannot connect / discovery finds nothing:**
-- Run `./scripts/check_env.sh` to verify network.
-- Verify both devices on same hotspot subnet.
+- Run `./scripts/check_env.sh` and `./scripts/android_diagnose.sh` to verify network.
+- Verify both devices on same hotspot subnet (not mobile data).
 - Check firewall on Windows: allow UDP 44100 inbound. Launcher hints: `New-NetFirewallRule -DisplayName AudioRouter -Direction Inbound -Protocol UDP -LocalPort 44100 -Action Allow`.
 - Use explicit IP (`-s 192.168.x.x`) instead of `--discover`.
 - List server interfaces: `audiorouter_server -l` or `scripts/start_server.bat` shows them.
 - List client routing: `ip addr` in Termux, or `check_env.sh` output.
 - VPN on Android can hijack routing: use `-b auto` or `-b wlan0` via `./scripts/termux_run.sh -b auto`.
+- If `wlan0` DOWN (as in your diagnostic), enable hotspot/WiFi first.
 
 **High latency or frequent underruns:**
 - Check diagnostics RTT: `./scripts/termux_run.sh --verbose` shows RTT.
-- Reduce jitter buffer for good Wi-Fi (`-l 35`), increase (`-l 80` or higher) for lossy hotspot.
+- Reduce jitter buffer for good Wi-Fi (`-l 35`), increase (`-l 80` or higher) for lossy hotspot or mobile data+VPN.
 - Reduce frames per packet server side (`-f 240` = 5 ms) to lower serialization delay, but increases packet rate.
-- Use 5 GHz hotspot if device supports it.
+- Use 5 GHz hotspot if device supports it (your device shows `wlan0` DOWN, so currently on mobile data - switch to hotspot).
 - Check VPN interference via `check_env.sh` tun0 detection.
 
 **Android audio is distorted or channels swapped:**
 - Verify sample rate matches (server default 48 kHz). Use `-r 48000`.
 - Direct ALSA may need period size adjustment (handled internally). Try libasound backend as fallback.
-- Run `./scripts/android_diagnose.sh` to see mixer volume controls (RX Digital Volume too high causes clipping).
+- Run `./scripts/android_diagnose.sh` to see mixer volume controls (RX Digital Volume 84 is safe, >90 may clip on WCD937x).
+- On Bengal, distorted may mean wrong RDAC: try only `AUX_RDAC Switch 1` without HPH RDAC, or vice-versa.
 
 ## CI/CD and Releases
 

@@ -10,6 +10,8 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -21,12 +23,33 @@ constexpr uint32_t kIdData = 0x61746164;
 
 // FIFO used to stream PCM into the agmplay subprocess.
 constexpr const char* kFifoPath = "/data/local/tmp/audiorouter_agm.fifo";
-constexpr const char* kAgmplayPath = "/vendor/bin/agmplay";
 constexpr unsigned int kAgmCard = 100;
 constexpr unsigned int kAgmDevice = 100;
 
 // How long to wait for agmplay to open the FIFO before giving up.
 constexpr int kFifoReaderTimeoutMs = 10000;
+
+// Candidate binary locations for agmplay (vendor to system fallback)
+constexpr const char* kAgmplayCandidates[] = {
+    "/vendor/bin/agmplay",
+    "/system/bin/agmplay",
+    "/vendor/bin/hw/vendor.qti.media.c2audio@1.0-service", // not agmplay but placeholder for search logic
+};
+
+std::string resolve_agmplay_path() {
+    for (const char* cand : {"/vendor/bin/agmplay", "/system/bin/agmplay"}) {
+        if (::access(cand, X_OK) == 0) {
+            return cand;
+        }
+    }
+    // Check existence even if not executable (some devices have different perms)
+    for (const char* cand : {"/vendor/bin/agmplay", "/system/bin/agmplay"}) {
+        if (::access(cand, F_OK) == 0) {
+            return cand;
+        }
+    }
+    return "/vendor/bin/agmplay"; // default, will be logged if spawn fails
+}
 
 } // namespace
 
@@ -62,6 +85,13 @@ bool AgmFifoPlayer::open(const AudioConfig& config, const std::string& device_na
         }
     }
 
+    std::string agmplay_path = resolve_agmplay_path();
+    if (::access(agmplay_path.c_str(), F_OK) != 0) {
+        LOG_ERROR("AgmFifoPlayer: agmplay binary not found at any known path (tried /vendor/bin/agmplay, /system/bin/agmplay). AGM backend unavailable on this device.");
+        ::unlink(kFifoPath);
+        return false;
+    }
+
     const pid_t pid = ::fork();
     if (pid < 0) {
         LOG_ERROR("AgmFifoPlayer: fork() failed: " << std::strerror(errno));
@@ -70,28 +100,51 @@ bool AgmFifoPlayer::open(const AudioConfig& config, const std::string& device_na
     }
 
     if (pid == 0) {
-        // Child: exec agmplay. Only async-signal-safe calls are allowed here.
+        // Child: exec agmplay. Only async-signal-safe calls allowed.
+        // IMPORTANT: Clear Termux's LD_PRELOAD (libtermux-exec.so) which blocks vendor
+        // binaries from loading in the default linker namespace.
+        // We use execve with a minimal clean environment to avoid:
+        //   CANNOT LINK EXECUTABLE "agmplay": library "/data/data/com.termux/files/usr/lib/libtermux-exec.so" needed...
         const int devnull = ::open("/dev/null", O_RDWR);
         if (devnull >= 0) {
             ::dup2(devnull, STDOUT_FILENO);
             ::dup2(devnull, STDERR_FILENO);
             ::close(devnull);
         }
-        const char* envp[] = {"LD_LIBRARY_PATH=/vendor/lib64", nullptr};
-        const char* args[] = {kAgmplayPath, kFifoPath, "-D", "100", "-d", "100",
-                              "-i", backend_.c_str(), nullptr};
-        ::execve(kAgmplayPath, const_cast<char* const*>(args), const_cast<char* const*>(envp));
+        // Clean environment: vendor lib paths + PATH, no LD_PRELOAD
+        // Keep LD_LIBRARY_PATH broad to satisfy both QCOM and generic dependencies
+        const char* envp[] = {
+            "LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib:/system/lib64:/system/lib",
+            "PATH=/vendor/bin:/system/bin:/system/xbin",
+            "ANDROID_ROOT=/system",
+            "ANDROID_DATA=/data",
+            nullptr
+        };
+        const char* args[] = {
+            agmplay_path.c_str(),
+            kFifoPath,
+            "-D", "100",
+            "-d", "100",
+            "-i", backend_.c_str(),
+            nullptr
+        };
+        ::execve(agmplay_path.c_str(), const_cast<char* const*>(args), const_cast<char* const*>(envp));
+        // If execve fails (e.g., agmplay not at resolved path), try fallback via execv with PATH search
+        // This second attempt uses clean env via environ manipulation, but we keep it simple: exit.
         _exit(127);  // exec failed
     }
 
     agmplay_pid_ = pid;
-    LOG_INFO("AgmFifoPlayer: spawned " << kAgmplayPath << " (pid " << pid << ", backend '"
+    LOG_INFO("AgmFifoPlayer: spawned " << agmplay_path << " (pid " << pid << ", backend '"
              << backend_ << "', " << rate << " Hz mono S16)" << ", waiting for it to open "
              << kFifoPath << "...");
 
     if (!wait_for_reader(kFifoReaderTimeoutMs)) {
         LOG_ERROR("AgmFifoPlayer: agmplay did not open the FIFO within "
-                  << kFifoReaderTimeoutMs << " ms (is /vendor/bin/agmplay present?)");
+                  << kFifoReaderTimeoutMs << " ms. Possible reasons: "
+                  << "binary missing, wrong backend '" << backend_ << "' for this device, "
+                  << "or linker namespace blocking. Try running with clean env: "
+                  << "env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib /vendor/bin/agmplay --help");
         close();
         return false;
     }

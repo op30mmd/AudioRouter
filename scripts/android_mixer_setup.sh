@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # AudioRouter - Android ALSA Mixer / Speaker Routing Helper (Professional)
 # Run with root privileges in Termux (su) or ADB root shell.
-# Detects SoC family and attempts common speaker path routing via tinymix.
+# Detects SoC family (including Bengal SD662/680) and attempts speaker routing.
 
 set -e
 
@@ -16,6 +16,7 @@ for arg in "$@"; do
         --list) LIST_ONLY=1 ;;
         --dry-run) DRY_RUN=1 ;;
         --qualcomm) FORCE_SOC="qualcomm" ;;
+        --bengal) FORCE_SOC="bengal" ;;
         --mediatek) FORCE_SOC="mediatek" ;;
     esac
 done
@@ -31,6 +32,7 @@ Options:
   --list         Only list sound cards and mixer controls, do not modify
   --dry-run      Show what would be done, without executing tinymix
   --qualcomm     Force Qualcomm routing path
+  --bengal       Force Bengal (SD662/680, WCD937x) routing path
   --mediatek     Force MediaTek routing path
 
 What this script does:
@@ -39,6 +41,7 @@ What this script does:
   3. Lists /proc/asound/cards and available tinymix controls
   4. Attempts speaker routing via common tinymix controls:
      - Qualcomm: RX_CDC_DMA_RX_0, PRI_MI2S_RX, SLIM_0_RX, Speaker Function
+     - Bengal (SD662/680): RX_MACRO RX0 MUX -> AIF1_PB, RX MIX TX0 MUX -> RX0, RDAC switches
      - MediaTek: Speaker, Speaker Switch, SPK, RX Digital Volume
   5. Reports result and suggests next steps
 
@@ -48,7 +51,9 @@ Requirements:
   - Termux or ADB shell
 
 After running, launch:
-  ./bin/audiorouter_client -s <PC_IP> -p 44100 -d direct:/dev/snd/pcmC0D0p
+  ./bin/audiorouter_client -s <PC_IP> -p 44100 -d direct:/dev/snd/pcmC0D0p -b auto
+  Or for Bengal without pcmC0D0p:
+  ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D1p -b auto
 EOF
     exit 0
 fi
@@ -67,7 +72,7 @@ fi
 
 echo "[INFO] Running as uid=$(id -u) - root OK"
 
-# Check tinymix
+# Check tinymix - handle Termux path and vendor path, avoid libtermux-exec issue by using clean env if needed
 if ! command -v tinymix >/dev/null 2>&1; then
     echo "[WARN] tinymix not found in PATH."
     echo "       In Termux: pkg install alsa-utils"
@@ -76,15 +81,17 @@ if ! command -v tinymix >/dev/null 2>&1; then
     for p in /vendor/bin/tinymix /system/bin/tinymix /data/data/com.termux/files/usr/bin/tinymix; do
         if [ -x "$p" ]; then
             echo "[INFO] Found tinymix at $p"
-            alias tinymix="$p" 2>/dev/null || true
-            # Create wrapper
+            # Create wrapper function to use found binary
             tinymix() { "$p" "$@"; }
             break
         fi
     done
-    if ! command -v tinymix >/dev/null 2>&1 && [ ! -n "$(type tinymix 2>/dev/null)" ]; then
-        echo "[ERROR] tinymix still not found, listing cards only. Install alsa-utils."
-        LIST_ONLY=1
+    if ! command -v tinymix >/dev/null 2>&1; then
+        # Check if wrapper defined
+        if ! type tinymix >/dev/null 2>&1; then
+            echo "[ERROR] tinymix still not found, listing cards only. Install alsa-utils."
+            LIST_ONLY=1
+        fi
     fi
 fi
 
@@ -108,24 +115,34 @@ fi
 echo ""
 echo "[3/4] Detecting SoC family..."
 SOC="unknown"
+IS_BENGAL=0
 if [ -n "$FORCE_SOC" ]; then
     SOC="$FORCE_SOC"
     echo "[INFO] Forced SoC family: $SOC"
+    if [ "$SOC" = "bengal" ]; then IS_BENGAL=1; SOC="qualcomm"; fi
 else
-    if grep -qi "qualcomm\|qcom\|sm[0-9]" /proc/cpuinfo 2>/dev/null; then
+    if grep -qi "bengal" /proc/asound/cards 2>/dev/null; then
         SOC="qualcomm"
+        IS_BENGAL=1
+        echo "[INFO] Detected Bengal SoC (SD662/680 family) via /proc/asound/cards - using Bengal routing"
+    elif grep -qi "qualcomm\|qcom\|sm[0-9]" /proc/cpuinfo 2>/dev/null; then
+        SOC="qualcomm"
+        # Check for bengal via cpuinfo variant? Bengal is SM6115
+        if grep -qi "bengal\|sm6115\|sm6225" /proc/cpuinfo 2>/dev/null; then
+            IS_BENGAL=1
+        fi
     elif grep -qi "mediatek\|mt[0-9]" /proc/cpuinfo 2>/dev/null; then
         SOC="mediatek"
     elif [ -f /proc/asound/cards ] && grep -qi "qualcomm" /proc/asound/cards; then
         SOC="qualcomm"
     fi
-    echo "[INFO] Detected SoC family: $SOC"
+    echo "[INFO] Detected SoC family: $SOC (Bengal flag: $IS_BENGAL)"
 fi
 
 echo ""
 if [ "$LIST_ONLY" = "1" ]; then
     echo "[3b] Listing mixer controls (tinymix without args)..."
-    tinymix 2>&1 | head -n 200 || echo "[WARN] tinymix listing failed"
+    tinymix 2>&1 | head -n 300 || echo "[WARN] tinymix listing failed"
     echo ""
     echo "[4/4] List-only mode, skipping routing. To apply routing, run without --list"
     exit 0
@@ -178,6 +195,61 @@ if [ "$SOC" = "qualcomm" ]; then
     try_tinymix "PRI_MI2S_RX Port Mixer" "PRI_MI2S_RX Port Mixer CODEC_DMA_LPAIF_RXTX" 1
     try_tinymix "SEC_MI2S_RX Audio Mixer" "SEC_MI2S_RX Audio Mixer MultiMedia1" 1
     try_tinymix "TERT_MI2S_RX Port Mixer" "TERT_MI2S_RX Port Mixer QUAT_MI2S_TX" 1
+
+    # Bengal (SD662/680, WCD937x + Bolero) - 184 controls, no pcmC0D0p, needs RX_MACRO routing
+    # Diagnostic from user shows bengal-idp-snd-card with 7 playback nodes, speaker path via RX_MACRO
+    if [ "$IS_BENGAL" = "1" ] || grep -qi "bengal" /proc/asound/cards 2>/dev/null; then
+        echo "  Applying BENGAL (SD662/680) specific routing - WCD937x + Bolero..."
+        echo "  This device has no pcmC0D0p, speaker uses RX0/RX1/RX2 paths"
+
+        # RX_MACRO MUX -> AIF1_PB / AIF2_PB (route LPASS AIF to RX macro)
+        try_tinymix "Bengal RX_MACRO RX0 MUX AIF1_PB" "RX_MACRO RX0 MUX" "AIF1_PB"
+        try_tinymix "Bengal RX_MACRO RX1 MUX AIF1_PB" "RX_MACRO RX1 MUX" "AIF1_PB"
+        try_tinymix "Bengal RX_MACRO RX2 MUX AIF2_PB" "RX_MACRO RX2 MUX" "AIF2_PB"
+        try_tinymix "Bengal RX_MACRO RX0 MUX AIF2_PB (alt)" "RX_MACRO RX0 MUX" "AIF2_PB"
+        try_tinymix "Bengal RX_MACRO RX1 MUX AIF2_PB (alt)" "RX_MACRO RX1 MUX" "AIF2_PB"
+        try_tinymix "Bengal RX_MACRO RX3 MUX AIF1_PB" "RX_MACRO RX3 MUX" "AIF1_PB"
+        try_tinymix "Bengal RX_MACRO RX4 MUX AIF1_PB" "RX_MACRO RX4 MUX" "AIF1_PB"
+        try_tinymix "Bengal RX_MACRO RX5 MUX AIF1_PB" "RX_MACRO RX5 MUX" "AIF1_PB"
+
+        # RX MIX MUX -> RX0/1/2
+        try_tinymix "Bengal RX MIX TX0 MUX RX0" "RX MIX TX0 MUX" "RX0"
+        try_tinymix "Bengal RX MIX TX1 MUX RX1" "RX MIX TX1 MUX" "RX1"
+        try_tinymix "Bengal RX MIX TX2 MUX RX2" "RX MIX TX2 MUX" "RX2"
+
+        # RX INT MIX routing (IIR and interp paths)
+        try_tinymix "Bengal RX INT0_1 MIX1 INP0 RX0" "RX INT0_1 MIX1 INP0" "RX0"
+        try_tinymix "Bengal RX INT1_1 MIX1 INP0 RX1" "RX INT1_1 MIX1 INP0" "RX1"
+        try_tinymix "Bengal RX INT2_1 MIX1 INP0 RX2" "RX INT2_1 MIX1 INP0" "RX2"
+        try_tinymix "Bengal RX INT0 MIX2 INP RX0" "RX INT0 MIX2 INP" "RX0"
+        try_tinymix "Bengal RX INT1 MIX2 INP RX1" "RX INT1 MIX2 INP" "RX1"
+        try_tinymix "Bengal RX INT2 MIX2 INP RX2" "RX INT2 MIX2 INP" "RX2"
+        try_tinymix "Bengal RX INT0_1 INTERP RX0" "RX INT0_1 INTERP" "RX0"
+        try_tinymix "Bengal RX INT1_1 INTERP RX1" "RX INT1_1 INTERP" "RX1"
+        try_tinymix "Bengal RX INT2_1 INTERP RX2" "RX INT2_1 INTERP" "RX2"
+
+        # RDAC switches - enable DACs for speaker/headphone
+        try_tinymix "Bengal HPHL_RDAC Switch" "HPHL_RDAC Switch" 1
+        try_tinymix "Bengal HPHR_RDAC Switch" "HPHR_RDAC Switch" 1
+        try_tinymix "Bengal AUX_RDAC Switch" "AUX_RDAC Switch" 1
+        try_tinymix "Bengal EAR_RDAC Switch" "EAR_RDAC Switch" 1
+
+        # Digital volumes for Bengal
+        try_tinymix "Bengal RX_RX0 Mix Digital Volume" "RX_RX0 Mix Digital Volume" 84
+        try_tinymix "Bengal RX_RX1 Mix Digital Volume" "RX_RX1 Mix Digital Volume" 84
+        try_tinymix "Bengal RX_RX2 Mix Digital Volume" "RX_RX2 Mix Digital Volume" 84
+        try_tinymix "Bengal RX_RX0 Digital Volume" "RX_RX0 Digital Volume" 84
+        try_tinymix "Bengal RX_RX1 Digital Volume" "RX_RX1 Digital Volume" 84
+        try_tinymix "Bengal RX_RX2 Digital Volume" "RX_RX2 Digital Volume" 84
+        try_tinymix "Bengal RX INT0 DEM MUX" "RX INT0 DEM MUX" "NORMAL_DSM_OUT"
+        try_tinymix "Bengal RX INT1 DEM MUX" "RX INT1 DEM MUX" "NORMAL_DSM_OUT"
+        try_tinymix "Bengal HPHL Volume" "HPHL Volume" 20
+        try_tinymix "Bengal HPHR Volume" "HPHR Volume" 20
+
+        echo "  Bengal routing applied. If still no sound, try:"
+        echo "    - tinyplay test: tinyplay /vendor/etc/audio/test.wav or /system/media/audio/ui/camera_click.ogg"
+        echo "    - Try PCM nodes: direct:/dev/snd/pcmC0D1p, D5p, D6p, D7p, D8p, D14p"
+    fi
 elif [ "$SOC" = "mediatek" ]; then
     echo "  Applying MediaTek-specific controls..."
     try_tinymix "MTK Speaker Switch" "Speaker_Amp_Switch" 1
@@ -191,10 +263,16 @@ echo "============================================================"
 echo " Next steps:"
 echo "  1. Keep this root shell or run: su"
 echo "  2. ./bin/audiorouter_client --list-devices"
-echo "  3. ./bin/audiorouter_client -s <PC_IP> -p 44100 -d direct:/dev/snd/pcmC0D0p"
+echo "  3a. Generic: ./bin/audiorouter_client -s <PC_IP> -p 44100 -d direct:/dev/snd/pcmC0D0p -b auto"
+echo "  3b. Bengal (no pcmC0D0p, 7 playback nodes):"
+echo "      ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D1p -b auto -v"
+echo "      ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D5p -b auto -v"
+echo "      ./bin/audiorouter_client -s <PC_IP> -d direct:/dev/snd/pcmC0D14p -b auto -v"
+echo "      ./bin/audiorouter_client -s <PC_IP> -d agm:CODEC_DMA-LPAIF_RXTX-RX-1 -b auto -v"
 echo ""
 echo " If still no sound:"
-echo "  - Try alternative devices: hw:0,0 , agm , direct:/dev/snd/pcmC0D1p"
-echo "  - Run diagnostic: ./scripts/android_diagnose.sh"
-echo "  - Check if another app holds the PCM device"
+echo "  - Try alternative devices: hw:0,0 , agm , direct:/dev/snd/pcmC0D1p, D2p, D5p, D6p, D7p, D8p, D14p"
+echo "  - Run diagnostic: ./scripts/android_diagnose.sh (tailored for Bengal)"
+echo "  - Check if another app holds PCM: try 'stop audioserver' (then 'start audioserver' after test)"
+echo "  - VPN: disable VPN or use -b auto to bypass tun0"
 echo "============================================================"

@@ -197,27 +197,53 @@ fi
 
 # Prepare environment setup for root execution
 # Include vendor lib paths for Qualcomm AGM
+# IMPORTANT: Clear LD_PRELOAD (Termux's libtermux-exec.so) which breaks vendor binaries like agmplay
+# AgmFifoPlayer already uses clean env via execve, but we also clear here for safety and for any child processes
 LD_PATH="/vendor/lib64:/vendor/lib:/system/lib64:/system/lib:${LD_LIBRARY_PATH:-}"
 
 # Permission fix command
 PERM_FIX="chmod 666 /dev/snd/* 2>/dev/null || true"
 
+# Network pre-checks (VPN tun0, wlan0 down)
+if command -v ip >/dev/null 2>&1; then
+    if ip addr show tun0 2>&1 | grep -q "tun0"; then
+        log_warn "tun0 VPN interface detected - VPN may route audio through tunnel (higher latency, MTU 1300)"
+        if [[ -z "$BIND_IFACE" ]]; then
+            log_warn "Consider using -b auto to bypass VPN: $0 -s $SERVER_IP -b auto"
+            # Auto-enable bypass if not specified? We warn but don't auto-change to avoid surprising user
+            # To auto-enable, uncomment next line:
+            # BIND_IFACE="auto"
+            # CLIENT_ARGS+=("-b" "auto")
+        fi
+    fi
+    if ip addr show wlan0 2>&1 | grep -q "wlan0"; then
+        if ! ip addr show wlan0 2>&1 | grep -q "UP"; then
+            log_warn "wlan0 is DOWN - WiFi/hotspot is off. AudioRouter needs local WiFi/hotspot:"
+            log_warn "  Scenario A: Android hotspot ON, PC connected to phone (192.168.43.x)"
+            log_warn "  Scenario B: Windows hotspot ON, Android connected to PC (192.168.137.x)"
+        fi
+    fi
+fi
+
 if [[ "$(id -u)" -ne 0 ]]; then
     log_info "Requesting root privileges via su..."
-    # Check if su exists
     if ! command -v su >/dev/null 2>&1; then
         log_warn "su not found. Running without root - ALSA access will likely fail."
         log_warn "Install root (Magisk) and ensure su is available."
         $PERM_FIX || true
-        LD_LIBRARY_PATH="$LD_PATH" exec "$BIN_PATH" "${CLIENT_ARGS[@]}"
+        LD_PRELOAD="" LD_LIBRARY_PATH="$LD_PATH" exec "$BIN_PATH" "${CLIENT_ARGS[@]}"
     else
-        # Use su -c with proper quoting
-        # Export HOME for Termux, set LD_LIBRARY_PATH inside su context
-        exec su -c "$PERM_FIX; export HOME=\${HOME:-/data/data/com.termux/files/home}; export LD_LIBRARY_PATH=$LD_PATH; \"$BIN_PATH\" ${CLIENT_ARGS[*]}"
+        # Use su -c with clean env for vendor binaries
+        # - LD_PRELOAD= clears Termux's libtermux-exec.so (fixes agmplay linking error:
+        #   CANNOT LINK EXECUTABLE agmplay: library libtermux-exec.so not accessible)
+        # - LD_LIBRARY_PATH includes vendor paths for AGM
+        # - HOME preserved for Termux
+        exec su -c "$PERM_FIX; export HOME=\${HOME:-/data/data/com.termux/files/home}; export LD_PRELOAD=\"\"; export LD_LIBRARY_PATH=$LD_PATH; export PATH=/data/data/com.termux/files/usr/bin:/vendor/bin:/system/bin:\$PATH; \"$BIN_PATH\" ${CLIENT_ARGS[*]}"
     fi
 else
     log_info "Already running as root (uid=0), fixing permissions..."
     $PERM_FIX
+    export LD_PRELOAD=""
     export LD_LIBRARY_PATH="$LD_PATH"
     exec "$BIN_PATH" "${CLIENT_ARGS[@]}"
 fi

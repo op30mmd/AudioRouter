@@ -134,14 +134,36 @@ else
     warn "/proc/asound/cards not found"
 fi
 
+run_vendor_clean() {
+    local bin="$1"; shift
+    env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib:/system/lib64:/system/lib PATH=/vendor/bin:/system/bin:/system/xbin "$bin" "$@" 2>&1
+}
+
 for bin in tinymix tinyplay tinycap agmplay; do
+    found=0
     if command -v "$bin" >/dev/null 2>&1; then
         ok "$bin found: $(command -v $bin)"
-    elif [[ -x "/vendor/bin/$bin" ]]; then
+        found=1
+    fi
+    if [[ -x "/vendor/bin/$bin" ]]; then
         ok "$bin found at /vendor/bin/$bin"
-    elif [[ -x "/system/bin/$bin" ]]; then
+        found=1
+        # Special test for agmplay with clean env to handle Termux libtermux-exec.so issue
+        if [[ "$bin" == "agmplay" ]]; then
+            if out="$(run_vendor_clean "/vendor/bin/$bin" --help 2>&1 | head -n 5)"; then
+                ok "  agmplay clean-env test: OK (vendor namespace works, Termux LD_PRELOAD workaround active)"
+            else
+                warn "  agmplay clean-env test returned non-zero but may still work (some agmplay versions need args); raw output:"
+                echo "$out" | head -n 10 || true
+                warn "  If you see 'libtermux-exec.so not accessible' error, our fix with env -i LD_LIBRARY_PATH=/vendor/lib64:/vendor/lib is required - AgmFifoPlayer and android_diagnose.sh already use this"
+            fi
+        fi
+    fi
+    if [[ $found -eq 0 && -x "/system/bin/$bin" ]]; then
         ok "$bin found at /system/bin/$bin"
-    else
+        found=1
+    fi
+    if [[ $found -eq 0 ]]; then
         warn "$bin not found (optional, $bin is needed for mixer setup / AGM backend)"
     fi
 done
@@ -150,12 +172,37 @@ echo ""
 echo "--- Network ---"
 if command -v ip >/dev/null 2>&1; then
     ok "ip command available"
-    ip addr show 2>&1 | grep -E "inet|mtu|state" | head -n 30 || true
+    ip addr show 2>&1 | grep -E "inet|mtu|state|wlan|tun|rmnet" | head -n 50 || true
+    echo ""
+    ip route show 2>&1 | head -n 30 || true
 elif command -v ifconfig >/dev/null 2>&1; then
     ok "ifconfig available"
-    ifconfig 2>&1 | head -n 50 || true
+    ifconfig 2>&1 | head -n 80 || true
 else
     warn "ip/ifconfig not found, cannot show interfaces"
+fi
+
+# VPN and WiFi analysis (critical for AudioRouter)
+if command -v ip >/dev/null 2>&1; then
+    if ip addr show tun0 2>&1 | grep -q "tun0"; then
+        warn "tun0 VPN interface ACTIVE - VPN routes traffic through tunnel, breaking local hotspot"
+        warn "  Fix: disable VPN or use client -b auto or -b wlan0 to bypass VPN"
+        warn "  Example: ./scripts/termux_run.sh <PC_IP> -- -b auto -v"
+    else
+        ok "No tun0 VPN interface (good for local hotspot audio)"
+    fi
+    # Check wlan0 state for hotspot scenarios
+    if ip addr show wlan0 2>&1 | grep -q "wlan0"; then
+        if ip addr show wlan0 2>&1 | grep -q "state UP\|UP,LOWER_UP"; then
+            ok "wlan0 is UP (WiFi or hotspot active)"
+        else
+            warn "wlan0 exists but DOWN - WiFi/hotspot is off. Enable hotspot for AudioRouter:"
+            warn "  Scenario A: Android hotspot ON, PC connected to phone (192.168.43.x)"
+            warn "  Scenario B: Windows hotspot ON, Android connected to PC (192.168.137.x)"
+        fi
+    else
+        info "wlan0 not found (may be named differently - check ip addr output)"
+    fi
 fi
 
 # Check UDP port 44100
@@ -168,7 +215,7 @@ fi
 
 if command -v getprop >/dev/null 2>&1; then
     info "Android properties (wifi interface):"
-    getprop | grep -i -E "wifi|dhcp|wlan" | head -n 20 || true
+    getprop | grep -i -E "wifi|dhcp|wlan|hotspot|tether" | head -n 30 || true
 fi
 
 echo ""
