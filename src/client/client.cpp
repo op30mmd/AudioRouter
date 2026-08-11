@@ -2,6 +2,7 @@
 #include "alsa_player.hpp"
 #include "direct_alsa.hpp"
 #include "agm_player.hpp"
+#include "agm_fifo_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -118,7 +119,7 @@ namespace {
 
     const char* strategy_label(OpenStrategy strategy, bool node_based) {
         switch (strategy) {
-            case OpenStrategy::AGM: return "AGM session (libagmclient.so)";
+            case OpenStrategy::AGM: return "AGM playback via vendor agmplay subprocess (FIFO)";
             case OpenStrategy::NODES: return node_based ? "direct kernel PCM nodes (/dev/snd)" : "direct kernel PCM nodes";
             default: return "ALSA-lib device (default/hw:0,0)";
         }
@@ -172,8 +173,11 @@ namespace {
 
                 std::shared_ptr<IAudioPlayer> device =
                     node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
-                    : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmPlayer>())
-                                                    : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
+                    : strategy == OpenStrategy::AGM
+                        ? (device_name.rfind("agm:direct", 0) == 0
+                               ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmPlayer>())
+                               : std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>()))
+                        : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
                 auto finished = std::make_shared<std::atomic<bool>>(false);
                 std::thread attempt_thread([open, cfg, device_name, candidate, device, finished]() {
                     if (!candidate.empty()) {
