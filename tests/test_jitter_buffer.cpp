@@ -105,17 +105,15 @@ bool run_jitter_buffer_tests() {
     // packets_lost should STILL be 1 (NOT 51)!
     TEST_ASSERT(stats_after_starv.packets_lost == 1);
 
-    // Stream resumes: sender sends packet 52, 53, 54!
-    std::vector<int16_t> pkt52(240 * 2, 600);
-    std::vector<int16_t> pkt53(240 * 2, 700);
-    std::vector<int16_t> pkt54(240 * 2, 800);
+    // Stream resumes: sender sends 100 packets (the dry-out above doubled the
+    // effective prefill target to 500ms = 100 packets).
+    for (uint32_t seq = 52; seq < 152; ++seq) {
+        std::vector<int16_t> pkt_resume(240 * 2, static_cast<int16_t>(600 + (seq - 52)));
+        jb.push_packet(seq, 6000 + seq * 1000, pkt_resume.data(), 240);
+    }
 
-    TEST_ASSERT(jb.push_packet(52, 6000, pkt52.data(), 240));
-    TEST_ASSERT(jb.push_packet(53, 7000, pkt53.data(), 240));
-    TEST_ASSERT(jb.push_packet(54, 8000, pkt54.data(), 240));
-
-    // Jitter buffer should be ready again (steady-state target is only 3
-    // packets now) and play packet 52 without dropping it as late
+    // Jitter buffer should be ready again and play packet 52 without dropping
+    // it as late
     TEST_ASSERT(jb.is_ready());
 
     size_t pop_resumed52 = jb.pop_frames(out.data(), 240);
@@ -124,11 +122,11 @@ bool run_jitter_buffer_tests() {
 
     size_t pop_resumed53 = jb.pop_frames(out.data(), 240);
     TEST_ASSERT(pop_resumed53 == 240);
-    TEST_ASSERT(out[0] == 700);
+    TEST_ASSERT(out[0] == 601);
 
     size_t pop_resumed54 = jb.pop_frames(out.data(), 240);
     TEST_ASSERT(pop_resumed54 == 240);
-    TEST_ASSERT(out[0] == 800);
+    TEST_ASSERT(out[0] == 602);
 
     auto stats_final = jb.get_stats();
     TEST_ASSERT(stats_final.packets_lost == 1);

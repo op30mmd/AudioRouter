@@ -15,6 +15,14 @@ constexpr uint32_t kStartupPrefillMultiplier = 3;
 constexpr uint32_t kStartupPrefillMinMs = 250;
 constexpr uint32_t kStartupPrefillMaxMs = 500;
 
+// Adaptive prefill: after a dry-out the prefill grows (up to a cap) so a
+// repeating delivery stall can't keep starving playback, and decays toward
+// the configured latency while delivery is steady.
+constexpr uint32_t kAdaptiveGrowthMultiplier = 2;
+constexpr uint32_t kAdaptiveCapMs = 500;
+constexpr uint32_t kAdaptiveDecayMs = 25;
+constexpr uint32_t kAdaptiveDecayIntervalMs = 1000;
+
 } // namespace
 
 namespace audiorouter {
@@ -23,7 +31,9 @@ JitterBuffer::JitterBuffer(uint32_t target_latency_ms)
     : target_latency_ms_(target_latency_ms),
       target_buffer_frames_(0),
       startup_target_frames_(0),
+      effective_target_frames_(0),
       startup_pending_(false),
+      last_decay_time_us_(0),
       slots_(MAX_SLOTS),
       next_play_seq_(0),
       has_first_packet_(false),
@@ -56,6 +66,8 @@ void JitterBuffer::reset() {
     has_first_packet_ = false;
     is_buffering_ = true;
     startup_pending_ = true;
+    effective_target_frames_ = startup_target_frames_;
+    last_decay_time_us_ = 0;
     slot_frame_offset_ = 0;
     last_arrival_timestamp_us_ = 0;
     last_transit_us_ = 0;
@@ -67,6 +79,20 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
 
     std::lock_guard<std::mutex> lock(mutex_);
     uint64_t now_us = get_time_us();
+
+    // Decay the effective prefill back toward the configured latency while
+    // delivery has been steady (no dry-outs) for a while.
+    if (effective_target_frames_ > target_buffer_frames_) {
+        if (last_decay_time_us_ == 0) last_decay_time_us_ = now_us;
+        if (now_us - last_decay_time_us_ >= static_cast<uint64_t>(kAdaptiveDecayIntervalMs) * 1000) {
+            const size_t step = (static_cast<uint64_t>(config_.sample_rate) * kAdaptiveDecayMs) / 1000;
+            effective_target_frames_ =
+                (effective_target_frames_ > step && effective_target_frames_ - step >= target_buffer_frames_)
+                    ? effective_target_frames_ - step
+                    : target_buffer_frames_;
+            last_decay_time_us_ = now_us;
+        }
+    }
 
     // Jitter calculation (RFC 3550 style exponential moving average)
     if (last_arrival_timestamp_us_ > 0 && timestamp_us > 0) {
@@ -141,12 +167,12 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
     std::memcpy(slot.pcm_data.data(), pcm_data, total_samples * sizeof(int16_t));
     slot.is_valid = true;
 
-    // Check if we accumulated enough frames to exit buffering. The first fill
-    // after a reset requires the (larger) startup prefill so the playhead
-    // doesn't run dry during the initial network/capture ramp-up; later
-    // re-buffers use the configured steady-state target.
+    // Check if we accumulated enough frames to exit buffering. The prefill is
+    // adaptive: it starts large (network/capture warm-up at stream start),
+    // grows after dry-outs, and decays toward the configured latency while
+    // delivery stays steady.
     if (is_buffering_) {
-        const size_t fill_target = startup_pending_ ? startup_target_frames_ : target_buffer_frames_;
+        const size_t fill_target = effective_target_frames_;
 
         size_t buffered = 0;
         for (size_t i = 0; i < MAX_SLOTS; ++i) {
@@ -247,9 +273,18 @@ size_t JitterBuffer::pop_frames(int16_t* dest, size_t num_frames) {
                 next_play_seq_++; // Skip the missing packet slot
             } else {
                 // No future packets exist -> buffer ran dry (underrun / pause).
-                // Enter buffering mode, output silence, and keep play pointer intact
+                // Enter buffering mode, output silence, and keep play pointer
+                // intact. Grow the effective prefill so a repeating delivery
+                // stall can't keep starving playback; it decays back toward
+                // the configured target once delivery steadies.
                 is_buffering_ = true;
                 stats_.underruns++;
+                const size_t cap = (static_cast<uint64_t>(config_.sample_rate) * kAdaptiveCapMs) / 1000;
+                effective_target_frames_ = std::min(cap, effective_target_frames_ * kAdaptiveGrowthMultiplier);
+                LOG_DEBUG("JitterBuffer: buffer ran dry (underrun #" << stats_.underruns
+                          << "); prefill target raised to "
+                          << (config_.sample_rate > 0 ? (effective_target_frames_ * 1000 / config_.sample_rate) : 0)
+                          << " ms");
 
                 size_t needed = num_frames - frames_delivered;
                 int16_t* dst_ptr = dest + (frames_delivered * config_.channels);
