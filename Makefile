@@ -1,11 +1,15 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++23 -O3 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -pthread -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
+# -MMD -MP generate per-object .d dependency files so header changes
+# (e.g. agm_fifo_player.hpp) trigger recompilation of every consumer instead
+# of leaving stale .o files with a mismatched class layout.
+CXXFLAGS ?= -std=c++23 -O3 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -pthread -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -MMD -MP
 INCLUDES = -Isrc/common -Isrc/client -Isrc/server
 LDFLAGS_EXTRA = -pie
+DEPFILES = $(patsubst %.o,%.d,$(COMMON_OBJS) $(SERVER_OBJS) $(CLIENT_OBJS) $(TEST_OBJS))
 
 # Debug / Sanitizer variant: make DEBUG=1 or make SANITIZE=address,undefined
 ifeq ($(DEBUG),1)
-    CXXFLAGS := -std=c++23 -O0 -g -Wall -Wextra -Wpedantic -Wconversion -pthread -fno-omit-frame-pointer -fstack-protector-strong
+    CXXFLAGS := -std=c++23 -O0 -g -Wall -Wextra -Wpedantic -Wconversion -pthread -fno-omit-frame-pointer -fstack-protector-strong -MMD -MP
     ifeq ($(SANITIZE),)
         SANITIZE=address,undefined
     endif
@@ -123,3 +127,6 @@ $(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(COMMON_OBJS)
 clean:
 	rm -rf $(BUILD_DIR) $(BIN_DIR)
 	@echo "Cleaned build artifacts."
+
+# Pull in auto-generated header dependencies (see -MMD -MP above).
+-include $(DEPFILES)

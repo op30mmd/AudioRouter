@@ -8,6 +8,8 @@
 #include <string>
 #include <csignal>
 #include <atomic>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 namespace {
     std::atomic<bool> g_shutdown_requested{false};
@@ -18,9 +20,20 @@ namespace {
     }
 }
 
+int get_terminal_width() {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        return ws.ws_col;
+    }
+    return 80;
+}
+
 void print_banner() {
-    std::cout << R"(
-  █████╗ ██╗   ██╗██████╗ ██╗ ██████╗ ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗ 
+    const int term_width = get_terminal_width();
+
+    if (term_width >= 90) {
+        std::cout << R"(
+  █████╗ ██╗   ██╗██████╗ ██╗ ██████╗ ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗
  ██╔══██╗██║   ██║██╔══██╗██║██╔═══██╗██╔══██╗██╔═══██╗██║   ██║╚══██╔══╝██╔════╝██╔══██╗
  ███████║██║   ██║██║  ██║██║██║   ██║██████╔╝██║   ██║██║   ██║   ██║   █████╗  ██████╔╝
  ██╔══██║██║   ██║██║  ██║██║██║   ██║██╔══██╗██║   ██║██║   ██║   ██║   ██╔══╝  ██╔══██╗
@@ -28,6 +41,24 @@ void print_banner() {
  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝
                        [Android Termux ALSA Client (Rooted)]
     )" << std::endl;
+    } else if (term_width >= 60) {
+        std::cout << R"(
+  ╔═╗╦ ╦╔╦╗╦╔═╗╦═╗╦ ╦╦ ╦╔╦╗╔═╗╦═╗
+  ╠═╣║ ║ ║║║║ ║╠╦╝║ ║║ ║ ║ ║╣╠╦╝
+  ╩ ╩╚═╝═╩╝╩╚═╝╩╚═╚═╝╚═╝ ╩ ╚═╝╩╚═
+        [Android Termux ALSA Client]
+    )" << std::endl;
+    } else if (term_width >= 40) {
+        std::cout << R"(
+  ╔═╗╦ ╦╔╦╗╦╔═╗
+  ╠═╣║ ║ ║║║║ ║
+  ╩ ╩╚═╝═╩╝╩╚═╝
+   AudioRouter
+   ALSA Client
+    )" << std::endl;
+    } else {
+        std::cout << "AudioRouter ALSA Client" << std::endl;
+    }
 }
 
 void print_usage(const char* prog) {
@@ -117,6 +148,9 @@ int main(int argc, char* argv[]) {
     // Register signal handlers for clean disconnect
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    // The AGM FIFO's reader can disappear (agmplay is restarted on a stall);
+    // a SIGPIPE on a FIFO write must not take the whole client down.
+    std::signal(SIGPIPE, SIG_IGN);
 
     audiorouter::AudioRouterClient client(config);
 

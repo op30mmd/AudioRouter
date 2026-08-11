@@ -7,6 +7,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
+#include <cstdio>
 
 namespace audiorouter {
 
@@ -72,9 +73,15 @@ std::vector<std::string> AndroidHelpers::get_dev_snd_nodes() {
     return nodes;
 }
 
+std::mutex& AndroidHelpers::subprocess_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 bool AndroidHelpers::run_tinymix_command(const std::string& control_name, const std::string& value) {
 #if defined(__linux__) || defined(__ANDROID__)
     std::string cmd = "tinymix \"" + control_name + "\" \"" + value + "\" 2>/dev/null";
+    std::lock_guard<std::mutex> lock(subprocess_mutex());
     int ret = std::system(cmd.c_str());
     return (ret == 0);
 #else
@@ -110,6 +117,40 @@ bool AndroidHelpers::apply_speaker_routing() {
     return all_ok;
 #else
     return false;
+#endif
+}
+
+bool AndroidHelpers::speaker_routing_intact() {
+#if defined(__linux__) || defined(__ANDROID__)
+    struct {
+        const char* control;
+        const char* expected;  // tinymix marks the current enum value with '>'
+    } const checks[] = {
+        {"RX_MACRO RX2 MUX", ">AIF2_PB"},
+        {"RX INT2_1 MIX1 INP0", ">RX2"},
+        {"AUX_RDAC Switch", "On"},
+    };
+
+    for (const auto& check : checks) {
+        const std::string cmd = std::string("tinymix \"") + check.control + "\" 2>/dev/null";
+        std::string out;
+        {
+            std::lock_guard<std::mutex> lock(subprocess_mutex());
+            if (FILE* f = ::popen(cmd.c_str(), "r")) {
+                char buf[256];
+                while (::fgets(buf, static_cast<int>(sizeof(buf)), f)) out += buf;
+                ::pclose(f);
+            }
+        }
+        if (out.find(check.expected) == std::string::npos) {
+            LOG_DEBUG("AndroidHelpers: speaker routing lost: '" << check.control << "' is no longer "
+                      << check.expected);
+            return false;
+        }
+    }
+    return true;
+#else
+    return true;
 #endif
 }
 
