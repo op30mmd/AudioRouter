@@ -157,6 +157,24 @@ bool AgmFifoPlayer::open(const AudioConfig& config, const std::string& device_na
 
     write_wav_header(rate);
 
+    // Critical: On Bengal, many backends (RX-0, RX-1, etc.) cause agmplay to exit
+    // immediately after opening FIFO (invalid graph). If that happens, we should
+    // fail open() quickly so supervisor can fallback to direct PCM nodes (which
+    // were working before our AGM default change). Check if process still alive
+    // 300ms after header write - if died, treat as open failure.
+    sleep_ms(300);
+    if (agmplay_pid_ > 0) {
+        int status = 0;
+        pid_t result = ::waitpid(agmplay_pid_, &status, WNOHANG);
+        if (result == agmplay_pid_) {
+            int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            int sig = WIFSIGNALED(status) ? WTERMSIG(status) : -1;
+            LOG_WARN("AgmFifoPlayer: agmplay died immediately after WAV header (exit_code=" << exit_code << " signal=" << sig << " backend='" << backend_ << "'). Backend invalid for this device - will fallback to direct PCM");
+            close();
+            return false;
+        }
+    }
+
     is_open_ = true;
     LOG_INFO("AgmFifoPlayer: streaming into agmplay (pid " << agmplay_pid_ << ", backend '"
              << backend_ << "')");

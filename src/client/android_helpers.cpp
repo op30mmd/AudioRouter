@@ -173,15 +173,18 @@ bool AndroidHelpers::is_bengal_board() {
 
 bool AndroidHelpers::should_default_to_agm() {
 #if defined(__linux__) || defined(__ANDROID__)
-    // Bengal boards have 7 playback nodes, no pcmC0D0p, and WCD937x codec where
-    // AGM FIFO via agmplay named pipe is more reliable than direct PCM.
-    // Also check if agmplay binary exists.
-    if (!is_bengal_board()) return false;
-
-    // Check if agmplay exists at known paths
-    if (::access("/vendor/bin/agmplay", F_OK) == 0 || ::access("/system/bin/agmplay", F_OK) == 0) {
-        return true;
-    }
+    // Originally: Bengal boards were thought to benefit from AGM FIFO.
+    // However, real device testing (bengal-idp-snd-card, 7 playback nodes, no pcmC0D0p)
+    // shows agmplay dies immediately with broken pipe for all backends
+    // CODEC_DMA-LPAIF_RXTX-RX-0/1/2/3, causing "broken pipe" errors.
+    // The device was working before with direct PCM nodes (pcmC0D1p etc.).
+    // User reported: "all of them were returned error 'broken pipe'" and
+    // "it was working before your changes" when default was direct.
+    // For stability, default back to direct PCM (AlsaPlayer/DirectAlsa) and
+    // let user explicitly choose -d agm if they want to test AGM.
+    // We keep Bengal detection for logging but return false for default.
+    // If you want AGM default on Bengal, change this to true and agmplay will
+    // be tried first with fallback to direct on failure (now with 300ms early death check).
     return false;
 #else
     return false;

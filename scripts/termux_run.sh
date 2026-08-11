@@ -163,18 +163,24 @@ if [[ "$NEEDS_SERVER" == "1" && -z "$SERVER_IP" && "$AUTO_DISCOVER" == "0" ]]; t
     fi
 fi
 
-# Auto-detect Bengal board and set AGM as default (user request: agmplay named pipe should be default on bengal)
-# If device is still default and we are on Bengal with agmplay present, use AGM named pipe
+# Auto-detect Bengal board: previously auto-selected AGM named pipe as default per user request
+# "agmplay named pipe should be the default on bengal". However, real testing on Bengal
+# (7 playback nodes, no pcmC0D0p, 184 controls) shows agmplay dies with broken pipe for all backends
+# RX-0/1/2/3, and user reported "it was working before your changes" when default was direct.
+# For stability, we now keep default as direct PCM (which was working before) and let user
+# explicitly choose -d agm if they want. The C++ code still has AGM->NODES->LEGACY fallback chain,
+# and AgmFifoPlayer now fails fast if backend invalid (300ms check) so it falls back to direct.
+# If you want to re-enable AGM default, uncomment below.
 EFFECTIVE_DEVICE="$DEVICE"
-if [[ "$DEVICE" == "default" ]]; then
-    if [[ -f /proc/asound/cards ]] && grep -qi "bengal" /proc/asound/cards 2>/dev/null; then
-        if [[ -x /vendor/bin/agmplay || -f /vendor/bin/agmplay || -x /system/bin/agmplay ]]; then
-            EFFECTIVE_DEVICE="agm:CODEC_DMA-LPAIF_RXTX-RX-1"
-            log_info "Bengal board detected (bengal-idp-snd-card) - auto-selecting AGM named pipe as default: $EFFECTIVE_DEVICE (was default)"
-            log_info "  You can override with -d direct:/dev/snd/pcmC0D1p or -d hw:0,0 etc. if AGM fails"
-        fi
-    fi
-fi
+# Disabled AGM auto-default for Bengal due to broken pipe on this variant:
+# if [[ "$DEVICE" == "default" ]]; then
+#     if [[ -f /proc/asound/cards ]] && grep -qi "bengal" /proc/asound/cards 2>/dev/null; then
+#         if [[ -x /vendor/bin/agmplay || -f /vendor/bin/agmplay ]]; then
+#             EFFECTIVE_DEVICE="agm:CODEC_DMA-LPAIF_RXTX-RX-1"
+#             log_info "Bengal board detected - auto-selecting AGM: $EFFECTIVE_DEVICE"
+#         fi
+#     fi
+# fi
 
 # Build client args
 CLIENT_ARGS=()
