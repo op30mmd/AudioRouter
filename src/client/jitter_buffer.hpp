@@ -58,6 +58,12 @@ private:
     AudioConfig config_;
     uint32_t target_latency_ms_;
     size_t target_buffer_frames_;
+    // Larger prefill required for the first fill after a reset: packet delivery
+    // is often slower than real-time during the first seconds of a stream
+    // (network ramp-up, capture warm-up), so a shallow prefill runs dry
+    // immediately. Later re-buffers use the steady target_latency_ms_.
+    size_t startup_target_frames_;
+    bool startup_pending_;
 
     std::vector<PacketSlot> slots_;
     uint32_t next_play_seq_;

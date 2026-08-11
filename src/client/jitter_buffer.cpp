@@ -6,11 +6,23 @@
 #include <cstring>
 #include <algorithm>
 
+namespace {
+
+// First-fill (post-reset) prefill is multiplied from the configured target and
+// clamped to [kStartupPrefillMinMs, kStartupPrefillMaxMs].
+constexpr uint32_t kStartupPrefillMultiplier = 3;
+constexpr uint32_t kStartupPrefillMinMs = 120;
+constexpr uint32_t kStartupPrefillMaxMs = 250;
+
+} // namespace
+
 namespace audiorouter {
 
 JitterBuffer::JitterBuffer(uint32_t target_latency_ms)
     : target_latency_ms_(target_latency_ms),
       target_buffer_frames_(0),
+      startup_target_frames_(0),
+      startup_pending_(false),
       slots_(MAX_SLOTS),
       next_play_seq_(0),
       has_first_packet_(false),
@@ -25,6 +37,11 @@ void JitterBuffer::configure(const AudioConfig& config, uint32_t target_latency_
     config_ = config;
     target_latency_ms_ = (target_latency_ms > 5) ? target_latency_ms : 5;
     target_buffer_frames_ = (static_cast<uint64_t>(config_.sample_rate) * target_latency_ms_) / 1000;
+
+    uint32_t startup_ms = std::max(kStartupPrefillMinMs, target_latency_ms_ * kStartupPrefillMultiplier);
+    startup_ms = std::min(startup_ms, kStartupPrefillMaxMs);
+    startup_target_frames_ = (static_cast<uint64_t>(config_.sample_rate) * startup_ms) / 1000;
+
     reset();
 }
 
@@ -37,6 +54,7 @@ void JitterBuffer::reset() {
     next_play_seq_ = 0;
     has_first_packet_ = false;
     is_buffering_ = true;
+    startup_pending_ = true;
     slot_frame_offset_ = 0;
     last_arrival_timestamp_us_ = 0;
     last_transit_us_ = 0;
@@ -122,8 +140,13 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
     std::memcpy(slot.pcm_data.data(), pcm_data, total_samples * sizeof(int16_t));
     slot.is_valid = true;
 
-    // Check if we accumulated enough frames to exit buffering
+    // Check if we accumulated enough frames to exit buffering. The first fill
+    // after a reset requires the (larger) startup prefill so the playhead
+    // doesn't run dry during the initial network/capture ramp-up; later
+    // re-buffers use the configured steady-state target.
     if (is_buffering_) {
+        const size_t fill_target = startup_pending_ ? startup_target_frames_ : target_buffer_frames_;
+
         size_t buffered = 0;
         for (size_t i = 0; i < MAX_SLOTS; ++i) {
             size_t s = (next_play_seq_ + i) % MAX_SLOTS;
@@ -141,10 +164,11 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
             }
         }
 
-        if (buffered >= target_buffer_frames_ || total_valid_frames >= target_buffer_frames_) {
+        if (buffered >= fill_target || total_valid_frames >= fill_target) {
             is_buffering_ = false;
+            startup_pending_ = false;
             LOG_DEBUG("JitterBuffer: Pre-buffering complete (" << buffered << " frames, "
-                      << (config_.sample_rate > 0 ? (buffered * 1000 / config_.sample_rate) : 0) << " ms). Starting ALSA playback.");
+                      << (config_.sample_rate > 0 ? (buffered * 1000 / config_.sample_rate) : 0) << " ms). Starting playback.");
         }
     }
 
