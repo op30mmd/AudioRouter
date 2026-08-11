@@ -111,8 +111,9 @@ std::vector<uint8_t> BuildBackendMetadataPayload(uint32_t rate, uint32_t bit_wid
 // for PLAYBACK with an instance key): STREAMRX:PCM_LL_PLAYBACK +
 // INSTANCE:INSTANCE_1, ckv VOLUME:LEVEL_0. The A05s's agmplay additionally
 // carries the DEVICEPP_RX key in the stream metadata (its log shows
-// gkv[2] = 0xac000000/0xac000002), so that pair is appended when enabled via
-// AUDIOROUTER_AGM_DEVICEPP_KV=1.
+// gkv[2] = 0xac000000/0xac000002); without that pair the ADSP finds no graph
+// for the tag (AR_ENOTEXIST -> -ENODEV), so it is included by default.
+// AUDIOROUTER_AGM_DEVICEPP_KV=0 disables it.
 std::vector<uint8_t> BuildStreamMetadataPayload(bool include_devicepp) {
     std::vector<uint8_t> m;
     AppendU32Le(m, include_devicepp ? 3u : 2u);  // num_gkv
@@ -471,7 +472,8 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
     const std::string pcm_mtd_ctl_name = "PCM" + std::to_string(kAgmDevice) + " metadata";
     const CtlLookup pcm_mtd = find_ctl(pcm_mtd_ctl_name);
     if (pcm_mtd.ctl && api_->mixer_ctl_set_array) {
-        const bool include_devicepp = getenv("AUDIOROUTER_AGM_DEVICEPP_KV") != nullptr;
+        const char* devpp_env = getenv("AUDIOROUTER_AGM_DEVICEPP_KV");
+        const bool include_devicepp = devpp_env ? (devpp_env[0] != '0') : true;
         const std::vector<uint8_t> payload = BuildStreamMetadataPayload(include_devicepp);
         const int mtd_ret = api_->mixer_ctl_set_array(pcm_mtd.ctl, payload.data(), payload.size());
         LOG_INFO("AgmPlayer: '" << pcm_mtd_ctl_name << "' metadata (by " << pcm_mtd.how << ", "
