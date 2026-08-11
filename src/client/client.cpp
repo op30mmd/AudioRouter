@@ -2,6 +2,7 @@
 #include "alsa_player.hpp"
 #include "direct_alsa.hpp"
 #include "agm_fifo_player.hpp"
+#include "aaudio_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -34,6 +35,10 @@ namespace {
     // library is absent (many Samsung/entry-level builds ship the classic ALSA
     // HAL instead) those attempts fail fast and the client falls back.
     constexpr size_t kMaxAgmOpenAttempts = 2;
+    // AAudio opens are quick user-space calls (no kernel driver to hang on),
+    // so a small retry budget is plenty before falling back to the
+    // root-requiring backends.
+    constexpr size_t kMaxAaudioOpenAttempts = 2;
 
     // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
     // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
@@ -46,6 +51,12 @@ namespace {
     // (vendor libagmclient.so) instead of raw PCM nodes.
     bool is_agm_device(const std::string& device_name) {
         return device_name.rfind("agm:", 0) == 0 || device_name == "agm";
+    }
+
+    // "aaudio" / "aaudio:..." plays through Android's native AAudio API (audio
+    // HAL / AudioFlinger) — the only backend that needs NO root.
+    bool is_aaudio_device(const std::string& device_name) {
+        return device_name.rfind("aaudio:", 0) == 0 || device_name == "aaudio";
     }
 
     std::vector<std::string> build_node_candidates(const std::string& device_name) {
@@ -101,12 +112,18 @@ namespace {
         }
     }
 
-    enum class OpenStrategy { AGM, NODES, LEGACY };
+    enum class OpenStrategy { AAUDIO, AGM, NODES, LEGACY };
 
-    // "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds don't ship
-    // libagmclient.so at all), then direct kernel PCM nodes, then ALSA-lib.
-    // Node-based names open PCM nodes only; everything else is ALSA-lib only.
+    // "aaudio"/"aaudio:<mode>" uses AAudio first (no root, works on stock
+    // devices; needs Android 8.0+), then falls back to the root-requiring
+    // backends. "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds
+    // don't ship libagmclient.so at all), then direct kernel PCM nodes, then
+    // ALSA-lib. Node-based names open PCM nodes only; everything else is
+    // ALSA-lib only.
     std::vector<OpenStrategy> build_open_strategies(const std::string& device_name) {
+        if (is_aaudio_device(device_name)) {
+            return {OpenStrategy::AAUDIO, OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
+        }
         if (is_agm_device(device_name)) {
             return {OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
         }
@@ -118,6 +135,7 @@ namespace {
 
     const char* strategy_label(OpenStrategy strategy, bool node_based) {
         switch (strategy) {
+            case OpenStrategy::AAUDIO: return "AAudio native audio via Android audio HAL (no root)";
             case OpenStrategy::AGM: return "AGM playback via vendor agmplay subprocess (FIFO)";
             case OpenStrategy::NODES: return node_based ? "direct kernel PCM nodes (/dev/snd)" : "direct kernel PCM nodes";
             default: return "ALSA-lib device (default/hw:0,0)";
@@ -140,7 +158,8 @@ namespace {
 
         while (!open->shutdown.load() && strategy_index < strategies.size()) {
             const OpenStrategy strategy = strategies[strategy_index];
-            const size_t max_attempts = strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
+            const size_t max_attempts = strategy == OpenStrategy::AAUDIO ? kMaxAaudioOpenAttempts
+                                      : strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
                                       : strategy == OpenStrategy::NODES ? kMaxNodeOpenAttempts
                                                                         : std::numeric_limits<size_t>::max();
             const bool node_based = strategy == OpenStrategy::NODES;
@@ -172,6 +191,7 @@ namespace {
 
                 std::shared_ptr<IAudioPlayer> device =
                     node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
+                    : strategy == OpenStrategy::AAUDIO ? std::shared_ptr<IAudioPlayer>(std::make_shared<AaudioFifoPlayer>())
                     : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>())
                                                     : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
                 auto finished = std::make_shared<std::atomic<bool>>(false);

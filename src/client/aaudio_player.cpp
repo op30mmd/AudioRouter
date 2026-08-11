@@ -1,0 +1,437 @@
+#include "aaudio_player.hpp"
+#include "../common/logger.hpp"
+#include "../common/time_util.hpp"
+
+#include <cerrno>
+#include <cstring>
+#include <vector>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#include <aaudio/AAudio.h>
+#endif
+
+namespace {
+
+// FIFO that carries PCM from write_frames() to the AAudio pump thread.
+constexpr const char* kFifoPath = "/data/local/tmp/audiorouter_aaudio.fifo";
+
+// Expand the pipe capacity to 1 MB (~5 s of 48 kHz stereo audio). The pipe is
+// the back-pressure buffer between the network and the AAudio stream; a small
+// default (64 KB) would stall on bursty Wi-Fi.
+constexpr int kFifoSizeBytes = 1048576;
+
+// How long AAudioStream_write() may block for space in the AAudio buffer.
+// Mirrors the standalone stream_daemon (500 ms).
+constexpr int64_t kWriteTimeoutNs = 500000000LL;
+
+// Poll timeouts keep shutdown responsive: the pump polls the FIFO for 100 ms
+// at a time and write_frames() waits at most 50 ms for pipe space, both
+// re-checking the open/stop flags each iteration.
+constexpr int kFifoPollMs = 100;
+constexpr int kWritePollMs = 50;
+
+// Minimum gap between AAudio stream recreations (a flapping routing change
+// must not thrash stream open/close).
+constexpr uint64_t kMinRebuildIntervalMs = 1000;
+
+} // namespace
+
+namespace audiorouter {
+
+AaudioFifoPlayer::AaudioFifoPlayer() = default;
+
+AaudioFifoPlayer::~AaudioFifoPlayer() {
+    close();
+}
+
+bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device_name) {
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+    if (is_open_.load()) close();
+
+    config_ = config;
+    if (config_.sample_rate == 0) config_.sample_rate = 48000;
+    if (config_.channels == 0) config_.channels = 2;
+
+    // Parse "aaudio" / "aaudio:deep" / "aaudio:voip".
+    mode_ = "lowlatency";
+    device_name_ = device_name.empty() ? "aaudio" : device_name;
+    if (device_name_.rfind("aaudio:", 0) == 0) {
+        const std::string mode = device_name_.substr(7);
+        if (mode == "deep" || mode == "voip" || mode == "lowlatency") {
+            mode_ = mode;
+        } else {
+            LOG_WARN("AaudioFifoPlayer: unknown aaudio mode '" << mode
+                     << "' (expected 'deep' or 'voip'); using default low-latency mode");
+        }
+    }
+
+    if (!create_fifo()) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        AAudioStreamBuilder* builder = nullptr;
+        aaudio_result_t res = AAudio_createStreamBuilder(&builder);
+        if (res != AAUDIO_OK || builder == nullptr) {
+            LOG_ERROR("AaudioFifoPlayer: failed to create AAudio stream builder: "
+                      << AAudio_convertResultToText(res));
+            destroy_fifo();
+            return false;
+        }
+        configure_builder(builder);
+        AAudioStream* opened = nullptr;
+        res = AAudioStreamBuilder_openStream(builder, &opened);
+        AAudioStreamBuilder_delete(builder);
+        if (res != AAUDIO_OK) {
+            LOG_ERROR("AaudioFifoPlayer: failed to open AAudio stream: "
+                      << AAudio_convertResultToText(res));
+            destroy_fifo();
+            return false;
+        }
+        stream_ = opened;
+        AAudioStream_requestStart(opened);
+    }
+
+    LOG_INFO("AaudioFifoPlayer: AAudio stream opened: "
+             << AAudioStream_getSampleRate(static_cast<AAudioStream*>(stream_))
+             << " Hz, " << AAudioStream_getChannelCount(static_cast<AAudioStream*>(stream_))
+             << " ch, mode '" << mode_ << "', FIFO " << kFifoPath);
+
+    stop_pump_.store(false);
+    is_open_.store(true);
+    pump_thread_ = std::thread(&AaudioFifoPlayer::pump_loop, this);
+    return true;
+#else
+    (void)config;
+    (void)device_name;
+    LOG_INFO("AaudioFifoPlayer: AAudio not available on this platform (requires "
+             "an Android API 26+ build with libaaudio)");
+    return false;
+#endif
+}
+
+void AaudioFifoPlayer::close() {
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+    stop_pump_.store(true);
+    if (pump_thread_.joinable()) pump_thread_.join();
+
+    if (fifo_fd_ >= 0) {
+        ::close(fifo_fd_);
+        fifo_fd_ = -1;
+    }
+    ::unlink(kFifoPath);
+
+    {
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        if (stream_ != nullptr) {
+            AAudioStream_close(static_cast<AAudioStream*>(stream_));
+            stream_ = nullptr;
+        }
+    }
+    frames_in_flight_.store(0);
+    is_open_.store(false);
+    LOG_INFO("AaudioFifoPlayer: AAudio stream closed");
+#else
+    is_open_.store(false);
+#endif
+}
+
+bool AaudioFifoPlayer::is_open() const {
+    return is_open_.load();
+}
+
+bool AaudioFifoPlayer::is_supported() {
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+    return true;
+#else
+    return false;
+#endif
+}
+
+size_t AaudioFifoPlayer::write_frames(const void* pcm_data, size_t num_frames) {
+    if (pcm_data == nullptr || num_frames == 0) return 0;
+    const size_t bytes_per_frame = config_.bytes_per_frame();
+    if (bytes_per_frame == 0) return 0;
+
+    const size_t total_bytes = num_frames * bytes_per_frame;
+    const auto* src = reinterpret_cast<const uint8_t*>(pcm_data);
+    size_t written_bytes = 0;
+
+    while (written_bytes < total_bytes) {
+        if (!is_open_.load() || fifo_fd_ < 0) break;
+        const ssize_t n = ::write(fifo_fd_, src + written_bytes, total_bytes - written_bytes);
+        if (n > 0) {
+            written_bytes += static_cast<size_t>(n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == EAGAIN) {
+            // Pipe full: wait for the pump thread to drain it. The FIFO's
+            // capacity plus AAudio's buffer pace playback, so this back-
+            // pressure is what keeps the stream glitch-free.
+            struct pollfd pfd = {fifo_fd_, POLLOUT, 0};
+            ::poll(&pfd, 1, kWritePollMs);
+            continue;
+        }
+        // EBADF (closed concurrently) or any other error: stop writing.
+        break;
+    }
+    return written_bytes / bytes_per_frame;
+}
+
+size_t AaudioFifoPlayer::get_buffer_delay_frames() const {
+    if (!is_open_.load()) return 0;
+    const size_t bytes_per_frame = config_.bytes_per_frame();
+
+    // PCM waiting in the FIFO right now (pump thread may already hold some).
+    int fifo_bytes = 0;
+    if (fifo_fd_ >= 0) ::ioctl(fifo_fd_, FIONREAD, &fifo_bytes);
+    const size_t fifo_frames =
+        (bytes_per_frame > 0 && fifo_bytes > 0) ? static_cast<size_t>(fifo_bytes) / bytes_per_frame : 0;
+
+    // PCM queued inside the AAudio stream itself. Prefer the live counters;
+    // if the pump is mid-write, fall back to its last published snapshot.
+    int64_t in_flight = frames_in_flight_.load();
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+    if (stream_mutex_.try_lock()) {
+        if (stream_ != nullptr) {
+            auto* stream = static_cast<AAudioStream*>(stream_);
+            in_flight = AAudioStream_getFramesWritten(stream) - AAudioStream_getFramesRead(stream);
+        }
+        stream_mutex_.unlock();
+    }
+#endif
+    if (in_flight < 0) in_flight = 0;
+
+    return fifo_frames + static_cast<size_t>(in_flight);
+}
+
+void AaudioFifoPlayer::flush() {
+    // The FIFO drains in real time (~20 ms of data); there is nothing to
+    // force out beyond what the pump already consumes.
+}
+
+std::string AaudioFifoPlayer::get_device_name() const {
+    return device_name_;
+}
+
+#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+
+void AaudioFifoPlayer::configure_builder(void* builder_ptr) {
+    auto* builder = static_cast<AAudioStreamBuilder*>(builder_ptr);
+
+    // The AudioRouter server always negotiates 48 kHz stereo S16, but honor
+    // whatever the server actually sent (AAudio will resample as needed).
+    AAudioStreamBuilder_setSampleRate(builder, static_cast<int32_t>(config_.sample_rate));
+    AAudioStreamBuilder_setChannelCount(builder, static_cast<int32_t>(config_.channels));
+
+    aaudio_format_t format = AAUDIO_FORMAT_PCM_I16;
+    switch (config_.format) {
+        case AudioSampleFormat::PCM_FLOAT32LE:
+            format = AAUDIO_FORMAT_PCM_FLOAT;
+            break;
+        case AudioSampleFormat::PCM_S24LE:
+        case AudioSampleFormat::PCM_S32LE:
+            // I24/I32 formats are API 31+; deliver 24/32-bit content as 16-bit
+            // rather than risk the low 8 bits being truncated by AAudio.
+            LOG_WARN("AaudioFifoPlayer: format " << to_string_view(config_.format)
+                     << " not natively supported; playing as S16");
+            break;
+        default:
+            break;  // PCM_S16LE
+    }
+    AAudioStreamBuilder_setFormat(builder, format);
+    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+    AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
+
+    // Usage/content-type hint the audio policy how to route/mix the stream
+    // (API 28+; below that AAudio defaults to media).
+#if __ANDROID_API__ >= 28
+    if (mode_ == "voip") {
+        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_VOICE_COMMUNICATION);
+        AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_SPEECH);
+        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    } else if (mode_ == "deep") {
+        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
+        AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
+        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_NONE);
+    } else {
+        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
+        AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
+        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    }
+#else
+    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+#endif
+}
+
+// Restarts the stream when it is not running (underrun, pause, stop).
+// Returns false when the stream is gone for good (disconnect during rebuild).
+bool AaudioFifoPlayer::ensure_stream_started_locked() {
+    if (stream_ == nullptr) return false;
+    auto* stream = static_cast<AAudioStream*>(stream_);
+
+    const aaudio_stream_state_t state = AAudioStream_getState(stream);
+    if (state == AAUDIO_STREAM_STATE_DISCONNECTED) {
+        // Routing changed (headphones unplugged, BT reconnect, ...): the old
+        // stream is dead; recreate it from the builder config.
+        const uint64_t now_ms = get_time_ms();
+        if (now_ms - last_rebuild_ms_ >= kMinRebuildIntervalMs) {
+            last_rebuild_ms_ = now_ms;
+            LOG_WARN("AaudioFifoPlayer: stream disconnected (routing change); recreating AAudio stream");
+            rebuild_stream_locked();
+        }
+        return stream_ != nullptr;
+    }
+
+    // Auto-restart the stream if it underran / was paused / stopped.
+    if (state != AAUDIO_STREAM_STATE_STARTED && state != AAUDIO_STREAM_STATE_STARTING) {
+        AAudioStream_requestStart(stream);
+    }
+    return true;
+}
+
+bool AaudioFifoPlayer::rebuild_stream_locked() {
+    if (stream_ != nullptr) {
+        AAudioStream_close(static_cast<AAudioStream*>(stream_));
+        stream_ = nullptr;
+    }
+    frames_in_flight_.store(0);
+
+    AAudioStreamBuilder* builder = nullptr;
+    aaudio_result_t res = AAudio_createStreamBuilder(&builder);
+    if (res != AAUDIO_OK || builder == nullptr) {
+        LOG_ERROR("AaudioFifoPlayer: failed to create AAudio stream builder: "
+                  << AAudio_convertResultToText(res));
+        return false;
+    }
+    configure_builder(builder);
+    AAudioStream* opened = nullptr;
+    res = AAudioStreamBuilder_openStream(builder, &opened);
+    AAudioStreamBuilder_delete(builder);
+    if (res != AAUDIO_OK) {
+        LOG_WARN("AaudioFifoPlayer: failed to recreate AAudio stream: "
+                 << AAudio_convertResultToText(res));
+        stream_ = nullptr;
+        return false;
+    }
+    stream_ = opened;
+    AAudioStream_requestStart(opened);
+    LOG_INFO("AaudioFifoPlayer: AAudio stream recreated ("
+             << AAudioStream_getSampleRate(static_cast<AAudioStream*>(stream_))
+             << " Hz, " << AAudioStream_getChannelCount(static_cast<AAudioStream*>(stream_))
+             << " ch)");
+    return true;
+}
+
+bool AaudioFifoPlayer::create_fifo() {
+    // Re-create the pipe cleanly.
+    ::unlink(kFifoPath);
+    if (::mkfifo(kFifoPath, 0666) != 0 && errno != EEXIST) {
+        LOG_ERROR("AaudioFifoPlayer: mkfifo(" << kFifoPath << ") failed: " << std::strerror(errno));
+        return false;
+    }
+    ::chmod(kFifoPath, 0666);
+
+    // CRITICAL: open O_RDWR so Linux never sends EOF when the writer
+    // (the client playback thread) pauses or disconnects; the pump thread
+    // keeps reading continuously instead of exiting. O_NONBLOCK additionally
+    // lets close() unblock a writer/reader stuck on a full/empty pipe.
+    fifo_fd_ = ::open(kFifoPath, O_RDWR | O_NONBLOCK);
+    if (fifo_fd_ < 0) {
+        LOG_ERROR("AaudioFifoPlayer: failed to open FIFO " << kFifoPath << ": " << std::strerror(errno));
+        ::unlink(kFifoPath);
+        return false;
+    }
+
+    // Expand pipe capacity to 1 MB (~5 s of audio) so bursty Wi-Fi delivery
+    // is buffered instead of stalling the network path.
+    (void)::fcntl(fifo_fd_, F_SETPIPE_SZ, kFifoSizeBytes);
+    return true;
+}
+
+void AaudioFifoPlayer::destroy_fifo() {
+    if (fifo_fd_ >= 0) {
+        ::close(fifo_fd_);
+        fifo_fd_ = -1;
+    }
+    ::unlink(kFifoPath);
+}
+
+void AaudioFifoPlayer::pump_loop() {
+    const size_t bytes_per_frame = config_.bytes_per_frame();
+    if (bytes_per_frame == 0) return;
+    // ~20 ms chunk, like the standalone stream_daemon (960 frames @ 48 kHz).
+    const size_t chunk_frames = (config_.sample_rate / 50) > 0 ? (config_.sample_rate / 50) : 1;
+    std::vector<uint8_t> buffer(chunk_frames * bytes_per_frame);
+    size_t residual = 0;
+
+    while (!stop_pump_.load()) {
+        // Continuous blocking read (never returns 0 / EOF thanks to O_RDWR).
+        // poll() bounds the wait so shutdown stays responsive.
+        struct pollfd pfd = {fifo_fd_, POLLIN, 0};
+        const int pr = ::poll(&pfd, 1, kFifoPollMs);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;  // EBADF: fifo closed (shutdown)
+        }
+        if (pr == 0 || !(pfd.revents & POLLIN)) continue;
+
+        ssize_t bytes_read = ::read(fifo_fd_, buffer.data() + residual, buffer.size() - residual);
+        if (bytes_read <= 0) continue;  // EAGAIN or interrupted; never EOF
+
+        const size_t total_bytes = residual + static_cast<size_t>(bytes_read);
+        const size_t frames_available = total_bytes / bytes_per_frame;
+        residual = total_bytes % bytes_per_frame;
+
+        if (frames_available > 0) {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            if (stream_ == nullptr) break;
+            if (!ensure_stream_started_locked()) continue;
+
+            auto* stream = static_cast<AAudioStream*>(stream_);
+            const aaudio_result_t frames_written =
+                AAudioStream_write(stream, buffer.data(), static_cast<int32_t>(frames_available),
+                                   kWriteTimeoutNs);
+            if (frames_written < 0) {
+                // Auto-restart the stream if it underran / was paused /
+                // disconnected mid-write. Log at most once every 5 s so a
+                // wedged stream can't flood the log.
+                const uint64_t now_ms = get_time_ms();
+                if (now_ms - last_write_warn_ms_ >= 5000) {
+                    last_write_warn_ms_ = now_ms;
+                    LOG_WARN("AaudioFifoPlayer: AAudioStream_write failed: "
+                             << AAudio_convertResultToText(static_cast<aaudio_result_t>(frames_written)));
+                }
+                if (frames_written == AAUDIO_ERROR_DISCONNECTED ||
+                    AAudioStream_getState(stream) == AAUDIO_STREAM_STATE_DISCONNECTED) {
+                    if (get_time_ms() - last_rebuild_ms_ >= kMinRebuildIntervalMs) {
+                        last_rebuild_ms_ = get_time_ms();
+                        rebuild_stream_locked();
+                    }
+                } else {
+                    AAudioStream_requestStart(stream);
+                }
+                continue;
+            }
+
+            const int64_t written_total = AAudioStream_getFramesWritten(stream);
+            const int64_t read_total = AAudioStream_getFramesRead(stream);
+            frames_in_flight_.store(written_total - read_total);
+        }
+
+        // Keep unused fractional-frame bytes for the next iteration.
+        if (residual > 0) {
+            std::memmove(buffer.data(), buffer.data() + (frames_available * bytes_per_frame), residual);
+        }
+    }
+}
+
+#endif  // __ANDROID__ && __ANDROID_API__ >= 26
+
+} // namespace audiorouter

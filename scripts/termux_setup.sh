@@ -39,6 +39,9 @@ fi
 echo "[2/4] Installing compiler and ALSA tools..."
 if [ "$(id -u)" -ne 0 ]; then
     pkg install -y clang make alsa-utils || true
+    # Optional: NDK sysroot with Android platform stub libraries. Needed only
+    # to link the AAudio no-root backend (-laaudio); skipped when unavailable.
+    pkg install -y ndk-sysroot 2>/dev/null || true
 else
     echo "     Skipped: pkg cannot run as root. Run 'pkg install clang make alsa-utils' as the Termux user."
 fi

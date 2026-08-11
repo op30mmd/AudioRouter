@@ -27,6 +27,12 @@ When the Android client connects to the Windows server via `IP:PORT`, the server
   - Dual ALSA backend: supports both dynamic `libasound.so` (`pkg install alsa-lib`) and direct kernel ioctl driver (`/dev/snd/pcmC*D*p`) with zero external dynamic dependencies.
   - Mixer setup scripts (`tinymix`) for Qualcomm Snapdragon and MediaTek Android hardware.
 
+- **🔊 AAudio Backend — No Root Required**:
+  - Plays through Android's native AAudio API (NDK `<aaudio/AAudio.h>`, API 26+): the stream is owned by AudioFlinger / the audio HAL, so it works on **stock, non-rooted devices** — no `/dev/snd`, no ALSA, no `tinymix`.
+  - PCM is pumped through a 1 MB FIFO into a low-latency AAudio stream in ~20 ms chunks with automatic underrun/pause recovery and stream recreation on routing changes (headphone unplug, Bluetooth switch).
+  - Three profiles: `aaudio` (media + low latency), `aaudio:deep` (power saver / deep buffer), `aaudio:voip` (call-style routing).
+  - Includes the standalone `stream_daemon` tool: a continuous real-time AAudio FIFO daemon (`/data/local/tmp/audio_pipe`) that any process can feed raw S16 stereo PCM into.
+
 ---
 
 ## 🏗️ Architecture & Protocol
@@ -166,11 +172,22 @@ Client Options:
 Usage: audiorouter_client [options]
   -s, --server <ip>         Windows PC Server IP address
   -p, --port <port>         Server UDP port (default: 44100)
-  -d, --device <dev>        ALSA device ('default', 'hw:0,0', 'direct:/dev/snd/pcmC0D0p')
+  -d, --device <dev>        Audio device (default: 'default'):
+                              ALSA:  'default', 'hw:0,0', 'plughw:0,0'
+                              Direct kernel: 'direct:/dev/snd/pcmC0D0p' or any '/dev/snd/...'
+                              Qualcomm AGM: 'agm' or 'agm:<backend>'
+                              AAudio (NO ROOT needed): 'aaudio', 'aaudio:deep', 'aaudio:voip'
   -l, --latency <ms>        Target Jitter Buffer latency in ms (default: 35ms)
       --discover            Auto-discover server on local hotspot subnet
       --dummy               Use simulated audio player (benchmarking/testing)
-      --list-devices        List detected ALSA and kernel PCM nodes
+      --list-devices        List detected ALSA, kernel PCM nodes and AAudio availability
+```
+
+#### No-Root Quick Start (AAudio)
+
+```bash
+# On a stock (non-rooted) device, Android 8.0+ — no 'su', no ALSA setup:
+./bin/audiorouter_client -s 192.168.43.45 -d aaudio
 ```
 
 ---
@@ -194,6 +211,70 @@ When running in Termux with root (`su`):
    tinymix "Speaker Function" "On"
    tinymix "RX_CDC_DMA_RX_0 Audio Mixer MultiMedia1" 1
    ```
+
+---
+
+## 🔊 AAudio Playback (No Root Required)
+
+AAudio is the NDK's native audio API (Android 8.0+). Unlike the ALSA / direct
+`/dev/snd` / AGM backends, an AAudio stream is owned by **AudioFlinger and the
+audio HAL**, so playback goes through the normal Android audio policy —
+speaker, Bluetooth, USB — **without root and without touching the mixer**.
+This makes it the best option for stock, non-rooted devices, or whenever
+another app's audio should keep working alongside AudioRouter.
+
+### How it works
+
+- The client writes PCM into a FIFO at `/data/local/tmp/audiorouter_aaudio.fifo`
+  (opened `O_RDWR`, capacity expanded to 1 MB ≈ 5 s of audio).
+- A background pump thread reads the FIFO (never EOF) and feeds
+  `AAudioStream_write()` in ~20 ms chunks with a 500 ms timeout — the same
+  engine as the standalone `stream_daemon`.
+- The FIFO provides natural back-pressure: if the network delivers faster than
+  the device consumes, the pipe fills and the jitter buffer drains instead of
+  dropping packets.
+- **Underrun/pause recovery**: if the stream is PAUSED/STOPPED or a write
+  fails, the stream is restarted automatically. If it is DISCONNECTED
+  (headphones unplugged, Bluetooth reconnect, USB audio removed), the stream
+  is recreated from scratch (rate-limited to once per second).
+
+### Device profiles
+
+| `-d` value         | Profile                                                     |
+|--------------------|-------------------------------------------------------------|
+| `aaudio`           | `USAGE_MEDIA` + `LOW_LATENCY` — default, lowest latency      |
+| `aaudio:deep`      | `USAGE_MEDIA` + `PERFORMANCE_MODE_NONE` — power saver / deep buffer, slightly higher latency, very stable |
+| `aaudio:voip`      | `USAGE_VOICE_COMMUNICATION` + `LOW_LATENCY` — call-style routing (useful if the stock policy ducks your stream) |
+
+### Building
+
+The AAudio backend is compiled in automatically when the toolchain targets
+Android API 26+ and `libaaudio` is linkable:
+
+- **Termux**: `pkg install ndk-sysroot` (provides the Android platform stub
+  libraries), then `make client` as usual. The Makefile probes for
+  `-laaudio`; on plain Linux/CI hosts the player compiles as a harmless stub.
+- **NDK / CMake**: set `-DANDROID_PLATFORM=android-26` (or newer); the
+  `aaudio` library is linked and the `stream_daemon` tool is built too.
+- If the probe finds no `libaaudio`, the client still builds — `-d aaudio`
+  simply fails fast and falls back to the other backends.
+
+### Standalone stream_daemon tool
+
+`src/tools/stream_daemon.cpp` is the standalone version of the same engine:
+it exposes a FIFO (default `/data/local/tmp/audio_pipe`, 48 kHz stereo S16)
+and plays whatever is written into it through AAudio. Useful when another
+process owns the PCM and you do not want the full client:
+
+```bash
+# Build with the NDK (or: ./scripts/build_stream_daemon.sh)
+clang++ -O2 -Wno-unavailable-declarations -target aarch64-linux-android30 \
+    -o stream_daemon src/tools/stream_daemon.cpp -laaudio -lm
+
+# Run it, then feed it raw interleaved S16 stereo PCM:
+./stream_daemon
+cat audio.raw > /data/local/tmp/audio_pipe
+```
 
 ---
 
@@ -253,17 +334,20 @@ AudioRouter/
 │   │   ├── audio_endpoint_control.hpp/.cpp # IAudioEndpointVolume PC speaker mute
 │   │   ├── dummy_capture.hpp/.cpp # Synthetic tone generator (Linux/fallback)
 │   │   └── audio_capture.hpp      # Audio capture interface
-│   └── client/                    # Android Termux ALSA Client
-│       ├── CMakeLists.txt
-│       ├── main.cpp               # Client CLI and signal handling
-│       ├── client.hpp/.cpp        # Client receiver engine & NAT heartbeat
-│       ├── alsa_player.hpp/.cpp   # ALSA player (dynamic libasound)
-│       ├── direct_alsa.hpp/.cpp   # Direct kernel /dev/snd/pcmC0D0p ioctl driver
-│       ├── agm_fifo_player.hpp/.cpp # AGM playback via vendor agmplay subprocess + FIFO
-│       ├── dummy_player.hpp/.cpp  # Simulated audio sink (benchmarks/CI)
-│       ├── jitter_buffer.hpp/.cpp # Adaptive Jitter Buffer with PLC
-│       ├── android_helpers.hpp/.cpp # Root verification & tinymix helpers
-│       └── audio_player.hpp       # Audio player interface
+│   ├── client/                    # Android Termux ALSA Client
+│   │   ├── CMakeLists.txt
+│   │   ├── main.cpp               # Client CLI and signal handling
+│   │   ├── client.hpp/.cpp        # Client receiver engine & NAT heartbeat
+│   │   ├── alsa_player.hpp/.cpp   # ALSA player (dynamic libasound)
+│   │   ├── direct_alsa.hpp/.cpp   # Direct kernel /dev/snd/pcmC0D0p ioctl driver
+│   │   ├── agm_fifo_player.hpp/.cpp # AGM playback via vendor agmplay subprocess + FIFO
+│   │   ├── aaudio_player.hpp/.cpp # AAudio FIFO player (no root, Android 8.0+)
+│   │   ├── dummy_player.hpp/.cpp  # Simulated audio sink (benchmarks/CI)
+│   │   ├── jitter_buffer.hpp/.cpp # Adaptive Jitter Buffer with PLC
+│   │   ├── android_helpers.hpp/.cpp # Root verification & tinymix helpers
+│   │   └── audio_player.hpp       # Audio player interface
+│   └── tools/
+│       └── stream_daemon.cpp      # Standalone AAudio FIFO daemon (no root)
 ├── tests/                         # Unit tests suite
 │   ├── CMakeLists.txt
 │   ├── test_main.cpp
@@ -276,6 +360,7 @@ AudioRouter/
     ├── build_server_msvc.bat      # Windows MSVC build script
     ├── build_server_mingw.bat     # Windows MinGW build script
     ├── build_client.sh            # Linux / Android build script
+    ├── build_stream_daemon.sh     # NDK/Termux build of the AAudio stream daemon
     ├── termux_setup.sh            # Termux environment setup script
     ├── termux_run.sh              # Termux root execution script
     └── android_mixer_setup.sh     # Android ALSA mixer speaker routing helper

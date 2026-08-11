@@ -1,5 +1,6 @@
 #include "client.hpp"
 #include "alsa_player.hpp"
+#include "aaudio_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
@@ -66,8 +67,11 @@ void print_usage(const char* prog) {
               << "Options:\n"
               << "  -s, --server <ip>         Windows PC Server IP address (e.g. 192.168.43.45 or 192.168.137.1)\n"
               << "  -p, --port <port>         Server UDP port (default: 44100)\n"
-              << "  -d, --device <dev>        ALSA device name (default: 'default', 'hw:0,0', 'direct:/dev/snd/pcmC0D0p',\n"
-              << "                              'agm' = Qualcomm AGM backend 'CODEC_DMA-LPAIF_RXTX-RX-1', 'agm:<backend>')\n"
+              << "  -d, --device <dev>        Audio device (default: 'default'):\n"
+              << "                              ALSA: 'default', 'hw:0,0', 'plughw:0,0'\n"
+              << "                              Direct kernel: 'direct:/dev/snd/pcmC0D0p' or any '/dev/snd/...'\n"
+              << "                              Qualcomm AGM: 'agm' or 'agm:<backend>'\n"
+              << "                              AAudio (NO ROOT needed): 'aaudio', 'aaudio:deep', 'aaudio:voip'\n"
               << "  -l, --latency <ms>        Target Jitter Buffer latency in ms (default: 35ms)\n"
               << "  -b, --bind <iface>        Pin UDP socket to a network interface (bypasses Android VPN tunnels):\n"
               << "                              'auto' = detect physical NIC (e.g. wlan0), or specify e.g. 'wlan0'\n"
@@ -139,6 +143,12 @@ int main(int argc, char* argv[]) {
         auto cards = audiorouter::AndroidHelpers::get_proc_asound_cards();
         for (const auto& c : cards) {
             std::cout << "  " << c << "\n";
+        }
+        std::cout << "\nAAudio (no root, Android 8.0+):\n";
+        if (audiorouter::AaudioFifoPlayer::is_supported()) {
+            std::cout << "  -> available — use -d aaudio (or aaudio:deep / aaudio:voip)\n";
+        } else {
+            std::cout << "  -> not compiled in this build (needs an Android API 26+ toolchain with libaaudio)\n";
         }
         return 0;
     }
