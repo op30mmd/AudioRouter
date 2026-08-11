@@ -9,10 +9,11 @@
 namespace {
 
 // First-fill (post-reset) prefill is multiplied from the configured target and
-// clamped to [kStartupPrefillMinMs, kStartupPrefillMaxMs].
+// clamped to [kStartupPrefillMinMs, kStartupPrefillMaxMs]. The floor covers the
+// typical 100-500ms server capture warm-up gap at stream start.
 constexpr uint32_t kStartupPrefillMultiplier = 3;
-constexpr uint32_t kStartupPrefillMinMs = 120;
-constexpr uint32_t kStartupPrefillMaxMs = 250;
+constexpr uint32_t kStartupPrefillMinMs = 250;
+constexpr uint32_t kStartupPrefillMaxMs = 500;
 
 } // namespace
 
@@ -164,7 +165,12 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
             }
         }
 
-        if (buffered >= fill_target || total_valid_frames >= fill_target) {
+        // The non-contiguous escape is only for steady-state (lossy networks);
+        // during the startup fill it must accumulate twice the target so holes
+        // in the early delivery can't start the playhead into a dry-out.
+        const size_t escape_target = startup_pending_ ? (fill_target * 2) : fill_target;
+
+        if (buffered >= fill_target || total_valid_frames >= escape_target) {
             is_buffering_ = false;
             startup_pending_ = false;
             LOG_DEBUG("JitterBuffer: Pre-buffering complete (" << buffered << " frames, "
