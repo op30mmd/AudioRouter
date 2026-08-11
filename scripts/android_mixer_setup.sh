@@ -1,6 +1,9 @@
 #!/system/bin/sh
 # AudioRouter - Android Mixer / Speaker Routing Helper
 # Run with root privileges ('su') in Termux or ADB shell.
+# NOTE: audiorouter_client already applies this routing automatically at
+#       startup (AndroidHelpers::apply_speaker_routing). This script is for
+#       manual diagnostics or when the client's built-in routing is not enough.
 
 echo "================================================="
 echo " Android ALSA Speaker Routing & Mixer Config"
@@ -18,16 +21,10 @@ chmod 666 /dev/snd/* 2>/dev/null || true
 echo "[2/3] Checking ALSA sound cards..."
 cat /proc/asound/cards
 
-echo "[3/3] Attempting standard tinymix routing to speaker..."
-# Qualcomm Snapdragon common speaker routing controls
-tinymix "RX_CDC_DMA_RX_0 Audio Mixer MultiMedia1" 1 2>/dev/null || true
-tinymix "PRI_MI2S_RX Audio Mixer MultiMedia1" 1 2>/dev/null || true
-tinymix "SLIM_0_RX Audio Mixer MultiMedia1" 1 2>/dev/null || true
-tinymix "TERT_MI2S_RX Audio Mixer MultiMedia1" 1 2>/dev/null || true
-tinymix "Speaker Function" "On" 2>/dev/null || true
-tinymix "Speaker Switch" 1 2>/dev/null || true
-tinymix "SPK" 1 2>/dev/null || true
-tinymix "RX1 Digital Volume" 84 2>/dev/null || true
-tinymix "RX2 Digital Volume" 84 2>/dev/null || true
+echo "[3/3] Applying verified RX_MACRO speaker routing (Snapdragon 680)..."
+# Same controls as AndroidHelpers::apply_speaker_routing() in src/client/android_helpers.cpp
+tinymix "RX_MACRO RX2 MUX" "AIF2_PB" 2>/dev/null || true
+tinymix "RX INT2_1 MIX1 INP0" "RX2" 2>/dev/null || true
+tinymix "AUX_RDAC Switch" "1" 2>/dev/null || true
 
 echo "Routing check completed. Launch audiorouter_client now."

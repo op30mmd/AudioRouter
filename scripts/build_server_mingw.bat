@@ -6,7 +6,11 @@ echo =================================================
 echo  Building AudioRouter Windows Server (MinGW)
 echo =================================================
 
-g++ -std=c++17 -O3 -Wall -Wextra ^
+if not exist bin (
+    mkdir bin
+)
+
+g++ -std=c++23 -O3 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -pthread ^
     -Isrc\common -Isrc\server ^
     src\server\main.cpp ^
     src\server\server.cpp ^

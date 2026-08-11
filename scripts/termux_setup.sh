@@ -33,7 +33,7 @@ pkg update -y || true
 
 # Install required build packages
 echo "[2/4] Installing compiler and ALSA tools..."
-pkg install -y clang make alsa-lib alsa-utils sudo || true
+pkg install -y clang make alsa-utils || true
 
 # Build AudioRouter Client if not present
 if [ -n "$BIN_PATH" ]; then

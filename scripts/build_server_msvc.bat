@@ -17,7 +17,7 @@ if %ERRORLEVEL% NEQ 0 (
     cmake -G "Visual Studio 16 2019" -A x64 ..
 )
 
-cmake --build . --config Release
+cmake --build . --config Release --target audiorouter_server
 if %ERRORLEVEL% NEQ 0 (
     echo Build failed.
     exit /b %ERRORLEVEL%
@@ -31,6 +31,12 @@ if not exist bin (
 copy build_msvc\src\server\Release\audiorouter_server.exe bin\ >nul 2>&1
 if not exist bin\audiorouter_server.exe (
     copy build_msvc\bin\Release\audiorouter_server.exe bin\ >nul 2>&1
+)
+
+if not exist bin\audiorouter_server.exe (
+    echo Error: audiorouter_server.exe not found after build.
+    echo Looked in build_msvc\src\server\Release\ and build_msvc\bin\Release\.
+    exit /b 1
 )
 
 echo.
