@@ -354,15 +354,63 @@ bool UdpSocket::bind_to_interface(const std::string& ifname) {
 
 std::string UdpSocket::pick_physical_interface() {
     std::vector<NetworkInterfaceInfo> ifaces = get_local_interfaces();
+
+    // Preference order for physical WiFi interfaces on Android
+    // wlan0 is primary STA, swlan0 is often hotspot AP secondary, p2p0 is WiFi-Direct
+    // We prefer wlan0 > swlan0 > p2p0 > wlan* > any 192.168.x.x interface
+    // This fixes the Bengal diagnostic where swlan0 was auto-selected but wlan0 DOWN,
+    // and where 10.x VPN IP was used with swlan0 binding causing handshake to fail / client to die
+    auto is_wlan_like = [](const std::string& name) {
+        return name.rfind("wlan", 0) == 0 || name.rfind("swlan", 0) == 0 || 
+               name.rfind("p2p", 0) == 0 || name.rfind("wifi", 0) == 0;
+    };
+
+    // First pass: look for wlan0 specifically with 192.168.x.x (hotspot typical)
     for (const auto& info : ifaces) {
         if (info.is_loopback || !info.is_up) continue;
-
+        if (info.name == "wlan0" && info.ip_address.rfind("192.168.", 0) == 0) {
+            return info.name;
+        }
+    }
+    // Second: any interface with 192.168.43.x (Android hotspot) or 192.168.137.x (Windows hotspot) that is UP and wlan-like
+    for (const auto& info : ifaces) {
+        if (info.is_loopback || !info.is_up) continue;
+        if (!is_wlan_like(info.name)) continue;
+        if (info.ip_address.rfind("192.168.43.", 0) == 0 || info.ip_address.rfind("192.168.137.", 0) == 0) {
+            return info.name;
+        }
+    }
+    // Third: preferred list order wlan0, swlan0, p2p0, wlan1, etc., UP and not VPN/mobile
+    const std::vector<std::string> preferred = {"wlan0", "swlan0", "p2p0", "wlan1", "wlan2"};
+    for (const auto& pref : preferred) {
+        for (const auto& info : ifaces) {
+            if (info.is_loopback || !info.is_up) continue;
+            if (info.name == pref) {
+                // Skip if IP is empty or 0.0.0.0
+                if (info.ip_address == "0.0.0.0" || info.ip_address.empty()) continue;
+                // Skip carrier/mobile IPs (26.x, 107.x seen on rmnet_data)
+                if (info.ip_address.rfind("26.", 0) == 0) continue;
+                if (info.ip_address.rfind("107.", 0) == 0) continue;
+                return info.name;
+            }
+        }
+    }
+    // Fourth: any wlan-like UP interface with valid IP
+    for (const auto& info : ifaces) {
+        if (info.is_loopback || !info.is_up) continue;
+        if (!is_wlan_like(info.name)) continue;
+        if (info.ip_address == "0.0.0.0" || info.ip_address.empty()) continue;
+        if (info.ip_address.rfind("26.", 0) == 0) continue;
+        if (info.ip_address.rfind("107.", 0) == 0) continue;
+        return info.name;
+    }
+    // Fifth: original logic - skip virtual / tunnel / cellular
+    for (const auto& info : ifaces) {
+        if (info.is_loopback || !info.is_up) continue;
         const std::string& n = info.name;
-        // Skip virtual / tunnel / cellular-datalink interfaces: Android VPNs
-        // are tunNN, hotspot clients use rmnet/ppp, tunnels use sit/gre/ip_vti.
         const char* virtual_prefixes[] = {"lo",  "tun", "tap", "ppp", "rmnet",
                                           "dum", "sit", "gre", "vti", "ip6tnl",
-                                          "ip_vti", "wlan", "wifi"};
+                                          "ip_vti"};
         bool virtual_iface = false;
         for (const char* p : virtual_prefixes) {
             if (n.rfind(p, 0) == 0) {
@@ -370,19 +418,16 @@ std::string UdpSocket::pick_physical_interface() {
                 break;
             }
         }
-        // "wlan" is in the exclusion list only so the loop below prefers real
-        // Ethernet; but on phones there is no Ethernet, so accept wlanNN here.
-        if (virtual_iface) {
-            if (n.rfind("wlan", 0) == 0 || n.rfind("wifi", 0) == 0) virtual_iface = false;
-        }
         if (virtual_iface) continue;
-
         return n;
     }
-    // Fallback: any non-loopback, up, IPv4-bearing interface.
+    // Fallback: any non-loopback, up, IPv4-bearing interface not VPN/mobile
     for (const auto& info : ifaces) {
         if (info.is_loopback || !info.is_up) continue;
         if (info.ip_address == "0.0.0.0") continue;
+        if (info.name.rfind("tun", 0) == 0) continue;
+        if (info.name.rfind("rmnet", 0) == 0) continue;
+        if (info.ip_address.rfind("10.", 0) == 0 && info.name == "tun0") continue; // VPN 10.x on tun0
         return info.name;
     }
     return "";

@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
@@ -64,6 +65,11 @@ AgmFifoPlayer::~AgmFifoPlayer() {
 bool AgmFifoPlayer::open(const AudioConfig& config, const std::string& device_name) {
 #if defined(__linux__) || defined(__ANDROID__)
     if (is_open_) close();
+
+    // Ignore SIGPIPE - writing to FIFO after agmplay exits would otherwise kill the client
+    // with SIGPIPE (default action: terminate). This matches the "dies in middle" bug
+    // observed on Bengal where agmplay backend exits after opening FIFO.
+    ::signal(SIGPIPE, SIG_IGN);
 
     config_ = config;
     backend_ = "CODEC_DMA-LPAIF_RXTX-RX-1";
@@ -309,7 +315,26 @@ size_t AgmFifoPlayer::write_frames(const void* pcm_data, size_t num_frames) {
         }
         if (n < 0 && errno == EINTR) continue;
         // EPIPE/EOF: agmplay exited (or never started consuming).
-        LOG_DEBUG("AgmFifoPlayer: FIFO write failed: " << (n < 0 ? std::strerror(errno) : "EOF"));
+        // Check if agmplay subprocess is still alive
+        bool agm_alive = true;
+        if (agmplay_pid_ > 0) {
+            int status = 0;
+            pid_t result = ::waitpid(agmplay_pid_, &status, WNOHANG);
+            if (result == agmplay_pid_) {
+                agm_alive = false;
+                int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                int sig = WIFSIGNALED(status) ? WTERMSIG(status) : -1;
+                LOG_WARN("AgmFifoPlayer: agmplay subprocess (pid " << agmplay_pid_ << ") died - exit_code=" << exit_code << " signal=" << sig << " backend='" << backend_ << "' may be wrong for this device. Try agm:CODEC_DMA-LPAIF_RXTX-RX-0, RX-1, RX-2");
+                // Mark as not open to trigger fallback logic, but don't close yet - let supervisor handle
+                // For now, keep is_open_ true but return 0 so playback thread sleeps and retries
+                agmplay_pid_ = -1;
+            }
+        }
+        if (!agm_alive) {
+            LOG_WARN("AgmFifoPlayer: FIFO write failed because agmplay died (EPIPE). Returning 0, client will keep trying / fallback may kick in");
+        } else {
+            LOG_WARN("AgmFifoPlayer: FIFO write failed: " << (n < 0 ? std::strerror(errno) : "EOF") << " (agmplay may still be alive but not consuming)");
+        }
         return 0;
     }
     return num_frames;

@@ -117,6 +117,9 @@ int main(int argc, char* argv[]) {
     // Register signal handlers for clean disconnect
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    // Ignore SIGPIPE - writing to AGM FIFO after agmplay dies would otherwise kill the client
+    // This fixes "dies in middle of execution" on Bengal where agmplay backend may exit unexpectedly
+    std::signal(SIGPIPE, SIG_IGN);
 
     audiorouter::AudioRouterClient client(config);
 
