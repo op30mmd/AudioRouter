@@ -316,14 +316,20 @@ bool AgmPlayer::open(const AudioConfig& config, const std::string& device_name) 
     std::memset(&cfg, 0, sizeof(cfg));
     cfg.channels = 1;  // mono speaker backend
     cfg.rate = config.sample_rate > 0 ? static_cast<unsigned int>(config.sample_rate) : 48000;
-    cfg.period_size = 240;  // 5 ms @ 48 kHz
+    // Buffer geometry mirrors the vendor's agmplay (period 1024, 4 periods,
+    // zero thresholds). The AGM session configures the ADSP graph's
+    // shared-memory data endpoint from these values (gsl configure
+    // read/write params); a smaller period/ring (e.g. 240/960 with nonzero
+    // thresholds) opens fine but the graph never pulls data and pcm_write
+    // blocks forever (observed: Played stuck at 960 frames, no sound).
+    cfg.period_size = 1024;
     cfg.period_count = 4;
     cfg.format = PCM_FORMAT_S16_LE;
-    cfg.start_threshold = cfg.period_size;
-    cfg.stop_threshold = cfg.period_size * cfg.period_count;
+    cfg.start_threshold = 0;
+    cfg.stop_threshold = 0;
     cfg.silence_threshold = 0;
     cfg.silence_size = 0;
-    cfg.avail_min = cfg.period_size;
+    cfg.avail_min = 0;
 
     LOG_INFO("AgmPlayer: opening AGM mixer plugin on card " << kAgmCard << "...");
     mixer_impl_ = api_->mixer_open(kAgmCard);
