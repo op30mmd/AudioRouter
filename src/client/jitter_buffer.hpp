@@ -58,13 +58,17 @@ private:
     AudioConfig config_;
     uint32_t target_latency_ms_;
     size_t target_buffer_frames_;
-    // Prefill used for the next buffering fill. Starts at the (larger)
-    // startup prefill after a reset, grows when playback runs dry, and
-    // decays back toward the configured target while delivery stays steady.
+    // Larger prefill required for the first fill after a reset: packet delivery
+    // is often slower than real-time during the first seconds of a stream
+    // (network ramp-up, capture warm-up), so a shallow prefill runs dry.
     size_t startup_target_frames_;
-    size_t effective_target_frames_;
     bool startup_pending_;
-    uint64_t last_decay_time_us_;
+    // Stability gate: buffering exits only after this many consecutive,
+    // gap-free packet arrivals, so playback never restarts into another
+    // delivery stall (which caused repeated underruns during ramp-up).
+    size_t hole_free_run_;
+    uint32_t last_arrived_seq_;
+    bool has_last_arrived_seq_;
 
     std::vector<PacketSlot> slots_;
     uint32_t next_play_seq_;
