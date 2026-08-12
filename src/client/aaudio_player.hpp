@@ -99,10 +99,11 @@ private:
     bool open_stream_and_probe(bool quiet);
     void pump_loop();
     void configure_builder(void* builder);   // AAudioStreamBuilder*
-    // Blocks (up to timeout_ms) until the stream is fully STARTED. Caller
-    // must hold stream_mutex_. Returns false on timeout or if the stream
-    // went DISCONNECTED/CLOSED/UNINITIALIZED.
-    bool wait_for_start_locked(int timeout_ms);
+    // Blocks (up to timeout_ms) until the stream is fully STARTED. Issues
+    // requestStart once, then polls; on failure fills fail_reason with the
+    // stream state and the requestStart result. Caller must hold
+    // stream_mutex_.
+    bool wait_for_start_locked(int timeout_ms, std::string* fail_reason);
     // Verifies the stream's data path is actually running: writes a small
     // silence chunk (retrying over a window - the clock model ramps after
     // STARTED) and checks that the device consumes it (framesRead advances or

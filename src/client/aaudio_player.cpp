@@ -56,8 +56,9 @@ constexpr int kWritePollMs = 50;
 constexpr uint64_t kMinRebuildIntervalMs = 1000;
 
 // How long open() waits for the stream to actually start (requestStart is
-// asynchronous) before declaring the stream wedged.
-constexpr int kStartWaitMs = 1500;
+// asynchronous; slow HALs/DSP bring-up can take a couple of seconds on first
+// use) before declaring the stream wedged.
+constexpr int kStartWaitMs = 2000;
 
 // The readiness probe may need several attempts: right after STARTED the
 // AAudio clock model is still ramping and the first write(s) can return 0 on
@@ -523,10 +524,17 @@ void AaudioFifoPlayer::configure_builder(void* builder_ptr) {
                                          : AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
 }
 
-bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms) {
-    if (stream_ == nullptr) return false;
+bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms, std::string* fail_reason) {
+    if (stream_ == nullptr) {
+        if (fail_reason) *fail_reason = "no stream";
+        return false;
+    }
     auto* stream = static_cast<AAudioStream*>(stream_);
 
+    // requestStart() is asynchronous; issue it once and poll. Re-issuing it
+    // every 50 ms (as before) can itself return errors while the stream is
+    // STARTING and never helps the state machine along.
+    aaudio_result_t start_result = AAudioStream_requestStart(stream);
     const uint64_t deadline = get_time_ms() + timeout_ms;
     while (get_time_ms() < deadline) {
         const aaudio_stream_state_t state = AAudioStream_getState(stream);
@@ -536,13 +544,22 @@ bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms) {
         if (state == AAUDIO_STREAM_STATE_DISCONNECTED ||
             state == AAUDIO_STREAM_STATE_CLOSED ||
             state == AAUDIO_STREAM_STATE_UNINITIALIZED) {
-            return false;  // dead stream, no point waiting
+            if (fail_reason) {
+                *fail_reason = "stream went dead while starting (state=" +
+                               std::to_string(static_cast<int>(state)) +
+                               ", start_result=" +
+                               std::to_string(static_cast<int>(start_result)) + ")";
+            }
+            return false;
         }
-        // STARTING / OPEN / UNKNOWN: keep (re)issuing the start request and
-        // poll. AAudioStream_write returns 0 until the stream is STARTED, so
-        // open() must not proceed before this.
-        AAudioStream_requestStart(stream);
+        // Still STARTING/OPEN: wait for the async transition.
         sleep_ms(50);
+    }
+    if (fail_reason) {
+        *fail_reason = "never STARTED within " + std::to_string(timeout_ms) +
+                       " ms (state=" +
+                       std::to_string(static_cast<int>(AAudioStream_getState(stream))) +
+                       ", start_result=" + std::to_string(static_cast<int>(start_result)) + ")";
     }
     return false;
 }
@@ -590,20 +607,20 @@ bool AaudioFifoPlayer::open_stream_and_probe(bool quiet) {
     bool ready = false;
     {
         std::lock_guard<std::mutex> lock(stream_mutex_);
-        ready = wait_for_start_locked(kStartWaitMs);
+        ready = wait_for_start_locked(kStartWaitMs, &fail_reason);
     }
-    ready = ready && probe_stream_ready(&fail_reason);
+    if (ready) ready = probe_stream_ready(&fail_reason);
     if (!ready) {
-        report("WARN", "stream did not start rendering within " + std::to_string(kStartWaitMs) +
+        report("WARN", "stream did not become ready within " + std::to_string(kStartWaitMs) +
                            " ms (" + fail_reason + "); retrying with deep-buffer performance "
                            "mode");
         {
             std::lock_guard<std::mutex> lock(stream_mutex_);
             deep_retry_ = true;
             rebuild_stream_locked();
-            ready = stream_ != nullptr && wait_for_start_locked(kStartWaitMs);
+            ready = stream_ != nullptr && wait_for_start_locked(kStartWaitMs, &fail_reason);
         }
-        ready = ready && probe_stream_ready(&fail_reason);
+        if (ready) ready = probe_stream_ready(&fail_reason);
     }
     if (!ready) {
         report("ERROR",
