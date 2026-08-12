@@ -104,10 +104,12 @@ private:
     // went DISCONNECTED/CLOSED/UNINITIALIZED.
     bool wait_for_start_locked(int timeout_ms);
     // Verifies the stream's data path is actually running: writes a small
-    // silence chunk and checks that the device consumes it (framesRead
-    // advances or a valid timestamp appears). Non-blocking except for the
-    // probe write. Caller must hold stream_mutex_.
-    bool probe_stream_ready();
+    // silence chunk (retrying over a window - the clock model ramps after
+    // STARTED) and checks that the device consumes it (framesRead advances or
+    // a valid timestamp appears). On failure fills fail_reason with the
+    // diagnostic detail (state, write results, frame counters). Caller must
+    // hold stream_mutex_.
+    bool probe_stream_ready(std::string* fail_reason);
     bool ensure_stream_started_locked();
     bool rebuild_stream_locked();
     bool create_fifo();

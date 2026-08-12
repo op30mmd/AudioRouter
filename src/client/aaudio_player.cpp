@@ -56,12 +56,20 @@ constexpr int kWritePollMs = 50;
 constexpr uint64_t kMinRebuildIntervalMs = 1000;
 
 // How long open() waits for the stream to actually start (requestStart is
-// asynchronous) and for the probe write to be consumed before declaring the
-// stream wedged.
-constexpr int kStartWaitMs = 1000;
+// asynchronous) before declaring the stream wedged.
+constexpr int kStartWaitMs = 1500;
 
-// How long the probe waits for the device to consume the probe chunk.
-constexpr int kProbeWaitMs = 1000;
+// The readiness probe may need several attempts: right after STARTED the
+// AAudio clock model is still ramping and the first write(s) can return 0 on
+// a perfectly healthy stream. Retry for this long before giving up.
+constexpr int kProbeWaitMs = 2000;
+
+// Per-attempt write timeout for the probe (short: we retry quickly).
+constexpr int64_t kProbeWriteTimeoutNs = 100000000LL;
+
+// Once a probe chunk is accepted, this long is allowed for the device to
+// actually consume it (framesRead advances or a timestamp appears).
+constexpr int kProbeConsumeWaitMs = 500;
 
 // How long the parent waits for the forked AAudio helper to report ready.
 constexpr int kHelperReadyTimeoutMs = 10000;
@@ -578,29 +586,32 @@ bool AaudioFifoPlayer::open_stream_and_probe(bool quiet) {
     // write timeouts forever while the FIFO fills and the jitter buffer
     // overflows. Retry once with the deep-buffer performance mode (legacy
     // AudioTrack path) before giving up.
+    std::string fail_reason;
     bool ready = false;
     {
         std::lock_guard<std::mutex> lock(stream_mutex_);
         ready = wait_for_start_locked(kStartWaitMs);
     }
-    ready = ready && probe_stream_ready();
+    ready = ready && probe_stream_ready(&fail_reason);
     if (!ready) {
         report("WARN", "stream did not start rendering within " + std::to_string(kStartWaitMs) +
-                           " ms; retrying with deep-buffer performance mode");
+                           " ms (" + fail_reason + "); retrying with deep-buffer performance "
+                           "mode");
         {
             std::lock_guard<std::mutex> lock(stream_mutex_);
             deep_retry_ = true;
             rebuild_stream_locked();
             ready = stream_ != nullptr && wait_for_start_locked(kStartWaitMs);
         }
-        ready = ready && probe_stream_ready();
+        ready = ready && probe_stream_ready(&fail_reason);
     }
     if (!ready) {
         report("ERROR",
-               "AAudio cannot render on this device (the stream starts but the audio data "
-               "path never runs - the HAL/MMAP output is not consuming). Falling back to "
-               "AGM/ALSA. You can also try '-d agm', restart Android audio ('stop "
-               "audioserver && start audioserver'), or reboot the device.");
+               "AAudio cannot render on this device (" + fail_reason +
+                   "). The stream starts but the audio data path never runs - the "
+                   "HAL/MMAP output is not consuming. Falling back to AGM/ALSA. You can also "
+                   "try '-d agm', restart Android audio ('stop audioserver && start "
+                   "audioserver'), or reboot the device.");
         {
             std::lock_guard<std::mutex> lock(stream_mutex_);
             if (stream_ != nullptr) {
@@ -613,35 +624,69 @@ bool AaudioFifoPlayer::open_stream_and_probe(bool quiet) {
     return true;
 }
 
-bool AaudioFifoPlayer::probe_stream_ready() {
+bool AaudioFifoPlayer::probe_stream_ready(std::string* fail_reason) {
     std::lock_guard<std::mutex> lock(stream_mutex_);
-    if (stream_ == nullptr) return false;
+    if (stream_ == nullptr) {
+        if (fail_reason) *fail_reason = "no stream";
+        return false;
+    }
     auto* stream = static_cast<AAudioStream*>(stream_);
+    const size_t bytes_per_frame = config_.bytes_per_frame();
+    if (bytes_per_frame == 0) {
+        if (fail_reason) *fail_reason = "invalid format";
+        return false;
+    }
 
     // Write one small chunk of silence and watch for consumption. This is the
     // correct readiness test for BOTH paths: on the MMAP path a dead output
     // returns 0 from the write (or never advances framesRead), while on the
     // legacy AudioTrack path the device only starts consuming once data is
-    // actually written - so probing timestamps on an idle stream would
-    // falsely reject a healthy legacy stream.
-    const size_t bytes_per_frame = config_.bytes_per_frame();
-    if (bytes_per_frame == 0) return false;
+    // actually written - so probing an idle stream would falsely reject a
+    // healthy legacy stream. Immediately after STARTED the clock model is
+    // still ramping and the first write(s) can return 0 even on a healthy
+    // stream, so retry over a window instead of giving up after one attempt.
     constexpr int32_t kProbeFrames = 240;  // 5 ms
     std::vector<int16_t> silence(static_cast<size_t>(kProbeFrames) * config_.channels, 0);
-    const aaudio_result_t written =
-        AAudioStream_write(stream, silence.data(), kProbeFrames, kWriteTimeoutNs);
-    if (written <= 0) return false;
 
     const uint64_t deadline = get_time_ms() + kProbeWaitMs;
+    int attempts = 0;
+    aaudio_result_t last_write = 0;
     while (get_time_ms() < deadline) {
-        if (AAudioStream_getFramesRead(stream) > 0) return true;  // device consumed
-        int64_t position = 0;
-        int64_t time_ns = 0;
-        if (AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &position, &time_ns) == AAUDIO_OK &&
-            time_ns > 0) {
-            return true;  // data path is producing timestamps
+        ++attempts;
+        last_write =
+            AAudioStream_write(stream, silence.data(), kProbeFrames, kProbeWriteTimeoutNs);
+        if (last_write > 0) {
+            // Chunk accepted. Wait for the device to consume it.
+            const uint64_t consume_deadline = get_time_ms() + kProbeConsumeWaitMs;
+            while (get_time_ms() < consume_deadline) {
+                if (AAudioStream_getFramesRead(stream) > 0) return true;  // device consumed
+                int64_t position = 0;
+                int64_t time_ns = 0;
+                if (AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &position, &time_ns) ==
+                        AAUDIO_OK &&
+                    time_ns > 0) {
+                    return true;  // data path is producing timestamps
+                }
+                sleep_ms(50);
+            }
+            // Accepted but never consumed: the path may have dropped; retry.
+            AAudioStream_requestStart(stream);
+        } else {
+            if (last_write == AAUDIO_ERROR_DISCONNECTED) break;  // dead, no point
+            // Write blocked/failed: the stream is still ramping (clock model
+            // starting). Re-request start and retry.
+            AAudioStream_requestStart(stream);
         }
         sleep_ms(50);
+    }
+
+    if (fail_reason) {
+        *fail_reason = "no consumption after " + std::to_string(attempts) +
+                       " probe writes (last write=" +
+                       std::to_string(static_cast<int>(last_write)) +
+                       ", state=" + std::to_string(static_cast<int>(AAudioStream_getState(stream))) +
+                       ", framesWritten=" + std::to_string(AAudioStream_getFramesWritten(stream)) +
+                       ", framesRead=" + std::to_string(AAudioStream_getFramesRead(stream)) + ")";
     }
     return false;
 }
