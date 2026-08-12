@@ -3,7 +3,15 @@
 # Usage: ./scripts/termux_run.sh [-s SERVER_IP] [-p PORT] [CLIENT_ARGS...]
 # Backward-compatible: ./scripts/termux_run.sh [SERVER_IP] [PORT] [CLIENT_ARGS...]
 # e.g. ./scripts/termux_run.sh 10.16.211.80 44100 -d agm -b auto
-#      ./scripts/termux_run.sh -s 10.16.211.80 -b auto -d agm
+#      ./scripts/termux_run.sh -s 10.58.30.80 -d aaudio -b auto
+#
+# The client is ALWAYS launched through its ABSOLUTE path, wrapped in
+#     su -c "/data/data/com.termux/files/home/AudioRouter/bin/audiorouter_client <args>"
+# This is required for the AAudio build: it links /system/lib64/libaaudio.so
+# by absolute path, which only the Android/system dynamic linker resolves.
+# Launching the binary from the Termux shell environment fails at runtime
+# with linker errors, so no LD_LIBRARY_PATH/HOME/chmod preamble is injected
+# into the su command - the plain absolute-path invocation is what works.
 
 SERVER_IP=""
 PORT="44100"
@@ -120,15 +128,34 @@ if [ -z "$SERVER_IP" ]; then
     exit 1
 fi
 
-echo "Connecting to Windows Server at $SERVER_IP:$PORT..."
+# Resolve the binary to a plain absolute path (su -c needs one).
+ABS_BIN="$BIN_PATH"
+if [ "${ABS_BIN#/}" = "$ABS_BIN" ]; then
+    ABS_BIN="$(cd "$(dirname "$ABS_BIN")" && pwd)/$(basename "$ABS_BIN")"
+fi
 
-# Run with root if possible
+# Quote a single argument for the mksh command string passed to su -c.
+sh_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Build the exact command: su -c "/abs/path/audiorouter_client <args>"
+CMD="$ABS_BIN -s $(sh_quote "$SERVER_IP") -p $(sh_quote "$PORT")"
+for a in "${CLIENT_ARGS[@]}"; do
+    CMD="$CMD $(sh_quote "$a")"
+done
+
+echo "Connecting to Windows Server at $SERVER_IP:$PORT..."
+echo "Running: $CMD"
+
 if [ "$(id -u)" -ne 0 ]; then
+    if ! command -v su >/dev/null 2>&1; then
+        echo "Error: not running as root and 'su' is not available. Run 'su' first or install su." >&2
+        exit 1
+    fi
     echo "Requesting root privileges via su..."
-    SU_CMD="chmod 666 /dev/snd/* 2>/dev/null; export HOME=\${HOME:-/data/data/com.termux/files/home}; export LD_LIBRARY_PATH=/vendor/lib64:\$LD_LIBRARY_PATH; exec $(printf '%q ' "$BIN_PATH" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}")"
-    su -c "$SU_CMD"
+    su -c "$CMD"
 else
-    chmod 666 /dev/snd/* 2>/dev/null || true
-    export LD_LIBRARY_PATH=/vendor/lib64:$LD_LIBRARY_PATH
-    "$BIN_PATH" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
+    # Already root (Android/system shell): launch the absolute path directly.
+    exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
 fi
