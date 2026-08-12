@@ -183,9 +183,16 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
 void AaudioFifoPlayer::close() {
 #if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     stop_pump_.store(true);
-    // Close the AAudio stream FIRST, before joining the pump: a write stuck
-    // on a dead output path is unblocked by closing the stream, otherwise the
-    // join below would hang shutdown.
+    // Let the pump finish any in-flight AAudioStream_write() before we close
+    // the stream: the real libaaudio is not safe against close-during-write
+    // from another thread (segfault on some HALs - seen on-device right after
+    // a server-initiated disconnect). The write is bounded by its 500 ms
+    // timeout, so this wait is short. If a pathological HAL never returns
+    // from write(), the backstop below closes the stream anyway to unblock
+    // it (matching the previous behavior).
+    for (int i = 0; i < 60 && pump_writing_.load(); ++i) {
+        sleep_ms(10);
+    }
     {
         std::lock_guard<std::mutex> lock(stream_mutex_);
         if (stream_ != nullptr) {
@@ -476,9 +483,11 @@ void AaudioFifoPlayer::pump_loop() {
                 if (!ensure_stream_started_locked()) continue;
             }
 
+            pump_writing_.store(true);
             const aaudio_result_t frames_written =
                 AAudioStream_write(stream, buffer.data(), static_cast<int32_t>(frames_available),
                                    kWriteTimeoutNs);
+            pump_writing_.store(false);
 
             if (frames_written < 0 || static_cast<size_t>(frames_written) < frames_available) {
                 // The write failed or only partially completed (timeout): the

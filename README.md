@@ -148,7 +148,7 @@ End-to-end audio delay = jitter buffer + backend delay:
 | Component | Typical | Worst case | Bound by |
 |-----------|---------|------------|----------|
 | Jitter buffer | target `-l` (default 35 ms) | startup prefill 120–500 ms (one-time) | `push_packet` prefill / stability gate |
-| FIFO (AAudio pipe) | ~0 ms (drained in real time; stale backlog discarded on stall recovery / rebuild) | **341 ms** transient (64 KB @ 192 KB/s, only while a stall is active) | `kFifoSizeBytes` + pump drain-on-recovery |
+| FIFO (AAudio pipe) | ~40 ms (playback thread self-paced against the backend; stale backlog discarded on stall recovery / rebuild) | **341 ms** transient (64 KB @ 192 KB/s, only while a stall is active) | `kFifoSizeBytes` + playback pacing + pump drain-on-recovery |
 | AAudio in-stream | ≤ 40 ms (capacity capped at 1920 frames on LOW_LATENCY); deep mode uses the HAL default | 40 ms | `setBufferCapacityInFrames` |
 | Network / UDP | RTT + jitter (see status line) | — | — |
 
@@ -170,13 +170,17 @@ Three client-specific latency controls keep the AAudio backend tight:
   network burst absorption. The stream_daemon keeps its original 1 MB
   for external `cat`/ffmpeg feeders; the client's smaller pipe caps how
   much stale audio can be queued during a stall.
+- **Playback self-pacing**: the client's playback thread is otherwise
+  unpaced — it dumps the jitter prefill burst into the pipe faster than
+  real time, and the pipe stays permanently full (the writer refills at
+  exactly the pump's drain rate), which showed up as a constant
+  `Audio: 350 ms` on device. The thread now sleeps when the backend
+  reports > 60 ms buffered (AAudio only), holding the pipe near ~40 ms.
 - **FIFO drain on recovery**: whenever the pump transitions from stalled
   to consuming — the startup ramp (writes block while the stream is
   STARTING, priming the pipe full), a mid-stream stall, or a stream
   rebuild after a disconnect — everything queued in the pipe is
-  discarded so playback resumes at live audio. Without this, the pipe
-  stays permanently full (the writer refills at exactly the pump's drain
-  rate), which showed up as a constant `Audio: 350 ms` on device.
+  discarded so playback resumes at live audio.
 
 ### 3.5 Heartbeat / keep-alive
 A 1 s heartbeat thread sends `HEARTBEAT_PING` with buffer level and loss counters

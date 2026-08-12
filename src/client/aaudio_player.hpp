@@ -96,6 +96,11 @@ private:
     std::thread pump_thread_;
     std::atomic<bool> stop_pump_{false};
     std::atomic<bool> is_open_{false};
+    // True while the pump thread is inside AAudioStream_write(). close()
+    // waits for this (bounded) before closing the stream, so the AAudio
+    // library is never accessed concurrently from two threads during
+    // teardown (the real libaaudio can crash on close-during-write).
+    std::atomic<bool> pump_writing_{false};
     // Frames inside the AAudio stream (written - read); updated by the pump.
     std::atomic<int64_t> frames_in_flight_{0};
     // Timestamp of the last stream recreation (rate limit for rebuilds).

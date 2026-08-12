@@ -8,6 +8,7 @@
 #include <csignal>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -107,6 +108,18 @@ void print_usage(const char* prog) {
 int main(int argc, char* argv[]) {
 #if defined(_WIN32)
     setup_console();
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+#else
+    // Install signal handlers FIRST so Ctrl+C / kill always take the graceful
+    // path (sigaction: reliable handler + no SA_RESTART so blocking calls
+    // return promptly).
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    ::sigaction(SIGINT, &sa, nullptr);
+    ::sigaction(SIGTERM, &sa, nullptr);
 #endif
     audiorouter::ServerConfig config;
     bool list_ifaces_only = false;
@@ -158,13 +171,6 @@ int main(int argc, char* argv[]) {
     }
 
     print_banner();
-
-    // Register signal handlers
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-#if defined(_WIN32)
-    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
-#endif
 
     audiorouter::AudioRouterServer server(config);
 

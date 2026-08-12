@@ -751,14 +751,29 @@ void AudioRouterClient::audio_playback_thread() {
             if (player && player->is_open()) {
                 size_t written = player->write_frames(play_buffer.data(), frames);
                 if (written > 0) {
-                    std::lock_guard<std::mutex> lock(stats_mutex_);
-                    stats_.frames_played += written;
-                    // Sample the real backend delay (pipe + in-stream buffers)
-                    // so the status line shows the actual audio latency on
-                    // top of the jitter buffer.
-                    const uint32_t rate = audio_config_.sample_rate > 0 ? audio_config_.sample_rate : 48000;
-                    stats_.audio_backend_delay_ms =
-                        static_cast<uint32_t>((player->get_buffer_delay_frames() * 1000ULL) / rate);
+                    uint32_t backend_ms = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex_);
+                        stats_.frames_played += written;
+                        // Sample the real backend delay (pipe + in-stream buffers)
+                        // so the status line shows the actual audio latency on
+                        // top of the jitter buffer.
+                        const uint32_t rate = audio_config_.sample_rate > 0 ? audio_config_.sample_rate : 48000;
+                        stats_.audio_backend_delay_ms =
+                            static_cast<uint32_t>((player->get_buffer_delay_frames() * 1000ULL) / rate);
+                        backend_ms = stats_.audio_backend_delay_ms;
+                    }
+                    // Self-pace against the device for the AAudio backend: the
+                    // pipe between the playback thread and the AAudio pump can
+                    // otherwise accumulate a full backlog (the jitter prefill
+                    // burst + the STARTING ramp), which shows up as a constant
+                    // multi-hundred-ms audio delay. Sleep so the backend drains
+                    // back toward ~40 ms. Other backends (ALSA/AGM/dummy)
+                    // report ~0 buffered delay and are unaffected.
+                    if (backend_ms > 60 &&
+                        player->get_device_name().rfind("aaudio", 0) == 0) {
+                        sleep_ms(backend_ms - 40);
+                    }
                 } else {
                     // Audio device returned 0 frames written or was busy; pace the thread
                     sleep_ms(fallback_sleep_ms);

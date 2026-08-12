@@ -16,11 +16,6 @@
 
 namespace {
     std::atomic<bool> g_shutdown_requested{false};
-
-    void signal_handler(int sig) {
-        (void)sig;
-        g_shutdown_requested.store(true);
-    }
 }
 
 int get_terminal_width() {
@@ -67,13 +62,11 @@ void print_banner() {
  ██║  ██║╚██████╔╝██████╔╝██║╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝
 )" << reset;
-    } else if (term_width >= 52) {
+    } else if (term_width >= 44) {
         std::cout << cyan << R"(
-   _    _        _     _                     _
-  / \  | |_   __| |   (_)_ __ ___  ___  _ __| |_
- / _ \ | \ \ / / _` |   | | '__/ _ \/ _ \| '__| __|
-/ ___ \| |\ V / (_| |   | | | | (_) (_) | |  | |_
-/_/   \_\_| \_/ \__,_|   |_|_|  \___/\___/|_|   \__|
+  ╔═╗╦ ╦╔╦╗╦╔═╗╦═╗╔═╗╦ ╦╔╦╗╔═╗╦═╗
+  ╠═╣║ ║║ ║║╠═╣╠╦╝║ ║║ ║ ║║╣╠╦╝
+  ╩ ╩╚═╝╚═╝╩╩ ╩╩╚═╚═╝╚═╝ ╩╚═╝╩╚═
 )" << reset;
     } else {
         std::cout << cyan << bold << "AudioRouter" << reset;
@@ -122,6 +115,26 @@ void print_usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+    // Install signal handlers FIRST, before anything else, so Ctrl+C / kill
+    // always reach the graceful path (and never interrupt a thread mid-
+    // shutdown in a way that could crash).
+    {
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = [](int) { g_shutdown_requested.store(true); };
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;  // no SA_RESTART: interrupt blocking calls promptly
+        ::sigaction(SIGINT, &sa, nullptr);
+        ::sigaction(SIGTERM, &sa, nullptr);
+        struct sigaction sa_ign;
+        std::memset(&sa_ign, 0, sizeof(sa_ign));
+        sa_ign.sa_handler = SIG_IGN;
+        sigemptyset(&sa_ign.sa_mask);
+        // The AAudio FIFO's reader can disappear (agmplay restart); a SIGPIPE
+        // on a FIFO write must not take the client down.
+        ::sigaction(SIGPIPE, &sa_ign, nullptr);
+    }
+
     audiorouter::ClientConfig config;
     bool list_devs = false;
 
@@ -181,13 +194,6 @@ int main(int argc, char* argv[]) {
     }
 
     print_banner();
-
-    // Register signal handlers for clean disconnect
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-    // The AGM FIFO's reader can disappear (agmplay is restarted on a stall);
-    // a SIGPIPE on a FIFO write must not take the whole client down.
-    std::signal(SIGPIPE, SIG_IGN);
 
     audiorouter::AudioRouterClient client(config);
 
