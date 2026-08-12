@@ -181,13 +181,33 @@ done
 #
 # CRITICAL: the client runs as ROOT (via su) while this script runs as the
 # non-root Termux app user. Android (uid rules + SELinux) silently refuses
-# (EPERM) a non-root process signaling a root process, so a plain pkill here
-# does nothing. The signal must be delivered AS ROOT, through su itself:
-#   su -c "pkill -<sig> -f '<client path>'"
+# (EPERM) a non-root process signaling a root process, so a plain kill/pkill
+# here does nothing. Two robust delivery paths, BOTH executed as root via su:
+#   1. kill by exact PID: the client is launched with
+#        su -c "echo \$\$ > $pidfile; exec <client>"
+#      so the pidfile holds the CLIENT's pid (exec keeps the pid), and
+#      Ctrl+C delivers  su -c "kill -INT \$(cat $pidfile)" - no pattern
+#      matching, no pkill dependency.
+#   2. pkill by command-line pattern as root (fallback if the pidfile is
+#      unreadable), using the bracket trick so it never matches our own
+#      pkill/su command lines.
 run_via_su() {
     local cmd="$1"
-    su -c "$cmd" &
+    local pidfile="/data/local/tmp/audiorouter_client.pid"
+    # Launch the client such that the recorded PID IS the client's PID: the
+    # su shell writes its own PID, then exec()s the client (same PID).
+    su -c "echo \$\$ > $pidfile; chmod 666 $pidfile; exec $cmd" &
     local su_pid=$!
+
+    # Wait (up to ~5 s) for the pidfile so we know the client's PID.
+    local cpid=""
+    local i=0
+    while [ $i -lt 50 ]; do
+        [ -s "$pidfile" ] && cpid="$(cat "$pidfile" 2>/dev/null)"
+        [ -n "$cpid" ] && break
+        i=$((i + 1))
+        sleep 0.1
+    done
 
     # Pattern that matches the client's command line but NOT this script's own
     # pkill/su command lines: "[a]udiorouter_client" as a regex matches the
@@ -196,29 +216,47 @@ run_via_su() {
     base="$(basename "$ABS_BIN")"
     pat="[${base%${base#?}}]${base#?}"
 
+    # Everything root-side: signal the client by PID via su (no EPERM).
     signal_client() {
         local sig="$1"
-        # Direct (works when this script is root, or the client is same-uid).
+        [ -n "$cpid" ] && su -c "kill -$sig $cpid 2>/dev/null" 2>/dev/null
+        su -c "pkill -$sig -f '$pat' 2>/dev/null" 2>/dev/null
         pkill -"$sig" -f "$pat" 2>/dev/null
-        # The real delivery path for the su case: signal AS ROOT.
-        su -c "pkill -$sig -f '$pat'" 2>/dev/null
+    }
+    client_alive() {
+        [ -n "$cpid" ] && su -c "kill -0 $cpid 2>/dev/null" 2>/dev/null
     }
 
     cleanup() {
-        trap - INT TERM   # no re-entry while we are tearing down
+        trap - INT TERM HUP   # no re-entry while we are tearing down
         echo ""
         echo "Stopping AudioRouter client..."
         kill -INT "$su_pid" 2>/dev/null
         signal_client INT
-        sleep 2
-        signal_client TERM
-        sleep 1
-        signal_client KILL
+        i=0
+        while [ $i -lt 10 ] && client_alive; do   # up to ~2 s for INT
+            i=$((i + 1))
+            sleep 0.2
+        done
+        for sig in TERM KILL; do
+            client_alive || break
+            signal_client "$sig"
+            i=0
+            while [ $i -lt 5 ] && client_alive; do
+                i=$((i + 1))
+                sleep 0.2
+            done
+        done
+        if client_alive; then
+            echo "Warning: client (pid $cpid) still running; stop it manually with:"
+            echo "  su -c 'pkill -9 -f audiorouter_client'"
+        fi
+        rm -f "$pidfile" 2>/dev/null
     }
-    trap cleanup INT TERM
+    trap cleanup INT TERM HUP
     wait "$su_pid"
     local status=$?
-    trap - INT TERM
+    trap - INT TERM HUP
     return $status
 }
 
