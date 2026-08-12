@@ -49,14 +49,17 @@ ifeq ($(ANDROID_TARGET),1)
     # and clang enforces availability attributes (strtof_l, strtod_l,
     # __sendto_chk: introduced in 26) against the API level baked into the
     # target triple, neither of which a -D macro can change. Raise the triple.
-    CXXFLAGS += --target=$(ANDROID_TRIPLE_BASE)26 -Wno-unavailable-declarations
+    # Target API 30 to match the proven standalone stream_daemon build
+    # (clang++ -target aarch64-linux-android30), which plays correctly on the
+    # reference device. 26+ is required for AAudio.
+    CXXFLAGS += --target=$(ANDROID_TRIPLE_BASE)30 -Wno-unavailable-declarations
 endif
 # Probe with the same raised target triple used for compilation (a -D define
 # is not enough for library selection). Termux's sysroot ships no libaaudio
 # stub, so fall back to the device's system lib (Android 8+ has
 # /system/lib64/libaaudio.so), linked by absolute path - no -L search needed.
 ANDROID_LIBDIR := $(if $(findstring aarch64,$(ANDROID_TRIPLE_BASE)),/system/lib64,/system/lib)
-AAUDIO_SYSROOT_LINKABLE := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ --target=$(ANDROID_TRIPLE_BASE)26 -laaudio -o /dev/null 2>/dev/null && echo 1)
+AAUDIO_SYSROOT_LINKABLE := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ --target=$(ANDROID_TRIPLE_BASE)30 -laaudio -o /dev/null 2>/dev/null && echo 1)
 AAUDIO_SYSTEM_AVAILABLE := $(shell test -f $(ANDROID_LIBDIR)/libaaudio.so && echo 1)
 ifeq ($(AAUDIO_SYSROOT_LINKABLE),1)
     CLIENT_LIBS += -laaudio

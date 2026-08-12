@@ -227,27 +227,24 @@ speaker, Bluetooth, USB — **without root and without touching the mixer**.
 This makes it the best option for stock, non-rooted devices, or whenever
 another app's audio should keep working alongside AudioRouter.
 
-> ⚠️ **AAudio must run as a normal (non-root) user.** Android's audio policy
-> blocks the AAudio/MMAP data path for **UID 0 (root)**: root processes have
-> no app attribution token, so the stream opens and reaches STARTED but never
-> actually renders (every `AAudioStream_write` returns 0). AAudio is designed
-> to run as the standard Termux app user (`u0_a...`). The client handles this
-> automatically: when started as root it **forks a helper process that drops
-> to the Termux app user and owns the AAudio stream**, while the main process
-> keeps root for the socket binding (`-b auto`) and the AGM/ALSA fallback.
+> ℹ️ **Runs in-process, exactly like the standalone `stream_daemon`** — the
+> same engine, opened in the client's own process, no privilege games. The
+> daemon is proven to play as root (`sudo ./stream_daemon` + `ffmpeg` into
+> the pipe), and the client mirrors it: no usage/content-type hints, no
+> readiness probe that can reject a slow-starting stream, the daemon's
+> 500 ms write timeout, and a lenient watchdog that recreates the stream
+> after ~10 s of silence and falls back to AGM/ALSA after repeated failures.
 >
 > ```bash
-> # -b auto needs root (SO_BINDTODEVICE); AAudio runs as the Termux user:
+> # With the interface bind (needs root for -b auto):
 > ./scripts/termux_run.sh -s 192.168.43.45 -d aaudio -b auto
-> #   -> termux_run.sh starts the client via su; the client keeps root for
-> #      the socket, and the AAudio stream lives in the forked helper as
-> #      u0_a... (PCM flows into it over the FIFO).
 > # No root needed at all (no -b):
 > ./bin/audiorouter_client -s 192.168.43.45 -d aaudio
 > ```
 >
-> If no Termux app user is available, the helper fails fast and the client
-> falls back to the root-capable backends (AGM/ALSA) instead of silence.
+> If the device's audio HAL has no working AAudio output (some vendor HALs),
+> the watchdog detects it and the client falls back to the AGM/ALSA backends
+> instead of looping.
 
 ### How it works
 
