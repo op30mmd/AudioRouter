@@ -21,6 +21,16 @@
 
 namespace {
 
+// AAudio buffer capacity for the low-latency path: 1920 frames = 40 ms @
+// 48 kHz. Some vendor HALs hand out huge AAudio buffers even in LOW_LATENCY
+// mode (the reference device reports ~16.8 k frames = 350 ms of in-flight
+// audio), which shows up as a constant multi-hundred-ms delay between the
+// source and the speaker. Capping the capacity keeps the in-stream backlog
+// to ~40 ms (plus the current write burst); the device then paces the pump
+// through write back-pressure instead of absorbing a big backlog.
+// Deep-buffer mode keeps the HAL default (its purpose is a large buffer).
+constexpr int32_t kBufferCapacityFrames = 1920;  // 40 ms @ 48 kHz
+
 // Pipe capacity for the PCM FIFO: 64 KB ~= 341 ms of 48 kHz stereo S16
 // (192 KB/s). The pipe is a DECOUPLING buffer between the playback thread and
 // the AAudio pump, not a network burst absorber - that is the jitter buffer's
@@ -311,9 +321,14 @@ void AaudioFifoPlayer::configure_builder(void* builder_ptr) {
     // stream_daemon (identical engine, proven on this device) sets none of
     // them; usage hints can steer the HAL onto a routing path that never
     // starts consuming, and the daemon works without them.
+    const bool deep = deep_retry_ || mode_ == "deep";
     AAudioStreamBuilder_setPerformanceMode(builder,
-        (deep_retry_ || mode_ == "deep") ? AAUDIO_PERFORMANCE_MODE_NONE
-                                         : AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+        deep ? AAUDIO_PERFORMANCE_MODE_NONE : AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    // Bound the in-stream backlog on the low-latency path (see
+    // kBufferCapacityFrames). Deep-buffer mode keeps the HAL default.
+    if (!deep) {
+        AAudioStreamBuilder_setBufferCapacityInFrames(builder, kBufferCapacityFrames);
+    }
 }
 
 // Restarts the stream when it is not running (underrun, pause, stop).

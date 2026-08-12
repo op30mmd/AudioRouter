@@ -7,9 +7,13 @@
 #include <vector>
 #include <csignal>
 #include <atomic>
+#include <cstdlib>
 
 #if defined(_WIN32)
     #include <windows.h>
+    #include <io.h>
+#else
+    #include <unistd.h>
 #endif
 
 namespace {
@@ -53,15 +57,25 @@ namespace {
 }
 
 void print_banner() {
-    std::cout << R"(
+    // ANSI color only for a real console (the setup_console() call on
+    // Windows already enables VT processing); plain when redirected/piped.
+    const bool color = ::isatty(1) == 1 && std::getenv("NO_COLOR") == nullptr;
+    const char* cyan  = color ? "\x1b[36m" : "";
+    const char* green = color ? "\x1b[32m" : "";
+    const char* bold  = color ? "\x1b[1m" : "";
+    const char* reset = color ? "\x1b[0m" : "";
+
+    std::cout << cyan << R"(
   █████╗ ██╗   ██╗██████╗ ██╗ ██████╗ ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗ 
  ██╔══██╗██║   ██║██╔══██╗██║██╔═══██╗██╔══██╗██╔═══██╗██║   ██║╚══██╔══╝██╔════╝██╔══██╗
  ███████║██║   ██║██║  ██║██║██║   ██║██████╔╝██║   ██║██║   ██║   ██║   █████╗  ██████╔╝
  ██╔══██║██║   ██║██║  ██║██║██║   ██║██╔══██╗██║   ██║██║   ██║   ██║   ██╔══╝  ██╔══██╗
  ██║  ██║╚██████╔╝██████╔╝██║╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝
-                       [Windows Audio Router Server -> Android ALSA]
-    )" << std::endl;
+)" << reset;
+    std::cout << green << bold
+              << "   Windows PC audio loopback -> Android  (WASAPI / UDP)" << reset
+              << "\n\n";
 }
 
 void print_usage(const char* prog) {

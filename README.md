@@ -149,7 +149,7 @@ End-to-end audio delay = jitter buffer + backend delay:
 |-----------|---------|------------|----------|
 | Jitter buffer | target `-l` (default 35 ms) | startup prefill 120–500 ms (one-time) | `push_packet` prefill / stability gate |
 | FIFO (AAudio pipe) | ~0 ms (drained in real time; stale backlog discarded on stall recovery / rebuild) | **341 ms** transient (64 KB @ 192 KB/s, only while a stall is active) | `kFifoSizeBytes` + pump drain-on-recovery |
-| AAudio in-stream | 8–16 ms (LOW_LATENCY, ~2 bursts); larger in deep mode | device-dependent | `AAudioStream_write` back-pressure |
+| AAudio in-stream | ≤ 40 ms (capacity capped at 1920 frames on LOW_LATENCY); deep mode uses the HAL default | 40 ms | `setBufferCapacityInFrames` |
 | Network / UDP | RTT + jitter (see status line) | — | — |
 
 The 5 s status line reports the backend portion separately as
@@ -158,7 +158,13 @@ The 5 s status line reports the backend portion separately as
 written−read frames), so the real audio delay is observable on top of
 the jitter `Buffer: <ms>` figure.
 
-Two client-specific latency controls keep the AAudio backend tight:
+Three client-specific latency controls keep the AAudio backend tight:
+- **Bounded AAudio buffer (1920 frames ≈ 40 ms)**: some vendor HALs hand out
+  huge AAudio buffers even in LOW_LATENCY mode (the reference device
+  reported ~16.8 k frames = 350 ms of in-flight audio, a constant
+  multi-hundred-ms source→speaker delay). `setBufferCapacityInFrames` caps
+  the in-stream backlog to 40 ms, so the device paces the pump through
+  write back-pressure instead of absorbing a big backlog.
 - **Bounded FIFO (64 KB ≈ 341 ms)**: the pipe is a thread-decoupling
   buffer, not a burst absorber — the jitter buffer (≤ ~1.28 s) owns
   network burst absorption. The stream_daemon keeps its original 1 MB

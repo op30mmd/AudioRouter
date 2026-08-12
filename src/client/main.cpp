@@ -9,6 +9,8 @@
 #include <string>
 #include <csignal>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -29,37 +31,62 @@ int get_terminal_width() {
     return 80;
 }
 
+// ANSI color for the banner: only when stdout is a terminal and the user has
+// not opted out (NO_COLOR / TERM=dumb). When piped or redirected, the banner
+// is plain ASCII so logs stay clean.
+namespace {
+bool banner_use_color() {
+    static const bool enabled = [] {
+        if (std::getenv("NO_COLOR") != nullptr) return false;
+        const char* term = std::getenv("TERM");
+        if (term != nullptr && std::strcmp(term, "dumb") == 0) return false;
+        return ::isatty(STDOUT_FILENO) == 1;
+    }();
+    return enabled;
+}
+const char* banner_cyan()   { return banner_use_color() ? "\x1b[36m" : ""; }
+const char* banner_green()  { return banner_use_color() ? "\x1b[32m" : ""; }
+const char* banner_bold()   { return banner_use_color() ? "\x1b[1m" : ""; }
+const char* banner_reset()  { return banner_use_color() ? "\x1b[0m" : ""; }
+}  // namespace
+
 void print_banner() {
     const int term_width = get_terminal_width();
+    const char* cyan  = banner_cyan();
+    const char* green = banner_green();
+    const char* bold  = banner_bold();
+    const char* reset = banner_reset();
+    const char* tag   = "Windows PC audio -> Android speakers  (AAudio / AGM / ALSA)";
 
-    if (term_width >= 90) {
-        std::cout << R"(
+    if (term_width >= 84) {
+        std::cout << cyan << R"(
   █████╗ ██╗   ██╗██████╗ ██╗ ██████╗ ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗
  ██╔══██╗██║   ██║██╔══██╗██║██╔═══██╗██╔══██╗██╔═══██╗██║   ██║╚══██╔══╝██╔════╝██╔══██╗
  ███████║██║   ██║██║  ██║██║██║   ██║██████╔╝██║   ██║██║   ██║   ██║   █████╗  ██████╔╝
  ██╔══██║██║   ██║██║  ██║██║██║   ██║██╔══██╗██║   ██║██║   ██║   ██║   ██╔══╝  ██╔══██╗
  ██║  ██║╚██████╔╝██████╔╝██║╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝
-                       [Android Termux ALSA Client (Rooted)]
-    )" << std::endl;
-    } else if (term_width >= 60) {
-        std::cout << R"(
-  ╔═╗╦ ╦╔╦╗╦╔═╗╦═╗╦ ╦╦ ╦╔╦╗╔═╗╦═╗
-  ╠═╣║ ║ ║║║║ ║╠╦╝║ ║║ ║ ║ ║╣╠╦╝
-  ╩ ╩╚═╝═╩╝╩╚═╝╩╚═╚═╝╚═╝ ╩ ╚═╝╩╚═
-        [Android Termux ALSA Client]
-    )" << std::endl;
-    } else if (term_width >= 40) {
-        std::cout << R"(
-  ╔═╗╦ ╦╔╦╗╦╔═╗
-  ╠═╣║ ║ ║║║║ ║
-  ╩ ╩╚═╝═╩╝╩╚═╝
-   AudioRouter
-   ALSA Client
-    )" << std::endl;
+)" << reset;
+    } else if (term_width >= 52) {
+        std::cout << cyan << R"(
+   _    _        _     _                     _
+  / \  | |_   __| |   (_)_ __ ___  ___  _ __| |_
+ / _ \ | \ \ / / _` |   | | '__/ _ \/ _ \| '__| __|
+/ ___ \| |\ V / (_| |   | | | | (_) (_) | |  | |_
+/_/   \_\_| \_/ \__,_|   |_|_|  \___/\___/|_|   \__|
+)" << reset;
     } else {
-        std::cout << "AudioRouter ALSA Client" << std::endl;
+        std::cout << cyan << bold << "AudioRouter" << reset;
     }
+
+    // Tagline on its own line, trimmed for narrow terminals.
+    std::cout << green << bold;
+    if (term_width < 52) {
+        std::cout << " - Windows PC audio -> Android speakers";
+    } else {
+        std::cout << "   " << tag;
+    }
+    std::cout << reset << "\n\n";
 }
 
 void print_usage(const char* prog) {
