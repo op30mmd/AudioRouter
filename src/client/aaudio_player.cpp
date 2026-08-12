@@ -286,11 +286,12 @@ bool AaudioFifoPlayer::open_via_helper() {
     }
 
     destroy_fifo();
-    LOG_ERROR("AaudioFifoPlayer: AAudio helper failed to open a renderable stream "
-              "(no Termux app user to drop to, or the AAudio data path is blocked/stalled on "
-              "this device). Falling back to AGM/ALSA. Run without '-b auto' and without su "
-              "for plain non-root AAudio, or use '-d agm'. You can also restart Android "
-              "audio manually ('stop audioserver && start audioserver') or reboot.");
+    LOG_ERROR("AaudioFifoPlayer: AAudio is not usable from the root/su context on this "
+              "device (the stream opens but never finishes starting - the audio policy "
+              "rejects the su/magisk process context). On this device '-d agm' is the "
+              "recommended backend and has been/ will be used as the fallback. To test "
+              "whether AAudio works in the TRUE app context, run the client WITHOUT su "
+              "and WITHOUT -b:  ./bin/audiorouter_client -s <SERVER_IP> -d aaudio");
     return false;
 }
 
