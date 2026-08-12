@@ -63,7 +63,7 @@ public:
     static bool is_supported();
 
 private:
-#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     void pump_loop();
     void configure_builder(void* builder);   // AAudioStreamBuilder*
     bool ensure_stream_started_locked();

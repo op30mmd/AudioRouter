@@ -51,9 +51,24 @@ ifeq ($(ANDROID_TARGET),1)
     # target triple, neither of which a -D macro can change. Raise the triple.
     CXXFLAGS += --target=$(ANDROID_TRIPLE_BASE)26 -Wno-unavailable-declarations
 endif
-AAUDIO_LINKABLE := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ -D__ANDROID_API__=26 -laaudio -o /dev/null 2>/dev/null && echo 1)
-ifeq ($(AAUDIO_LINKABLE),1)
+# Probe with the same raised target triple used for compilation (a -D define
+# is not enough for library selection). Termux's sysroot ships no libaaudio
+# stub, so also probe the device's system dir (Android 8+ has libaaudio.so).
+ANDROID_LIBDIR := $(if $(findstring aarch64,$(ANDROID_TRIPLE_BASE)),/system/lib64,/system/lib)
+AAUDIO_SYSROOT_LINKABLE := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ --target=$(ANDROID_TRIPLE_BASE)26 -laaudio -o /dev/null 2>/dev/null && echo 1)
+AAUDIO_SYSTEM_LINKABLE := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ --target=$(ANDROID_TRIPLE_BASE)26 -L$(ANDROID_LIBDIR) -laaudio -o /dev/null 2>/dev/null && echo 1)
+ifeq ($(AAUDIO_SYSROOT_LINKABLE),1)
     CLIENT_LIBS += -laaudio
+    HAVE_AAUDIO = 1
+else ifeq ($(AAUDIO_SYSTEM_LINKABLE),1)
+    CLIENT_LIBS += -L$(ANDROID_LIBDIR) -laaudio
+    HAVE_AAUDIO = 1
+endif
+ifeq ($(HAVE_AAUDIO),1)
+    # Compile the real AAudio backend only when libaaudio is linkable
+    # (it is NOT on stock Termux); otherwise aaudio_player.cpp must stub out,
+    # or the link fails with undefined AAudio* symbols.
+    CXXFLAGS += -DAAUDIO_ENABLED=1
 endif
 
 BUILD_DIR = build
@@ -101,7 +116,7 @@ TEST_TARGET = $(BIN_DIR)/audiorouter_tests$(EXE_EXT)
 .PHONY: all clean test server client directories sanitize stream-daemon
 
 all: directories $(SERVER_TARGET) $(CLIENT_TARGET) $(TEST_TARGET)
-ifeq ($(AAUDIO_LINKABLE),1)
+ifeq ($(HAVE_AAUDIO),1)
 all: $(STREAM_DAEMON_TARGET)
 endif
 
@@ -109,7 +124,7 @@ server: directories $(SERVER_TARGET)
 
 client: directories $(CLIENT_TARGET)
 
-ifeq ($(AAUDIO_LINKABLE),1)
+ifeq ($(HAVE_AAUDIO),1)
 stream-daemon: directories $(STREAM_DAEMON_TARGET)
 
 $(STREAM_DAEMON_TARGET): $(STREAM_DAEMON_SRCS)

@@ -12,7 +12,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 
-#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
 #include <aaudio/AAudio.h>
 #endif
 
@@ -51,7 +51,7 @@ AaudioFifoPlayer::~AaudioFifoPlayer() {
 }
 
 bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device_name) {
-#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     if (is_open_.load()) close();
 
     config_ = config;
@@ -116,7 +116,7 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
 }
 
 void AaudioFifoPlayer::close() {
-#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     stop_pump_.store(true);
     if (pump_thread_.joinable()) pump_thread_.join();
 
@@ -146,7 +146,7 @@ bool AaudioFifoPlayer::is_open() const {
 }
 
 bool AaudioFifoPlayer::is_supported() {
-#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     return true;
 #else
     return false;
@@ -197,7 +197,7 @@ size_t AaudioFifoPlayer::get_buffer_delay_frames() const {
     // PCM queued inside the AAudio stream itself. Prefer the live counters;
     // if the pump is mid-write, fall back to its last published snapshot.
     int64_t in_flight = frames_in_flight_.load();
-#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     if (stream_mutex_.try_lock()) {
         if (stream_ != nullptr) {
             auto* stream = static_cast<AAudioStream*>(stream_);
@@ -220,7 +220,7 @@ std::string AaudioFifoPlayer::get_device_name() const {
     return device_name_;
 }
 
-#if defined(__ANDROID__) && __ANDROID_API__ >= 26
+#if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
 
 void AaudioFifoPlayer::configure_builder(void* builder_ptr) {
     auto* builder = static_cast<AAudioStreamBuilder*>(builder_ptr);
@@ -432,6 +432,6 @@ void AaudioFifoPlayer::pump_loop() {
     }
 }
 
-#endif  // __ANDROID__ && __ANDROID_API__ >= 26
+#endif  // __ANDROID__ && AAUDIO_ENABLED
 
 } // namespace audiorouter
