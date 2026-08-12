@@ -27,11 +27,14 @@ ifeq ($(OS),Windows_NT)
     SERVER_LIBS = -lws2_32 -liphlpapi -lavrt -lole32
     CLIENT_LIBS = -lws2_32 -liphlpapi
     EXE_EXT = .exe
+    WINDRES ?= windres
+    SERVER_RESOURCE_OBJ = $(BUILD_DIR)/server_manifest.o
 else
     PLATFORM := linux
     SERVER_LIBS = -lpthread
     CLIENT_LIBS = -lpthread -ldl
     EXE_EXT =
+    SERVER_RESOURCE_OBJ =
 endif
 
 # AAudio (Android API 26+) support: the aaudio player and the standalone
@@ -162,6 +165,13 @@ $(BUILD_DIR)/socket_util.o: src/common/socket_util.cpp
 $(BUILD_DIR)/server_%.o: src/server/%.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
+ifeq ($(PLATFORM),windows)
+# Embed the UAC manifest for MinGW/Make builds. Requiring elevation lets the
+# loopback stream include audio sessions created by elevated applications.
+$(SERVER_RESOURCE_OBJ): src/server/audiorouter_server.rc src/server/audiorouter_server.manifest
+	$(WINDRES) --include-dir src/server $< -O coff -o $@
+endif
+
 # Client objects
 $(BUILD_DIR)/client_%.o: src/client/%.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
@@ -171,7 +181,7 @@ $(BUILD_DIR)/test_%.o: tests/%.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Link Server
-$(SERVER_TARGET): $(SERVER_OBJS) $(COMMON_OBJS)
+$(SERVER_TARGET): $(SERVER_OBJS) $(COMMON_OBJS) $(SERVER_RESOURCE_OBJ)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXTRA) $^ -o $@ $(SERVER_LIBS)
 	@echo "Built: $(SERVER_TARGET)"
 

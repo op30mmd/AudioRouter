@@ -82,7 +82,9 @@ and a watchdog:
 - **Capture** (`wasapi_capture.cpp`): `IAudioClient` in `AUDCLNT_SHAREMODE_SHARED` +
   `AUDCLNT_STREAMFLAGS_LOOPBACK`, `IAudioCaptureClient::GetBuffer` on a dedicated
   thread. The device mix format is queried and the client is told the negotiated
-  format in `CONNECT_ACK`.
+  format in `CONNECT_ACK`. The Windows executable embeds a
+  `requireAdministrator` UAC manifest so its integrity level matches programs
+  started with **Run as administrator** and their audio is included in capture.
 - **Packetization** (`server.cpp::on_audio_captured`): captured frames are chunked to
   `frames_per_packet` (default 240 = 5 ms @ 48 kHz, single-MTU), stamped with a
   monotonically increasing `seq_num` and a µs timestamp, and sent over a
@@ -215,8 +217,11 @@ ffmpeg -re -f lavfi -i "sine=frequency=440:sample_rate=48000" \
 ### Windows server
 ```bat
 scripts\build_server_msvc.bat     :: MSVC + CMake
-scripts\build_server_mingw.bat    :: MinGW
+scripts\build_server_mingw.bat    :: MinGW (requires g++ and windres)
 ```
+Both build paths embed an elevation manifest. Windows displays a UAC prompt whenever
+`audiorouter_server.exe` starts; approve it so WASAPI can capture audio from elevated
+as well as ordinary programs.
 
 ### Android client (Termux)
 ```bash
@@ -297,6 +302,11 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
 
 ## 7. Troubleshooting / operational notes
 
+- **Audio from an administrator program is silent**: use a newly rebuilt server and
+  approve its UAC prompt. If the prompt does not appear, the executable does not
+  contain the required elevation manifest; rebuild it with one of the supported
+  Windows scripts. Protected/DRM audio and applications using an exclusive output
+  path can still be unavailable to WASAPI shared-mode loopback.
 - **AAudio does not render on some vendor HALs**: the stream opens but never starts
   consuming (watchdog logs `AAudioStream_write wrote X of Y frames (state=..., read=...)`).
   The client falls back to AGM/ALSA automatically; use `-d agm` directly for the
@@ -321,7 +331,7 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
 src/common/    protocol.hpp, socket_util.*, audio_types.hpp, ring_buffer.hpp,
                logger.hpp, time_util.hpp, span/expected/thread compat
 src/server/    main.cpp, server.*, wasapi_capture.*, dummy_capture.*,
-               audio_endpoint_control.*, audio_capture.hpp
+               audio_endpoint_control.*, audio_capture.hpp, UAC manifest/resource
 src/client/    main.cpp, client.*, jitter_buffer.*, audio_player.hpp,
                aaudio_player.*, agm_fifo_player.*, alsa_player.*,
                direct_alsa.*, dummy_player.*, android_helpers.*

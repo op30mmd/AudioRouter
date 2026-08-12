@@ -7,6 +7,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# MinGW needs its resource compiler enabled so the server's UAC manifest is
+# embedded in the executable. MSVC generates the equivalent manifest through
+# its linker options (see src/server/CMakeLists.txt).
+if (WIN32 AND NOT MSVC)
+    enable_language(RC)
+endif()
+
 # Warnings & hardening — keep compatible with original but ensure C++23
 if (MSVC)
     add_compile_options(/W4 /EHsc /O2 /permissive-)
