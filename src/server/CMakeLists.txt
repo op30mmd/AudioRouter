@@ -54,6 +54,16 @@ if (WIN32)
             OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/audiorouter_server.manifest"
         )
     endif()
+
+    # Do not accept a successful Windows link if the toolchain silently drops
+    # the requested execution level. That would reintroduce silent capture for
+    # elevated programs while leaving an otherwise healthy executable.
+    add_custom_command(TARGET audiorouter_server POST_BUILD
+        COMMAND "${CMAKE_COMMAND}"
+            "-DEXECUTABLE=$<TARGET_FILE:audiorouter_server>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/verify_windows_manifest.cmake"
+        VERBATIM
+    )
 else()
     target_link_libraries(audiorouter_server PRIVATE
         pthread
