@@ -40,9 +40,16 @@ endif
 # On plain Linux/CI hosts these probes fail and aaudio_player.cpp compiles as
 # a no-op stub, so the client still builds everywhere.
 ANDROID_TARGET := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ -dM -E - 2>/dev/null | grep -q '__ANDROID__' && echo 1)
+ANDROID_TRIPLE := $(shell $(CXX) -dumpmachine 2>/dev/null)
+ANDROID_TRIPLE_BASE := $(shell printf '%s' '$(ANDROID_TRIPLE)' | sed -E 's/[0-9]+$$//')
 ifeq ($(ANDROID_TARGET),1)
     # Termux's bionic defaults to API 24; AAudio requires 26+.
-    CXXFLAGS += -D__ANDROID_API__=26 -Wno-unavailable-declarations
+    # Hoisting with -D__ANDROID_API__=26 alone is NOT enough: bionic gates
+    # fortify declarations on __ANDROID_MIN_SDK_VERSION__ (android/versioning.h)
+    # and clang enforces availability attributes (strtof_l, strtod_l,
+    # __sendto_chk: introduced in 26) against the API level baked into the
+    # target triple, neither of which a -D macro can change. Raise the triple.
+    CXXFLAGS += --target=$(ANDROID_TRIPLE_BASE)26 -Wno-unavailable-declarations
 endif
 AAUDIO_LINKABLE := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ -D__ANDROID_API__=26 -laaudio -o /dev/null 2>/dev/null && echo 1)
 ifeq ($(AAUDIO_LINKABLE),1)
