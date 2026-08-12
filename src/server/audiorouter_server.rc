@@ -1,0 +1,3 @@
+// GNU windres does not reliably recognize the symbolic MANIFEST resource
+// type, so keep the Win32 numeric IDs here: resource ID 1, type RT_MANIFEST.
+1 24 "audiorouter_server.manifest"

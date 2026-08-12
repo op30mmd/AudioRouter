@@ -38,6 +38,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <cstdint>
+#include <string>
 
 #if defined(__ANDROID__) && __ANDROID_API__ >= 26
 #include <aaudio/AAudio.h>
