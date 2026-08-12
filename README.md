@@ -188,6 +188,10 @@ Usage: audiorouter_client [options]
 ```bash
 # On a stock (non-rooted) device, Android 8.0+ — no 'su', no ALSA setup:
 ./bin/audiorouter_client -s 192.168.43.45 -d aaudio
+
+# With the interface bind (needs root for -b auto; AAudio still runs as the
+# Termux user because the client drops privileges for it):
+./scripts/termux_run.sh -s 192.168.43.45 -d aaudio -b auto
 ```
 
 ---
@@ -223,14 +227,26 @@ speaker, Bluetooth, USB — **without root and without touching the mixer**.
 This makes it the best option for stock, non-rooted devices, or whenever
 another app's audio should keep working alongside AudioRouter.
 
-> ⚠️ **Must run as a normal (non-root) user.** Android's audio policy blocks
-> the AAudio/MMAP data path for **UID 0 (root)**: root processes have no app
-> attribution token, so the stream opens and reaches STARTED but never
+> ⚠️ **AAudio must run as a normal (non-root) user.** Android's audio policy
+> blocks the AAudio/MMAP data path for **UID 0 (root)**: root processes have
+> no app attribution token, so the stream opens and reaches STARTED but never
 > actually renders (every `AAudioStream_write` returns 0). AAudio is designed
-> to run as the standard Termux app user (`u0_a...`). `termux_run.sh`
-> detects `-d aaudio` and runs the client **without `su`** automatically; if
-> the client is launched under root it fails fast and falls back to the
-> root-capable backends (AGM/ALSA) instead of playing silence.
+> to run as the standard Termux app user (`u0_a...`). The client handles this
+> automatically: when started as root it **drops to the Termux app user right
+> before opening the AAudio stream**, so you can combine root-only features
+> with AAudio in one run:
+>
+> ```bash
+> # -b auto needs root (SO_BINDTODEVICE); AAudio runs as the Termux user:
+> ./scripts/termux_run.sh -s 192.168.43.45 -d aaudio -b auto
+> #   -> termux_run.sh starts the client via su; the client drops to u0_a...
+> #      for the AAudio stream while keeping the socket bound.
+> # No root needed at all (no -b):
+> ./bin/audiorouter_client -s 192.168.43.45 -d aaudio
+> ```
+>
+> If the drop is not possible (no Termux install), the client fails fast and
+> falls back to the root-capable backends (AGM/ALSA) instead of silence.
 
 ### How it works
 

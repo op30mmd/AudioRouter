@@ -296,10 +296,9 @@ bool AudioRouterClient::start() {
         LOG_INFO("Running with root privileges (UID 0). Direct ALSA access enabled.");
         AndroidHelpers::fix_snd_permissions();
         if (is_aaudio_device(config_.device_name)) {
-            LOG_WARN("AAudio is blocked under root (UID 0) by Android audio policy (root has no "
-                     "app attribution token, so the AAudio data path never renders). The client "
-                     "will fall back to AGM/ALSA. To use AAudio, run without su - termux_run.sh "
-                     "does this automatically for '-d aaudio'.");
+            LOG_INFO("AAudio requested while running as root: the client will drop to the "
+                     "Termux app user before opening AAudio (Android blocks the AAudio data "
+                     "path for UID 0), keeping root for the socket binding (-b auto).");
         }
     } else {
         LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'sudo' in Termux.");
@@ -389,6 +388,19 @@ bool AudioRouterClient::start() {
     net_thread_ = std::thread(&AudioRouterClient::network_receive_thread, this);
     playback_thread_ = std::thread(&AudioRouterClient::audio_playback_thread, this);
     heartbeat_thread_ = std::thread(&AudioRouterClient::heartbeat_thread, this);
+
+    // AAudio must run as a normal app user: Android audio policy blocks the
+    // AAudio/MMAP data path for UID 0 (root has no app attribution token), so
+    // a root-launched AAudio stream opens but never renders. When the client
+    // was started as root (needed for -b auto / SO_BINDTODEVICE and the ALSA
+    // backends), drop to the Termux app user right before opening the player:
+    // the socket binding keeps its root privilege, while the AAudio stream is
+    // attributed to a real app. If the drop fails, AaudioFifoPlayer::open()
+    // refuses under root and the client falls back to the root-capable
+    // backends (AGM/ALSA) instead of playing silence.
+    if (!config_.use_dummy_player && is_aaudio_device(config_.device_name)) {
+        AndroidHelpers::drop_to_termux_user();
+    }
 
     // Open the audio player on a bounded, cancellable path: a hung ALSA /
     // kernel driver must never block the main thread or stall shutdown.

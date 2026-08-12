@@ -96,15 +96,18 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
     // attribution token, so Android audio policy blocks the AAudio/MMAP data
     // path for root: the stream opens and reaches STARTED but never renders
     // (every write returns 0). AAudio must run as the normal Termux user
-    // (u0_a...). Fail fast so the client falls back to the root-capable
-    // backends (AGM/ALSA) instead of playing silence. Escape hatch for
-    // devices/ROMs that do allow root: AUDIOROUTER_AAUDIO_AS_ROOT=1.
+    // (u0_a...). The client drops privileges automatically before opening the
+    // player; reaching this check with UID 0 means the drop failed (no Termux
+    // install) or this binary is being run standalone as root - fail fast so
+    // the client falls back to the root-capable backends (AGM/ALSA) instead
+    // of playing silence. Escape hatch for devices/ROMs that do allow root:
+    // AUDIOROUTER_AAUDIO_AS_ROOT=1.
     if (getuid() == 0 && std::getenv("AUDIOROUTER_AAUDIO_AS_ROOT") == nullptr) {
         LOG_ERROR("AaudioFifoPlayer: AAudio is blocked for UID 0 (root) by Android audio "
                   "policy (root has no app attribution token, so the AAudio data path never "
-                  "renders). Run the client as the normal Termux user - termux_run.sh does "
-                  "this automatically for '-d aaudio' - or use a root-capable backend "
-                  "instead: '-d agm' / '-d default'.");
+                  "renders). Run the client as the normal Termux user (termux_run.sh handles "
+                  "this, or run without su), or use a root-capable backend instead: "
+                  "'-d agm' / '-d default'.");
         return false;
     }
 

@@ -25,6 +25,17 @@ public:
     // reconfigures the codec when it preempts us, so a cleared route is the
     // early sign that the AGM graph is about to go silent.
     static bool speaker_routing_intact();
+    // Drops root privileges to the Termux app user (u0_a...) so AAudio can
+    // run as a normal app: Android audio policy blocks the AAudio/MMAP data
+    // path for UID 0 (root has no app attribution token), so a root-launched
+    // AAudio stream opens but never renders. Call while still root (after
+    // the socket binding / -b auto, before opening the audio player); the
+    // drop is permanent for the process. Returns true on success, false when
+    // already non-root, no Termux install is found, or the drop failed (the
+    // caller should then let AAudio's own UID-0 guard fall back). The Termux
+    // home is located via AUDIOROUTER_TERMUX_HOME when set (also used by
+    // tests), otherwise /data/data/com.termux/files/home.
+    static bool drop_to_termux_user();
     static void print_android_troubleshooting_tips();
 };
 

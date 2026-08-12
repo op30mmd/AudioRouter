@@ -12,11 +12,14 @@
 #     only the Android/system dynamic linker resolves, so the su command is the
 #     plain absolute-path invocation without any LD_LIBRARY_PATH/HOME/chmod
 #     preamble.
-#   - AAudio (-d aaudio / aaudio:*): runs WITHOUT su, as the normal Termux user
-#     (u0_a...). Android audio policy blocks AAudio/MMAP data paths for UID 0
-#     (root has no app attribution token): the stream opens but never renders.
-#     If the script itself is already root, it switches to the Termux app user
-#     via 'su <termux_uid>' when it can determine it.
+#   - AAudio (-d aaudio / aaudio:*): the CLIENT drops to the normal Termux
+#     user (u0_a...) itself before opening the AAudio stream - Android audio
+#     policy blocks the AAudio/MMAP data path for UID 0 (root has no app
+#     attribution token). That lets us combine root for the socket binding
+#     (-b auto needs SO_BINDTODEVICE) with non-root for AAudio in one process:
+#     when -b/--bind is requested the client is started via su (root), and it
+#     drops privileges for the AAudio part. Without -b it runs directly as the
+#     Termux user (no root needed at all).
 
 SERVER_IP=""
 PORT="44100"
@@ -155,39 +158,46 @@ echo "Running: $CMD"
 
 # AAudio must run as a normal app user: Android audio policy blocks the
 # AAudio/MMAP data path for UID 0 (root has no app attribution token), so a
-# root-launched AAudio stream opens but never renders.
+# root-launched AAudio stream opens but never renders. The client drops to the
+# Termux user itself before opening AAudio, which allows:
+#   - aaudio + -b/--bind  -> run via su (root) so SO_BINDTODEVICE works; the
+#                            client drops privileges for the AAudio stream.
+#   - aaudio without -b   -> no root needed; run directly as the Termux user.
 IS_AAUDIO=0
+HAS_BIND=0
 for a in "${CLIENT_ARGS[@]}"; do
     case "$a" in
         aaudio|aaudio:*) IS_AAUDIO=1 ;;
+        -b|--bind) HAS_BIND=1 ;;
     esac
 done
 
 if [ "$(id -u)" -ne 0 ]; then
-    if [ "$IS_AAUDIO" -eq 1 ]; then
-        echo "AAudio backend: running as the normal Termux user (no root) - required for AAudio."
+    if [ "$IS_AAUDIO" -eq 1 ] && [ "$HAS_BIND" -eq 1 ]; then
+        # Root for the socket binding; the client drops to the Termux user
+        # for the AAudio stream itself.
+        if ! command -v su >/dev/null 2>&1; then
+            echo "Error: '-b' needs root but 'su' is not available. Run 'su' first or install su." >&2
+            exit 1
+        fi
+        echo "Requesting root privileges via su (for -b auto); the client drops back to the Termux user for AAudio..."
+        su -c "$CMD"
+    elif [ "$IS_AAUDIO" -eq 1 ]; then
+        echo "AAudio backend: running as the normal Termux user (no root needed)."
         exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
-    fi
-    if ! command -v su >/dev/null 2>&1; then
-        echo "Error: not running as root and 'su' is not available. Run 'su' first or install su." >&2
-        exit 1
-    fi
-    echo "Requesting root privileges via su..."
-    su -c "$CMD"
-elif [ "$IS_AAUDIO" -eq 1 ]; then
-    # Already root (e.g. a root shell) but AAudio requested: switch to the
-    # Termux app user so the AAudio data path is attributed to a real app.
-    TERMUX_UID="$(stat -c %u /data/data/com.termux/files/home 2>/dev/null)"
-    if [ -n "$TERMUX_UID" ] && [ "$TERMUX_UID" -ne 0 ] 2>/dev/null; then
-        echo "AAudio backend: running as Termux user (UID $TERMUX_UID) - root blocks AAudio."
-        CMD_AS_USER="export HOME=/data/data/com.termux/files/home; $CMD"
-        su "$TERMUX_UID" -c "$CMD_AS_USER"
     else
-        echo "Warning: cannot determine the Termux user; running AAudio as root."
-        echo "Android blocks AAudio for root - the client will fall back to AGM/ALSA."
-        echo "For AAudio, run this script from the Termux app without su."
-        exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
+        if ! command -v su >/dev/null 2>&1; then
+            echo "Error: not running as root and 'su' is not available. Run 'su' first or install su." >&2
+            exit 1
+        fi
+        echo "Requesting root privileges via su..."
+        su -c "$CMD"
     fi
+elif [ "$IS_AAUDIO" -eq 1 ]; then
+    # Already root (e.g. a root shell) and AAudio requested: launch directly;
+    # the client drops to the Termux user itself before opening AAudio (so
+    # -b auto still works from the root context).
+    exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
 else
     # Already root (Android/system shell) with a root-requiring backend:
     # launch the absolute path directly.
