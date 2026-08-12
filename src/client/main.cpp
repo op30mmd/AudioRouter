@@ -185,6 +185,7 @@ int main(int argc, char* argv[]) {
                      << "RTT: " << rtt_ms << " ms | "
                      << "Buffer: " << stats.jitter_stats.current_buffer_ms << " ms | "
                      << "Jitter: " << stats.jitter_stats.avg_jitter_ms << " ms | "
+                     << "Audio: " << stats.audio_backend_delay_ms << " ms | "
                      << "Lost: " << stats.jitter_stats.packets_lost << " pkts | "
                      << "Underruns: " << stats.jitter_stats.underruns << " | "
                      << "Played: " << stats.frames_played << " frames");

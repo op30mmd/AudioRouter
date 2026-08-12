@@ -21,10 +21,15 @@
 
 namespace {
 
-// Expand the pipe capacity to 1 MB (~5 s of 48 kHz stereo audio). The pipe is
-// the back-pressure buffer between the network and the AAudio stream; a small
-// default (64 KB) would stall on bursty Wi-Fi.
-constexpr int kFifoSizeBytes = 1048576;
+// Pipe capacity for the PCM FIFO: 64 KB ~= 341 ms of 48 kHz stereo S16
+// (192 KB/s). The pipe is a DECOUPLING buffer between the playback thread and
+// the AAudio pump, not a network burst absorber - that is the jitter buffer's
+// job (up to ~1.28 s). A larger pipe (the stream_daemon's 1 MB = ~5.3 s) lets
+// a stalled stream bury seconds of stale audio that then plays back before
+// live audio, which the user hears as a multi-second delay after any hiccup.
+// 64 KB holds ~17 pump chunks of slack while keeping the stale-audio bound at
+// ~341 ms (and the pump drains it to near-zero in steady state anyway).
+constexpr int kFifoSizeBytes = 65536;
 
 // How long AAudioStream_write() may block for space in the AAudio buffer.
 // Matches the standalone stream_daemon (500 ms), which is proven to work on
@@ -398,6 +403,17 @@ bool AaudioFifoPlayer::create_fifo() {
     return true;
 }
 
+void AaudioFifoPlayer::drain_fifo() {
+    if (fifo_fd_ < 0) return;
+    // The pipe is O_NONBLOCK, so read() returns EAGAIN once it is empty.
+    // 64 iterations of 4 KB covers the whole 64 KB pipe (and then some).
+    char tmp[4096];
+    for (int i = 0; i < 64; ++i) {
+        const ssize_t n = ::read(fifo_fd_, tmp, sizeof(tmp));
+        if (n <= 0) break;  // EAGAIN (drained) or error
+    }
+}
+
 void AaudioFifoPlayer::destroy_fifo() {
     if (fifo_fd_ >= 0) {
         ::close(fifo_fd_);
@@ -478,6 +494,9 @@ void AaudioFifoPlayer::pump_loop() {
                         last_rebuild_ms_ = now_ms;
                         LOG_WARN("AaudioFifoPlayer: stream disconnected; recreating AAudio stream");
                         rebuild_stream_locked();
+                        // Drop whatever accumulated while the old stream was
+                        // dead so recovery starts at live audio, not stale.
+                        drain_fifo();
                     }
                 } else if (consecutive_write_failures_ >= kStallRebuildThreshold) {
                     // Persistent stall: the session opened but never renders.
@@ -513,6 +532,10 @@ void AaudioFifoPlayer::pump_loop() {
                                  << consecutive_write_failures_
                                  << " failed writes; recreating AAudio stream");
                         rebuild_stream_locked();
+                        // Drop stale buffered audio so the fresh stream
+                        // starts at live audio instead of replaying the
+                        // stall period.
+                        drain_fifo();
                     }
                 } else {
                     AAudioStream_requestStart(stream);

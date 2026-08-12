@@ -753,6 +753,12 @@ void AudioRouterClient::audio_playback_thread() {
                 if (written > 0) {
                     std::lock_guard<std::mutex> lock(stats_mutex_);
                     stats_.frames_played += written;
+                    // Sample the real backend delay (pipe + in-stream buffers)
+                    // so the status line shows the actual audio latency on
+                    // top of the jitter buffer.
+                    const uint32_t rate = audio_config_.sample_rate > 0 ? audio_config_.sample_rate : 48000;
+                    stats_.audio_backend_delay_ms =
+                        static_cast<uint32_t>((player->get_buffer_delay_frames() * 1000ULL) / rate);
                 } else {
                     // Audio device returned 0 frames written or was busy; pace the thread
                     sleep_ms(fallback_sleep_ms);

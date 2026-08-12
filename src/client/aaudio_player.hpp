@@ -71,6 +71,11 @@ private:
     void configure_builder(void* builder);   // AAudioStreamBuilder*
     bool ensure_stream_started_locked();
     bool rebuild_stream_locked();
+    // Discards everything currently buffered in the FIFO (non-blocking read +
+    // discard). Called after a stream rebuild so stale pre-stall audio does
+    // not replay before live audio - this is what bounds the audible delay
+    // after a stall/reconnect.
+    void drain_fifo();
     bool create_fifo();
     void destroy_fifo();
 #endif

@@ -130,7 +130,7 @@ The device name selects both the backend and the fallback chain:
 
 | `-d` value | Backend | Privilege | Notes |
 |------------|---------|-----------|-------|
-| `aaudio` / `aaudio:deep` / `aaudio:voip` | **AAudio** (NDK, in-process) | none | Byte-for-byte mirror of `stream_daemon`: 1 MB `O_RDWR` FIFO, ~20 ms pump chunks, 500 ms write timeout, no usage hints, no readiness probe; lenient watchdog (20 failed writes → recreate, deep-buffer mode on 2nd rebuild, fall back after 3). FIFO at `/data/local/tmp` as root, `$HOME` otherwise. |
+| `aaudio` / `aaudio:deep` / `aaudio:voip` | **AAudio** (NDK, in-process) | none | Byte-for-byte mirror of `stream_daemon`: 64 KB (≈341 ms) `O_RDWR` FIFO, ~20 ms pump chunks, 500 ms write timeout, no usage hints, no readiness probe; lenient watchdog (20 failed writes → recreate + drain the FIFO, deep-buffer mode on 2nd rebuild, fall back after 3). FIFO at `/data/local/tmp` as root, `$HOME` otherwise. |
 | `agm` / `agm:<backend>` | **AGM** via vendor `agmplay` subprocess + WAV-over-FIFO | root | Default backend `CODEC_DMA-LPAIF_RXTX-RX-1`; auto-recover: FIFO-stall detection, logcat/mixer preemption watcher, HAL restart. |
 | `direct:/dev/snd/pcmC0D0p` or `/dev/snd/...` | **Direct kernel PCM** (ioctl) | root | No ALSA userspace deps; enumerates `/dev/snd` nodes; per-node retry with hang detection. |
 | `default`, `hw:0,0`, `plughw:0,0` | **ALSA** via `libasound.so` | root | dlopen-based, optional direct fallback. |
@@ -141,12 +141,40 @@ Fallback chains (`build_open_strategies`): `aaudio*` → `AAUDIO → AGM → NOD
 Each attempt runs on its own thread with a 20 s hang timeout; abandoned attempts
 hot-swap the device in if they later succeed.
 
-### 3.4 Heartbeat / keep-alive
+### 3.4 Latency budget
+
+End-to-end audio delay = jitter buffer + backend delay:
+
+| Component | Typical | Worst case | Bound by |
+|-----------|---------|------------|----------|
+| Jitter buffer | target `-l` (default 35 ms) | startup prefill 120–500 ms (one-time) | `push_packet` prefill / stability gate |
+| FIFO (AAudio pipe) | near 0 ms (drained in real time) | **341 ms** (64 KB @ 192 KB/s) | `kFifoSizeBytes` |
+| AAudio in-stream | 8–16 ms (LOW_LATENCY, ~2 bursts); larger in deep mode | device-dependent | `AAudioStream_write` back-pressure |
+| Network / UDP | RTT + jitter (see status line) | — | — |
+
+The 5 s status line reports the backend portion separately as
+`Audio: <ms>` (`ClientStats::audio_backend_delay_ms`, sampled from
+`IAudioPlayer::get_buffer_delay_frames()` = FIFO bytes + AAudio
+written−read frames), so the real audio delay is observable on top of
+the jitter `Buffer: <ms>` figure.
+
+Two client-specific latency controls keep the AAudio backend tight:
+- **Bounded FIFO (64 KB ≈ 341 ms)**: the pipe is a thread-decoupling
+  buffer, not a burst absorber — the jitter buffer (≤ ~1.28 s) owns
+  network burst absorption. The stream_daemon keeps its original 1 MB
+  for external `cat`/ffmpeg feeders; the client's smaller pipe caps how
+  much stale audio can be queued during a stall.
+- **FIFO drain on stream rebuild**: when the pump recreates the AAudio
+  stream after a stall or disconnect, everything queued in the pipe is
+  discarded so recovery resumes at live audio instead of replaying the
+  stall period.
+
+### 3.5 Heartbeat / keep-alive
 A 1 s heartbeat thread sends `HEARTBEAT_PING` with buffer level and loss counters
 (keeps NAT mappings open, feeds server-side stats), and re-handshakes when the
 server goes silent beyond `reconnect_timeout_ms`.
 
-### 3.5 Standalone tool: `stream_daemon`
+### 3.6 Standalone tool: `stream_daemon`
 `src/tools/stream_daemon.cpp` — continuous real-time AAudio FIFO daemon. Creates
 `/data/local/tmp/audio_pipe` (or `$HOME/audio_pipe`), opens it `O_RDWR` (never EOF),
 expands it to 1 MB, and pumps 20 ms chunks into a low-latency AAudio stream with
