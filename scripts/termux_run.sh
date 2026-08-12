@@ -184,6 +184,8 @@ if [ "$(id -u)" -ne 0 ]; then
         su -c "$CMD"
     elif [ "$IS_AAUDIO" -eq 1 ]; then
         echo "AAudio backend: running as the normal Termux user (no root needed)."
+        echo "Note: if AAudio does not work on this device, the AGM/ALSA fallbacks need root -"
+        echo "re-run with '-b auto' (or '-d agm') via su in that case."
         exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
     else
         if ! command -v su >/dev/null 2>&1; then

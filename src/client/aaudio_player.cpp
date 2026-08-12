@@ -676,12 +676,21 @@ bool AaudioFifoPlayer::open_stream_and_probe(bool quiet, std::string* out_reason
         *out_reason = fail_reason;
     }
     if (!ready) {
+        // Non-root: the AGM/ALSA fallbacks need root and will fail with
+        // permission errors - tell the user to run with su (via termux_run.sh
+        // with -b auto) so the AGM fallback can actually take over.
+        const bool non_root = (getuid() != 0);
         report("ERROR",
                "AAudio cannot render on this device (" + fail_reason +
-                   "). The stream starts but the audio data path never runs - the "
-                   "HAL/MMAP output is not consuming. Falling back to AGM/ALSA. You can also "
-                   "try '-d agm', restart Android audio ('stop audioserver && start "
-                   "audioserver'), or reboot the device.");
+                   "): the AAudio stream never finishes starting (this device's audio HAL "
+                   "has no working AAudio output). " +
+                   (non_root
+                        ? "The AGM/ALSA fallbacks need root and cannot take over in this "
+                          "non-root run - please re-run with su so AGM can play: "
+                          "./scripts/termux_run.sh -s <SERVER_IP> -d agm (or the same command "
+                          "with -b auto)."
+                        : "Falling back to AGM/ALSA. You can also restart Android audio "
+                          "('stop audioserver && start audioserver') or reboot the device."));
         {
             std::lock_guard<std::mutex> lock(stream_mutex_);
             if (stream_ != nullptr) {
