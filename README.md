@@ -194,6 +194,15 @@ make test          # 8 suites: protocol, ring buffer, jitter buffer/PLC,
                    # socket, conversion, thread/type/memory safety
 ```
 
+### Binary-only release (no source)
+The GitHub release artifact ships `audiorouter_client`, `stream_daemon` and the
+scripts without a source tree. The scripts detect this layout: `termux_setup.sh`
+installs runtime tools only (`alsa-utils` for `tinymix`) and never tries to
+compile; `termux_run.sh` uses the prebuilt binary next to it. Both exit with a
+clear message pointing at the release download when the binary is missing. The
+build scripts (`build_client.sh`, `build_stream_daemon.sh`) refuse with an
+explicit "source checkout required" error in this layout.
+
 ## 5. Usage
 
 ### Server

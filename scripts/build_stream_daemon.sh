@@ -17,6 +17,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 mkdir -p "$PROJECT_ROOT/bin"
 
+if [ ! -f "$PROJECT_ROOT/src/tools/stream_daemon.cpp" ]; then
+    echo "Error: source file src/tools/stream_daemon.cpp not found." >&2
+    echo "This is a build script for source checkouts - binary-only release" >&2
+    echo "packages ship a prebuilt 'stream_daemon' and do not need it." >&2
+    exit 1
+fi
+
 CXX=""
 if [ -n "$ANDROID_NDK_LATEST_HOME" ] && [ -f "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]; then
     CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"

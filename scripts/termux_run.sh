@@ -1,5 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # AudioRouter - Termux Android Client Runner Script
+# Works in both a source checkout (compiles the client if missing) and a
+# binary-only release artifact (uses the prebuilt 'audiorouter_client' next
+# to this script - never tries to compile without a source tree).
 # Usage: ./scripts/termux_run.sh [-s SERVER_IP] [-p PORT] [CLIENT_ARGS...]
 # Backward-compatible: ./scripts/termux_run.sh [SERVER_IP] [PORT] [CLIENT_ARGS...]
 # e.g. ./scripts/termux_run.sh 10.16.211.80 44100 -d agm -b auto
@@ -99,14 +102,18 @@ else
 fi
 
 if [ -z "$BIN_PATH" ]; then
-    if [ -f "$PROJECT_ROOT/Makefile" ]; then
+    # Build from source only when a source checkout is present; a binary-only
+    # release cannot compile, so point the user at the prebuilt artifact.
+    if [ -f "$PROJECT_ROOT/Makefile" ] && [ -d "$PROJECT_ROOT/src" ]; then
         echo "Client binary not found. Compiling now..."
         mkdir -p "$PROJECT_ROOT/bin" "$PROJECT_ROOT/build"
         make -C "$PROJECT_ROOT" client
         BIN_PATH="$PROJECT_ROOT/bin/audiorouter_client"
     else
-        echo "Error: Client binary not found and source code / Makefile is missing."
-        echo "Please compile the client first or place the 'audiorouter_client' binary in 'bin/' or PATH."
+        echo "Error: 'audiorouter_client' not found." >&2
+        echo "This is a binary-only package (no source tree to compile from)." >&2
+        echo "Download the Android release binary from GitHub Releases and place it" >&2
+        echo "next to this script, in 'bin/', or in PATH." >&2
         exit 1
     fi
 fi
