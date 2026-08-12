@@ -85,19 +85,30 @@ AaudioFifoPlayer::~AaudioFifoPlayer() {
 }
 
 std::string AaudioFifoPlayer::fifo_path() {
-    // AAudio runs as the (non-root) Termux user, whose home is writable by
-    // the app user; /data/local/tmp is shell-owned and not writable by app
-    // uids. Resolution: $HOME (the normal Termux case), else the Termux home
-    // (the root-with-helper case - the helper drops to the Termux user, so
-    // parent and child agree on the path), else /data/local/tmp.
+    // The FIFO must live somewhere the AAudio process (the non-root Termux
+    // user) can create files, AND somewhere the current process can create
+    // it too (the parent creates the FIFO as root in helper mode).
+    //   - Running as root (helper mode): always /data/local/tmp - root can
+    //     create there, and the helper child inherits the fd and never needs
+    //     the path itself. $HOME is NOT usable for root: under `su` from
+    //     Termux, Magisk sets HOME=/ (read-only -> 'mkfifo(//...fifo)
+    //     failed: Read-only file system'), and the Termux home itself is in
+    //     Android's per-app sandbox which denies even root by path rules.
+    //   - Non-root (normal Termux app user): $HOME is the app's own home
+    //     (writable); fall back to the Termux home (when the current user
+    //     owns it) or /data/local/tmp.
     static const std::string path = [] {
-        if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+        if (getuid() == 0) {
+            return std::string("/data/local/tmp/audiorouter_aaudio.fifo");
+        }
+        if (const char* home = std::getenv("HOME");
+            home != nullptr && home[0] != '\0' && std::strcmp(home, "/") != 0) {
             return std::string(home) + "/audiorouter_aaudio.fifo";
         }
         uid_t uid = 0;
         gid_t gid = 0;
         std::string termux_home;
-        if (AndroidHelpers::termux_user(&uid, &gid, &termux_home)) {
+        if (AndroidHelpers::termux_user(&uid, &gid, &termux_home) && getuid() == uid) {
             return termux_home + "/audiorouter_aaudio.fifo";
         }
         return std::string("/data/local/tmp/audiorouter_aaudio.fifo");
@@ -262,7 +273,9 @@ void AaudioFifoPlayer::helper_child_main(int status_fd) {
         ::write(status_fd, "F", 1);
         _exit(1);
     }
-    ::setenv("HOME", home.c_str(), 1);
+    // Note: we do NOT setenv HOME here. The helper uses the FIFO fd inherited
+    // from the parent (created at /data/local/tmp as root); it never creates
+    // the FIFO itself, so it never needs a writable path of its own.
     if (::setgroups(0, nullptr) != 0 || ::setgid(gid) != 0 || ::setuid(uid) != 0) {
         std::fprintf(stderr, "AaudioFifoPlayer: helper: privilege drop failed: %s\n",
                      std::strerror(errno));
@@ -694,22 +707,23 @@ bool AaudioFifoPlayer::rebuild_stream_locked() {
 }
 
 bool AaudioFifoPlayer::create_fifo() {
+    resolved_fifo_ = fifo_path();
     // Re-create the pipe cleanly.
-    ::unlink(fifo_path().c_str());
-    if (::mkfifo(fifo_path().c_str(), 0666) != 0 && errno != EEXIST) {
-        LOG_ERROR("AaudioFifoPlayer: mkfifo(" << fifo_path() << ") failed: " << std::strerror(errno));
+    ::unlink(resolved_fifo_.c_str());
+    if (::mkfifo(resolved_fifo_.c_str(), 0666) != 0 && errno != EEXIST) {
+        LOG_ERROR("AaudioFifoPlayer: mkfifo(" << resolved_fifo_ << ") failed: " << std::strerror(errno));
         return false;
     }
-    ::chmod(fifo_path().c_str(), 0666);
+    ::chmod(resolved_fifo_.c_str(), 0666);
 
     // CRITICAL: open O_RDWR so Linux never sends EOF when the writer
     // (the client playback thread) pauses or disconnects; the pump thread
     // keeps reading continuously instead of exiting. O_NONBLOCK additionally
     // lets close() unblock a writer/reader stuck on a full/empty pipe.
-    fifo_fd_ = ::open(fifo_path().c_str(), O_RDWR | O_NONBLOCK);
+    fifo_fd_ = ::open(resolved_fifo_.c_str(), O_RDWR | O_NONBLOCK);
     if (fifo_fd_ < 0) {
-        LOG_ERROR("AaudioFifoPlayer: failed to open FIFO " << fifo_path() << ": " << std::strerror(errno));
-        ::unlink(fifo_path().c_str());
+        LOG_ERROR("AaudioFifoPlayer: failed to open FIFO " << resolved_fifo_ << ": " << std::strerror(errno));
+        ::unlink(resolved_fifo_.c_str());
         return false;
     }
 
@@ -724,7 +738,7 @@ void AaudioFifoPlayer::destroy_fifo() {
         ::close(fifo_fd_);
         fifo_fd_ = -1;
     }
-    ::unlink(fifo_path().c_str());
+    ::unlink((resolved_fifo_.empty() ? fifo_path() : resolved_fifo_).c_str());
 }
 
 void AaudioFifoPlayer::pump_loop() {

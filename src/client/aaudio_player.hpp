@@ -158,6 +158,10 @@ private:
     int status_fd_ = -1;
     std::thread monitor_thread_;
     std::atomic<bool> stop_monitor_{false};
+    // FIFO path resolved for the CURRENT process (see fifo_path()). Stored so
+    // create_fifo()/unlink use the same path the child inherited, even if the
+    // child sets HOME to the Termux home.
+    std::string resolved_fifo_;
 };
 
 } // namespace audiorouter
