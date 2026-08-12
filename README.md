@@ -223,12 +223,24 @@ speaker, Bluetooth, USB — **without root and without touching the mixer**.
 This makes it the best option for stock, non-rooted devices, or whenever
 another app's audio should keep working alongside AudioRouter.
 
+> ⚠️ **Must run as a normal (non-root) user.** Android's audio policy blocks
+> the AAudio/MMAP data path for **UID 0 (root)**: root processes have no app
+> attribution token, so the stream opens and reaches STARTED but never
+> actually renders (every `AAudioStream_write` returns 0). AAudio is designed
+> to run as the standard Termux app user (`u0_a...`). `termux_run.sh`
+> detects `-d aaudio` and runs the client **without `su`** automatically; if
+> the client is launched under root it fails fast and falls back to the
+> root-capable backends (AGM/ALSA) instead of playing silence.
+
 ### How it works
 
-- The client writes PCM into a FIFO at `/data/local/tmp/audiorouter_aaudio.fifo`
-  (opened `O_RDWR`, capacity expanded to 1 MB ≈ 5 s of audio).
+- The client writes PCM into a FIFO under the Termux user's home —
+  `$HOME/audiorouter_aaudio.fifo` (falling back to
+  `/data/local/tmp/audiorouter_aaudio.fifo` when `$HOME` is unset). The
+  home is writable by the non-root app user, `/data/local/tmp` is not.
+  The FIFO is opened `O_RDWR` with the capacity expanded to 1 MB ≈ 5 s.
 - A background pump thread reads the FIFO (never EOF) and feeds
-  `AAudioStream_write()` in ~20 ms chunks with a 500 ms timeout — the same
+  `AAudioStream_write()` in ~20 ms chunks with a 200 ms timeout — the same
   engine as the standalone `stream_daemon`.
 - The FIFO provides natural back-pressure: if the network delivers faster than
   the device consumes, the pipe fills and the jitter buffer drains instead of
@@ -262,18 +274,21 @@ Android API 26+ and `libaaudio` is linkable:
 ### Standalone stream_daemon tool
 
 `src/tools/stream_daemon.cpp` is the standalone version of the same engine:
-it exposes a FIFO (default `/data/local/tmp/audio_pipe`, 48 kHz stereo S16)
-and plays whatever is written into it through AAudio. Useful when another
-process owns the PCM and you do not want the full client:
+it exposes a FIFO (default `$HOME/audio_pipe`, falling back to
+`/data/local/tmp/audio_pipe` when `$HOME` is unset; 48 kHz stereo S16) and
+plays whatever is written into it through AAudio. Useful when another
+process owns the PCM and you do not want the full client. Like the client
+backend, it must run as a normal (non-root) user — it prints a warning if
+started as root.
 
 ```bash
 # Build with the NDK (or: ./scripts/build_stream_daemon.sh)
 clang++ -O2 -Wno-unavailable-declarations -target aarch64-linux-android30 \
     -o stream_daemon src/tools/stream_daemon.cpp -laaudio -lm
 
-# Run it, then feed it raw interleaved S16 stereo PCM:
+# Run it (no su!), then feed it raw interleaved S16 stereo PCM:
 ./stream_daemon
-cat audio.raw > /data/local/tmp/audio_pipe
+cat audio.raw > ~/audio_pipe
 ```
 
 ---

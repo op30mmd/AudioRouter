@@ -27,8 +27,12 @@
 // FIFO + AAudio streaming engine directly, so a separate daemon is only
 // needed when another process owns the PCM.
 //
-// No root required: AAudio goes through Android's audio HAL / AudioFlinger,
-// so this works on stock devices (Android 8.0+).
+// No root required - and root must NOT be used: AAudio goes through Android's
+// audio HAL / AudioFlinger, and Android audio policy blocks the AAudio/MMAP
+// data path for UID 0 (root has no app attribution token), so a root-launched
+// stream opens but never renders. Run this daemon as the normal Termux user
+// (u0_a...). The default FIFO path therefore lives under $HOME when set
+// (the Termux home is writable by the app user; /data/local/tmp is not).
 
 #include <cstdio>
 #include <cstdlib>
@@ -113,12 +117,29 @@ bool open_stream(StreamHandle* h, int sample_rate) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Default FIFO: $HOME (writable by the non-root Termux user) when set,
+    // else /data/local/tmp (the classic path, for root/shell environments).
+    static std::string home_pipe;
     const char* fifo_path = "/data/local/tmp/audio_pipe";
+    if (argc > 1) {
+        fifo_path = argv[1];
+    } else if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+        home_pipe = std::string(home) + "/audio_pipe";
+        fifo_path = home_pipe.c_str();
+    }
     int sample_rate = 48000;
-    if (argc > 1) fifo_path = argv[1];
     if (argc > 2) {
         const int parsed = std::atoi(argv[2]);
         if (parsed > 0) sample_rate = parsed;
+    }
+
+    // AAudio is blocked for UID 0 by Android audio policy (root has no app
+    // attribution token): the stream opens but never renders. Warn loudly so
+    // a silent run is diagnosable.
+    if (::getuid() == 0) {
+        std::printf("[-] Warning: running as root (UID 0). Android audio policy blocks the\n");
+        std::printf("    AAudio data path for root - the stream may open but never render.\n");
+        std::printf("    Run this daemon as the normal Termux user (no su) for AAudio.\n");
     }
 
     // Re-create the pipe cleanly.
@@ -157,6 +178,7 @@ int main(int argc, char* argv[]) {
 
     uint8_t buffer[kBufferFrames * kBytesPerFrame];
     size_t residual = 0;
+    long long zero_write_count = 0;
 
     std::printf("[+] Streaming engine active! Waiting for audio data...\n");
     std::printf("[+] Feed it:  cat audio.raw > %s\n", fifo_path);
@@ -214,6 +236,18 @@ int main(int argc, char* argv[]) {
                 AAudioStream_write(handle.stream, buffer, framesAvailable, kWriteTimeoutNs);
             if (framesWritten < 0) {
                 AAudioStream_requestStart(handle.stream);
+            } else if (framesWritten == 0) {
+                // 0 frames = the stream is not rendering (dead MMAP path;
+                // commonly the root-UID block). Report it, throttled.
+                ++zero_write_count;
+                if (zero_write_count == 1 || zero_write_count % 200 == 0) {
+                    std::printf("[-] AAudioStream_write returned 0 frames (%lld times) - "
+                                "the stream is not rendering. Running as root blocks AAudio; "
+                                "run the daemon as a normal user.\n",
+                                static_cast<long long>(zero_write_count));
+                }
+            } else {
+                zero_write_count = 0;
             }
         }
 

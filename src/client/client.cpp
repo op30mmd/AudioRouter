@@ -295,6 +295,12 @@ bool AudioRouterClient::start() {
     if (AndroidHelpers::is_running_as_root()) {
         LOG_INFO("Running with root privileges (UID 0). Direct ALSA access enabled.");
         AndroidHelpers::fix_snd_permissions();
+        if (is_aaudio_device(config_.device_name)) {
+            LOG_WARN("AAudio is blocked under root (UID 0) by Android audio policy (root has no "
+                     "app attribution token, so the AAudio data path never renders). The client "
+                     "will fall back to AGM/ALSA. To use AAudio, run without su - termux_run.sh "
+                     "does this automatically for '-d aaudio'.");
+        }
     } else {
         LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'sudo' in Termux.");
     }

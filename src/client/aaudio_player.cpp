@@ -3,6 +3,7 @@
 #include "../common/time_util.hpp"
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <vector>
@@ -19,8 +20,10 @@
 
 namespace {
 
-// FIFO that carries PCM from write_frames() to the AAudio pump thread.
-constexpr const char* kFifoPath = "/data/local/tmp/audiorouter_aaudio.fifo";
+// The FIFO carries PCM from write_frames() to the AAudio pump thread. It is
+// resolved at runtime (see AaudioFifoPlayer::fifo_path()): AAudio must run as
+// the non-root Termux user, and that user cannot write /data/local/tmp
+// (shell-owned), so the FIFO lives under $HOME when available.
 
 // Expand the pipe capacity to 1 MB (~5 s of 48 kHz stereo audio). The pipe is
 // the back-pressure buffer between the network and the AAudio stream; a small
@@ -66,6 +69,20 @@ AaudioFifoPlayer::~AaudioFifoPlayer() {
     close();
 }
 
+std::string AaudioFifoPlayer::fifo_path() {
+    // AAudio runs as the (non-root) Termux user, whose home is writable;
+    // /data/local/tmp is owned by 'shell' and not writable by app uids, so it
+    // is only the fallback when $HOME is unset (e.g. a root shell).
+    static const std::string path = [] {
+        std::string dir = "/data/local/tmp";
+        if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+            dir = home;
+        }
+        return dir + "/audiorouter_aaudio.fifo";
+    }();
+    return path;
+}
+
 bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device_name) {
 #if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     if (is_open_.load()) close();
@@ -74,6 +91,22 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
     consecutive_write_failures_ = 0;
     stall_rebuilds_ = 0;
     deep_retry_ = false;
+
+    // AAudio is attributed to the calling app; UID 0 (root) has no app
+    // attribution token, so Android audio policy blocks the AAudio/MMAP data
+    // path for root: the stream opens and reaches STARTED but never renders
+    // (every write returns 0). AAudio must run as the normal Termux user
+    // (u0_a...). Fail fast so the client falls back to the root-capable
+    // backends (AGM/ALSA) instead of playing silence. Escape hatch for
+    // devices/ROMs that do allow root: AUDIOROUTER_AAUDIO_AS_ROOT=1.
+    if (getuid() == 0 && std::getenv("AUDIOROUTER_AAUDIO_AS_ROOT") == nullptr) {
+        LOG_ERROR("AaudioFifoPlayer: AAudio is blocked for UID 0 (root) by Android audio "
+                  "policy (root has no app attribution token, so the AAudio data path never "
+                  "renders). Run the client as the normal Termux user - termux_run.sh does "
+                  "this automatically for '-d aaudio' - or use a root-capable backend "
+                  "instead: '-d agm' / '-d default'.");
+        return false;
+    }
 
     config_ = config;
     if (config_.sample_rate == 0) config_.sample_rate = 48000;
@@ -156,7 +189,7 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
              << " Hz, " << AAudioStream_getChannelCount(static_cast<AAudioStream*>(stream_))
              << " ch, mode '" << mode_ << "', state "
              << AAudioStream_getState(static_cast<AAudioStream*>(stream_))
-             << ", FIFO " << kFifoPath);
+             << ", FIFO " << fifo_path());
 
     stop_pump_.store(false);
     is_open_.store(true);
@@ -191,7 +224,7 @@ void AaudioFifoPlayer::close() {
         ::close(fifo_fd_);
         fifo_fd_ = -1;
     }
-    ::unlink(kFifoPath);
+    ::unlink(fifo_path().c_str());
 
     frames_in_flight_.store(0);
     is_open_.store(false);
@@ -440,21 +473,21 @@ bool AaudioFifoPlayer::rebuild_stream_locked() {
 
 bool AaudioFifoPlayer::create_fifo() {
     // Re-create the pipe cleanly.
-    ::unlink(kFifoPath);
-    if (::mkfifo(kFifoPath, 0666) != 0 && errno != EEXIST) {
-        LOG_ERROR("AaudioFifoPlayer: mkfifo(" << kFifoPath << ") failed: " << std::strerror(errno));
+    ::unlink(fifo_path().c_str());
+    if (::mkfifo(fifo_path().c_str(), 0666) != 0 && errno != EEXIST) {
+        LOG_ERROR("AaudioFifoPlayer: mkfifo(" << fifo_path() << ") failed: " << std::strerror(errno));
         return false;
     }
-    ::chmod(kFifoPath, 0666);
+    ::chmod(fifo_path().c_str(), 0666);
 
     // CRITICAL: open O_RDWR so Linux never sends EOF when the writer
     // (the client playback thread) pauses or disconnects; the pump thread
     // keeps reading continuously instead of exiting. O_NONBLOCK additionally
     // lets close() unblock a writer/reader stuck on a full/empty pipe.
-    fifo_fd_ = ::open(kFifoPath, O_RDWR | O_NONBLOCK);
+    fifo_fd_ = ::open(fifo_path().c_str(), O_RDWR | O_NONBLOCK);
     if (fifo_fd_ < 0) {
-        LOG_ERROR("AaudioFifoPlayer: failed to open FIFO " << kFifoPath << ": " << std::strerror(errno));
-        ::unlink(kFifoPath);
+        LOG_ERROR("AaudioFifoPlayer: failed to open FIFO " << fifo_path() << ": " << std::strerror(errno));
+        ::unlink(fifo_path().c_str());
         return false;
     }
 
@@ -469,7 +502,7 @@ void AaudioFifoPlayer::destroy_fifo() {
         ::close(fifo_fd_);
         fifo_fd_ = -1;
     }
-    ::unlink(kFifoPath);
+    ::unlink(fifo_path().c_str());
 }
 
 void AaudioFifoPlayer::pump_loop() {
@@ -609,7 +642,7 @@ void AaudioFifoPlayer::pump_loop() {
             ::close(fifo_fd_);
             fifo_fd_ = -1;
         }
-        ::unlink(kFifoPath);
+        ::unlink(fifo_path().c_str());
     }
 }
 

@@ -5,13 +5,18 @@
 # e.g. ./scripts/termux_run.sh 10.16.211.80 44100 -d agm -b auto
 #      ./scripts/termux_run.sh -s 10.58.30.80 -d aaudio -b auto
 #
-# The client is ALWAYS launched through its ABSOLUTE path, wrapped in
-#     su -c "/data/data/com.termux/files/home/AudioRouter/bin/audiorouter_client <args>"
-# This is required for the AAudio build: it links /system/lib64/libaaudio.so
-# by absolute path, which only the Android/system dynamic linker resolves.
-# Launching the binary from the Termux shell environment fails at runtime
-# with linker errors, so no LD_LIBRARY_PATH/HOME/chmod preamble is injected
-# into the su command - the plain absolute-path invocation is what works.
+# The client is ALWAYS launched through its ABSOLUTE path.
+#   - Root-requiring backends (ALSA/AGM/direct): wrapped in
+#       su -c "/data/data/com.termux/files/home/AudioRouter/bin/audiorouter_client <args>"
+#     The AAudio build links /system/lib64/libaaudio.so by absolute path, which
+#     only the Android/system dynamic linker resolves, so the su command is the
+#     plain absolute-path invocation without any LD_LIBRARY_PATH/HOME/chmod
+#     preamble.
+#   - AAudio (-d aaudio / aaudio:*): runs WITHOUT su, as the normal Termux user
+#     (u0_a...). Android audio policy blocks AAudio/MMAP data paths for UID 0
+#     (root has no app attribution token): the stream opens but never renders.
+#     If the script itself is already root, it switches to the Termux app user
+#     via 'su <termux_uid>' when it can determine it.
 
 SERVER_IP=""
 PORT="44100"
@@ -148,14 +153,43 @@ done
 echo "Connecting to Windows Server at $SERVER_IP:$PORT..."
 echo "Running: $CMD"
 
+# AAudio must run as a normal app user: Android audio policy blocks the
+# AAudio/MMAP data path for UID 0 (root has no app attribution token), so a
+# root-launched AAudio stream opens but never renders.
+IS_AAUDIO=0
+for a in "${CLIENT_ARGS[@]}"; do
+    case "$a" in
+        aaudio|aaudio:*) IS_AAUDIO=1 ;;
+    esac
+done
+
 if [ "$(id -u)" -ne 0 ]; then
+    if [ "$IS_AAUDIO" -eq 1 ]; then
+        echo "AAudio backend: running as the normal Termux user (no root) - required for AAudio."
+        exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
+    fi
     if ! command -v su >/dev/null 2>&1; then
         echo "Error: not running as root and 'su' is not available. Run 'su' first or install su." >&2
         exit 1
     fi
     echo "Requesting root privileges via su..."
     su -c "$CMD"
+elif [ "$IS_AAUDIO" -eq 1 ]; then
+    # Already root (e.g. a root shell) but AAudio requested: switch to the
+    # Termux app user so the AAudio data path is attributed to a real app.
+    TERMUX_UID="$(stat -c %u /data/data/com.termux/files/home 2>/dev/null)"
+    if [ -n "$TERMUX_UID" ] && [ "$TERMUX_UID" -ne 0 ] 2>/dev/null; then
+        echo "AAudio backend: running as Termux user (UID $TERMUX_UID) - root blocks AAudio."
+        CMD_AS_USER="export HOME=/data/data/com.termux/files/home; $CMD"
+        su "$TERMUX_UID" -c "$CMD_AS_USER"
+    else
+        echo "Warning: cannot determine the Termux user; running AAudio as root."
+        echo "Android blocks AAudio for root - the client will fall back to AGM/ALSA."
+        echo "For AAudio, run this script from the Termux app without su."
+        exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
+    fi
 else
-    # Already root (Android/system shell): launch the absolute path directly.
+    # Already root (Android/system shell) with a root-requiring backend:
+    # launch the absolute path directly.
     exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
 fi

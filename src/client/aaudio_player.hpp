@@ -16,27 +16,38 @@ namespace audiorouter {
 // AudioFlinger / the audio HAL, so playback works through the normal Android
 // audio policy (speaker, Bluetooth, USB, ...) WITHOUT ROOT and WITHOUT
 // touching /dev/snd or ALSA. This is the only client backend that runs on
-// stock, non-rooted devices. The cost is that it is a "managed" path: the
-// audio is mixed by Android (a notification can duck it) and the stream can
-// be preempted on routing changes (headphones unplugged, BT reconnect).
+// stock, non-rooted devices.
+//
+// IMPORTANT: AAudio must run as a NORMAL app user (u0_a...), never as root.
+// Android audio policy blocks AAudio/MMAP data paths created by UID 0
+// because root processes have no app attribution token: the stream opens and
+// reaches STARTED but the data path never renders (every write returns 0).
+// termux_run.sh detects '-d aaudio' and runs the client without su; this
+// player also fails fast when it detects UID 0 so the client falls back to
+// the root-capable backends (AGM/ALSA) instead of playing silence.
 //
 // Design (mirrors the standalone `stream_daemon` tool in src/tools/):
-//   - PCM is written into a FIFO at /data/local/tmp/audiorouter_aaudio.fifo.
+//   - PCM is written into a FIFO under $HOME (the Termux user's home, which
+//     a non-root app can write - /data/local/tmp is shell-only), falling back
+//     to /data/local/tmp when $HOME is unset.
 //   - A background pump thread reads the FIFO (blocking semantics, never
 //     EOF because the fd is opened O_RDWR) and feeds AAudioStream_write()
-//     in ~20 ms chunks with a 500 ms timeout, exactly like the standalone
-//     daemon. The FIFO gives natural back-pressure: when AAudio consumes
-//     slower than the network delivers, the pipe fills and write_frames()
-//     blocks, which drains the jitter buffer instead of dropping.
+//     in ~20 ms chunks with a 200 ms timeout. The FIFO gives natural
+//     back-pressure: when AAudio consumes slower than the network delivers,
+//     the pipe fills and write_frames() blocks, which drains the jitter
+//     buffer instead of dropping.
 //   - Underrun/pause recovery: if the stream is PAUSED/STOPPED or a write
 //     fails, the stream is requestStart()ed again; if it is DISCONNECTED
 //     (routing change), the stream is recreated from the builder config
-//     (rate-limited).
+//     (rate-limited). A stream that reaches STARTED but whose data path
+//     never produces timestamps (dead MMAP path) is detected at open() via
+//     AAudioStream_getTimestamp and retried with the deep-buffer
+//     performance mode (legacy AudioTrack path), then given up on.
 //
 // Device naming (select with -d):
-//   aaudio              -> USAGE_MEDIA + LOW_LATENCY (default, like the daemon)
+//   aaudio              -> USAGE_MEDIA + LOW_LATENCY (default)
 //   aaudio:deep         -> USAGE_MEDIA + PERFORMANCE_MODE_NONE (power saver /
-//                          deep buffer; more stable, slightly higher latency)
+//                          deep buffer; also the legacy-AudioTrack fallback)
 //   aaudio:voip         -> USAGE_VOICE_COMMUNICATION + LOW_LATENCY (routes
 //                          like a call; useful when the stock audio policy
 //                          otherwise ducks the stream)
@@ -61,6 +72,10 @@ public:
     // True when this binary was compiled with AAudio support (Android API 26+
     // toolchain with libaaudio available).
     static bool is_supported();
+
+    // Resolved FIFO path: $HOME/audiorouter_aaudio.fifo when HOME is set
+    // (non-root Termux), else /data/local/tmp/audiorouter_aaudio.fifo.
+    static std::string fifo_path();
 
 private:
 #if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
