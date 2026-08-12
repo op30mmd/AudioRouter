@@ -66,6 +66,10 @@ private:
 #if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     void pump_loop();
     void configure_builder(void* builder);   // AAudioStreamBuilder*
+    // Blocks (up to timeout_ms) until the stream leaves the not-started
+    // states (OPEN/UNKNOWN). Caller must hold stream_mutex_. Returns false on
+    // timeout or if the stream went DISCONNECTED/CLOSED.
+    bool wait_for_start_locked(int timeout_ms);
     bool ensure_stream_started_locked();
     bool rebuild_stream_locked();
     bool create_fifo();
@@ -95,6 +99,19 @@ private:
     // Timestamp of the last write-failure warning (rate limit so a wedged
     // stream can't flood the log at 50 lines/second).
     uint64_t last_write_warn_ms_ = 0;
+    // Consecutive AAudioStream_write calls that failed or wrote only part of
+    // the chunk (reset on a full write). Used to detect a stream that opened
+    // but never actually renders (a session the HAL cannot start).
+    int consecutive_write_failures_ = 0;
+    // Number of times the pump rebuilt the stream due to persistent stalls.
+    // After the first stall-rebuild, the next one falls back to the
+    // deep-buffer performance mode, which starts on HALs that reject
+    // low-latency sessions.
+    int stall_rebuilds_ = 0;
+    // Force PERFORMANCE_MODE_NONE when (re)building the stream: set by open()
+    // when the low-latency stream never starts, and by the pump after
+    // repeated mid-stream stalls.
+    bool deep_retry_ = false;
 };
 
 } // namespace audiorouter

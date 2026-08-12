@@ -401,8 +401,12 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
 
     // Route the codec to the speaker before any open attempt so a successful
     // open has an audible path right away. Best effort: some devices name the
-    // mixer controls differently.
-    AndroidHelpers::apply_speaker_routing();
+    // mixer controls differently. NOT for AAudio: the audio HAL owns the mixer
+    // for AAudio streams, and force-routing the codec from outside (tinymix)
+    // can jam the HAL's session start - the stream opens but never renders.
+    if (!is_aaudio_device(device_name)) {
+        AndroidHelpers::apply_speaker_routing();
+    }
 
     {
         std::lock_guard<std::mutex> lock(open_->mutex);

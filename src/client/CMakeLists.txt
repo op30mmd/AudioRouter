@@ -51,9 +51,13 @@ elseif (ANDROID)
     if (ANDROID_PLATFORM MATCHES "^android-(2[6-9]|[3-9][0-9])$" OR
         ANDROID_PLATFORM MATCHES "^(2[6-9]|[3-9][0-9])$")
         target_link_libraries(audiorouter_client PRIVATE aaudio)
+        # AAUDIO_ENABLED gates the real AAudio backend in aaudio_player.cpp
+        # (matches the Makefile probe); without it the player is a stub.
+        target_compile_definitions(audiorouter_client PRIVATE AAUDIO_ENABLED=1)
         # Standalone AAudio FIFO daemon (see src/tools/stream_daemon.cpp).
         add_executable(stream_daemon ../tools/stream_daemon.cpp)
         target_link_libraries(stream_daemon PRIVATE aaudio)
+        target_compile_definitions(stream_daemon PRIVATE AAUDIO_ENABLED=1)
     endif()
 else()
     target_link_libraries(audiorouter_client PRIVATE

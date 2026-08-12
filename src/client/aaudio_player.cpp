@@ -27,8 +27,10 @@ constexpr const char* kFifoPath = "/data/local/tmp/audiorouter_aaudio.fifo";
 constexpr int kFifoSizeBytes = 1048576;
 
 // How long AAudioStream_write() may block for space in the AAudio buffer.
-// Mirrors the standalone stream_daemon (500 ms).
-constexpr int64_t kWriteTimeoutNs = 500000000LL;
+// 200 ms is far above the ~20 ms a 960-frame chunk needs on a healthy stream,
+// but short enough that a stream which opened yet never starts rendering is
+// detected quickly (the daemon keeps the original 500 ms).
+constexpr int64_t kWriteTimeoutNs = 200000000LL;
 
 // Poll timeouts keep shutdown responsive: the pump polls the FIFO for 100 ms
 // at a time and write_frames() waits at most 50 ms for pipe space, both
@@ -39,6 +41,14 @@ constexpr int kWritePollMs = 50;
 // Minimum gap between AAudio stream recreations (a flapping routing change
 // must not thrash stream open/close).
 constexpr uint64_t kMinRebuildIntervalMs = 1000;
+
+// How long open() waits for the stream to actually start (requestStart is
+// asynchronous) before declaring it wedged.
+constexpr int kStartWaitMs = 1500;
+
+// A stream that fails/stalls this many consecutive writes (~1.6 s at the
+// 200 ms write timeout) is considered wedged and gets recreated.
+constexpr int kStallRebuildThreshold = 8;
 
 } // namespace
 
@@ -53,6 +63,11 @@ AaudioFifoPlayer::~AaudioFifoPlayer() {
 bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device_name) {
 #if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     if (is_open_.load()) close();
+
+    // Fresh session: reset the stall-recovery state from any previous run.
+    consecutive_write_failures_ = 0;
+    stall_rebuilds_ = 0;
+    deep_retry_ = false;
 
     config_ = config;
     if (config_.sample_rate == 0) config_.sample_rate = 48000;
@@ -97,10 +112,40 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
         AAudioStream_requestStart(opened);
     }
 
+    // requestStart() is asynchronous. A stream that opens but never actually
+    // starts rendering (the HAL cannot start the session, e.g. the codec
+    // route is held by a stale session or a low-latency session is refused)
+    // would otherwise eat 200 ms write timeouts forever while the FIFO fills
+    // up and the jitter buffer overflows. Wait for it to start.
+    bool started = false;
+    {
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        started = wait_for_start_locked(kStartWaitMs);
+    }
+    if (!started) {
+        LOG_WARN("AaudioFifoPlayer: AAudio stream did not start within " << kStartWaitMs
+                 << " ms; retrying with deep-buffer performance mode");
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            deep_retry_ = true;
+            rebuild_stream_locked();
+            started = stream_ != nullptr && wait_for_start_locked(kStartWaitMs);
+        }
+        if (!started) {
+            LOG_ERROR("AaudioFifoPlayer: AAudio stream will not start on this device. "
+                      "The AAudio backend cannot play here; the client will fall back "
+                      "to AGM/ALSA. You can also try '-d aaudio:deep'.");
+            close();
+            return false;
+        }
+    }
+
     LOG_INFO("AaudioFifoPlayer: AAudio stream opened: "
              << AAudioStream_getSampleRate(static_cast<AAudioStream*>(stream_))
              << " Hz, " << AAudioStream_getChannelCount(static_cast<AAudioStream*>(stream_))
-             << " ch, mode '" << mode_ << "', FIFO " << kFifoPath);
+             << " ch, mode '" << mode_ << "', state "
+             << AAudioStream_getState(static_cast<AAudioStream*>(stream_))
+             << ", FIFO " << kFifoPath);
 
     stop_pump_.store(false);
     is_open_.store(true);
@@ -255,19 +300,41 @@ void AaudioFifoPlayer::configure_builder(void* builder_ptr) {
     if (mode_ == "voip") {
         AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_VOICE_COMMUNICATION);
         AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_SPEECH);
-        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    } else if (mode_ == "deep") {
-        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
-        AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
-        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_NONE);
     } else {
         AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
         AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
-        AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     }
+    // deep_retry_ downgrades a low-latency session to the deep-buffer path:
+    // some HALs refuse to start low-latency streams (the stream opens but
+    // never renders), while the deep-buffer session starts fine.
+    AAudioStreamBuilder_setPerformanceMode(builder,
+        (deep_retry_ || mode_ == "deep") ? AAUDIO_PERFORMANCE_MODE_NONE
+                                         : AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
 #else
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
 #endif
+}
+
+bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms) {
+    if (stream_ == nullptr) return false;
+    auto* stream = static_cast<AAudioStream*>(stream_);
+
+    const uint64_t deadline = get_time_ms() + timeout_ms;
+    while (get_time_ms() < deadline) {
+        const aaudio_stream_state_t state = AAudioStream_getState(stream);
+        if (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING) {
+            return true;  // started, or the HAL accepted the start request
+        }
+        if (state == AAUDIO_STREAM_STATE_DISCONNECTED ||
+            state == AAUDIO_STREAM_STATE_CLOSED ||
+            state == AAUDIO_STREAM_STATE_UNINITIALIZED) {
+            return false;  // dead stream, no point waiting
+        }
+        // Not started yet: keep (re)issuing the start request and poll.
+        AAudioStream_requestStart(stream);
+        sleep_ms(50);
+    }
+    return false;
 }
 
 // Restarts the stream when it is not running (underrun, pause, stop).
@@ -302,6 +369,7 @@ bool AaudioFifoPlayer::rebuild_stream_locked() {
         stream_ = nullptr;
     }
     frames_in_flight_.store(0);
+    consecutive_write_failures_ = 0;
 
     AAudioStreamBuilder* builder = nullptr;
     aaudio_result_t res = AAudio_createStreamBuilder(&builder);
@@ -398,20 +466,46 @@ void AaudioFifoPlayer::pump_loop() {
             const aaudio_result_t frames_written =
                 AAudioStream_write(stream, buffer.data(), static_cast<int32_t>(frames_available),
                                    kWriteTimeoutNs);
-            if (frames_written < 0) {
-                // Auto-restart the stream if it underran / was paused /
-                // disconnected mid-write. Log at most once every 5 s so a
-                // wedged stream can't flood the log.
+            if (frames_written < 0 || static_cast<size_t>(frames_written) < frames_available) {
+                // The write failed or only partially completed (timeout): the
+                // stream may be paused or wedged. Auto-restart it; if it stays
+                // wedged, recreate the session. Log at most once every 5 s so
+                // a wedged stream can't flood the log.
+                ++consecutive_write_failures_;
                 const uint64_t now_ms = get_time_ms();
                 if (now_ms - last_write_warn_ms_ >= 5000) {
                     last_write_warn_ms_ = now_ms;
-                    LOG_WARN("AaudioFifoPlayer: AAudioStream_write failed: "
-                             << AAudio_convertResultToText(static_cast<aaudio_result_t>(frames_written)));
+                    LOG_WARN("AaudioFifoPlayer: AAudioStream_write stalled (result="
+                             << frames_written << ", state="
+                             << AAudioStream_getState(stream) << ", failures="
+                             << consecutive_write_failures_ << ')');
                 }
-                if (frames_written == AAUDIO_ERROR_DISCONNECTED ||
-                    AAudioStream_getState(stream) == AAUDIO_STREAM_STATE_DISCONNECTED) {
+                const bool disconnected =
+                    frames_written == AAUDIO_ERROR_DISCONNECTED ||
+                    AAudioStream_getState(stream) == AAUDIO_STREAM_STATE_DISCONNECTED;
+                if (disconnected) {
+                    // Routing changed (headphones unplugged, BT reconnect, ...).
                     if (get_time_ms() - last_rebuild_ms_ >= kMinRebuildIntervalMs) {
                         last_rebuild_ms_ = get_time_ms();
+                        LOG_WARN("AaudioFifoPlayer: stream disconnected; recreating AAudio stream");
+                        rebuild_stream_locked();
+                    }
+                } else if (consecutive_write_failures_ >= kStallRebuildThreshold) {
+                    // Persistent stall: the session opened but never renders
+                    // (HAL cannot start it). Recreate the session; after the
+                    // first stall-rebuild, drop to the deep-buffer performance
+                    // mode, which starts on HALs that refuse low-latency.
+                    if (get_time_ms() - last_rebuild_ms_ >= kMinRebuildIntervalMs) {
+                        last_rebuild_ms_ = get_time_ms();
+                        ++stall_rebuilds_;
+                        if (stall_rebuilds_ > 1 && !deep_retry_) {
+                            deep_retry_ = true;
+                            LOG_WARN("AaudioFifoPlayer: stream keeps stalling; retrying with "
+                                     "deep-buffer performance mode");
+                        }
+                        LOG_WARN("AaudioFifoPlayer: stream wedged after "
+                                 << consecutive_write_failures_
+                                 << " failed writes; recreating AAudio stream");
                         rebuild_stream_locked();
                     }
                 } else {
@@ -420,6 +514,7 @@ void AaudioFifoPlayer::pump_loop() {
                 continue;
             }
 
+            consecutive_write_failures_ = 0;
             const int64_t written_total = AAudioStream_getFramesWritten(stream);
             const int64_t read_total = AAudioStream_getFramesRead(stream);
             frames_in_flight_.store(written_total - read_total);
