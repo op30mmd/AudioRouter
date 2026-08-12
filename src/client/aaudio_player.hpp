@@ -66,10 +66,14 @@ private:
 #if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     void pump_loop();
     void configure_builder(void* builder);   // AAudioStreamBuilder*
-    // Blocks (up to timeout_ms) until the stream leaves the not-started
-    // states (OPEN/UNKNOWN). Caller must hold stream_mutex_. Returns false on
-    // timeout or if the stream went DISCONNECTED/CLOSED.
+    // Blocks (up to timeout_ms) until the stream is fully STARTED. Caller
+    // must hold stream_mutex_. Returns false on timeout or if the stream
+    // went DISCONNECTED/CLOSED/UNINITIALIZED.
     bool wait_for_start_locked(int timeout_ms);
+    // Verifies the stream's data path is actually running: a STARTED stream
+    // whose timestamps never appear is a dead MMAP/HAL path (AAudioStream_
+    // write would return 0 forever). Non-blocking - polls getTimestamp.
+    bool probe_stream_ready();
     bool ensure_stream_started_locked();
     bool rebuild_stream_locked();
     bool create_fifo();

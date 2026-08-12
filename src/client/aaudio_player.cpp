@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <ctime>
 #include <vector>
 
 #include <fcntl.h>
@@ -43,12 +44,17 @@ constexpr int kWritePollMs = 50;
 constexpr uint64_t kMinRebuildIntervalMs = 1000;
 
 // How long open() waits for the stream to actually start (requestStart is
-// asynchronous) before declaring it wedged.
+// asynchronous) and, once STARTED, for the first valid timestamp (i.e. the
+// data path running) before declaring the stream wedged.
 constexpr int kStartWaitMs = 1500;
 
 // A stream that fails/stalls this many consecutive writes (~1.6 s at the
 // 200 ms write timeout) is considered wedged and gets recreated.
 constexpr int kStallRebuildThreshold = 8;
+
+// A stream that keeps stalling even after this many recreations is never
+// going to render on this device; give up instead of rebuilding forever.
+constexpr int kMaxStallRebuilds = 5;
 
 } // namespace
 
@@ -116,25 +122,30 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
     // starts rendering (the HAL cannot start the session, e.g. the codec
     // route is held by a stale session or a low-latency session is refused)
     // would otherwise eat 200 ms write timeouts forever while the FIFO fills
-    // up and the jitter buffer overflows. Wait for it to start.
-    bool started = false;
+    // up and the jitter buffer overflows. Wait for STARTED, then verify the
+    // data path actually runs (timestamps appear) - on some devices the
+    // stream reaches STARTED on a dead MMAP path where every write returns 0.
+    bool ready = false;
     {
         std::lock_guard<std::mutex> lock(stream_mutex_);
-        started = wait_for_start_locked(kStartWaitMs);
+        ready = wait_for_start_locked(kStartWaitMs);
     }
-    if (!started) {
-        LOG_WARN("AaudioFifoPlayer: AAudio stream did not start within " << kStartWaitMs
+    ready = ready && probe_stream_ready();
+    if (!ready) {
+        LOG_WARN("AaudioFifoPlayer: stream did not start rendering within " << kStartWaitMs
                  << " ms; retrying with deep-buffer performance mode");
         {
             std::lock_guard<std::mutex> lock(stream_mutex_);
             deep_retry_ = true;
             rebuild_stream_locked();
-            started = stream_ != nullptr && wait_for_start_locked(kStartWaitMs);
+            ready = stream_ != nullptr && wait_for_start_locked(kStartWaitMs);
         }
-        if (!started) {
-            LOG_ERROR("AaudioFifoPlayer: AAudio stream will not start on this device. "
-                      "The AAudio backend cannot play here; the client will fall back "
-                      "to AGM/ALSA. You can also try '-d aaudio:deep'.");
+        ready = ready && probe_stream_ready();
+        if (!ready) {
+            LOG_ERROR("AaudioFifoPlayer: AAudio cannot render on this device (stream starts "
+                      "but no audio data path - the HAL/MMAP output is not running). Falling "
+                      "back to AGM/ALSA. You can also try '-d agm' or '-d aaudio:deep', or "
+                      "restart Android audio ('stop audioserver && start audioserver').");
             close();
             return false;
         }
@@ -163,6 +174,17 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
 void AaudioFifoPlayer::close() {
 #if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
     stop_pump_.store(true);
+    // Close the AAudio stream FIRST, before joining the pump: a write stuck
+    // on a dead output path (the legacy AudioTrack path can block forever)
+    // is unblocked by closing the stream, otherwise the join below would
+    // hang shutdown.
+    {
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        if (stream_ != nullptr) {
+            AAudioStream_close(static_cast<AAudioStream*>(stream_));
+            stream_ = nullptr;
+        }
+    }
     if (pump_thread_.joinable()) pump_thread_.join();
 
     if (fifo_fd_ >= 0) {
@@ -171,13 +193,6 @@ void AaudioFifoPlayer::close() {
     }
     ::unlink(kFifoPath);
 
-    {
-        std::lock_guard<std::mutex> lock(stream_mutex_);
-        if (stream_ != nullptr) {
-            AAudioStream_close(static_cast<AAudioStream*>(stream_));
-            stream_ = nullptr;
-        }
-    }
     frames_in_flight_.store(0);
     is_open_.store(false);
     LOG_INFO("AaudioFifoPlayer: AAudio stream closed");
@@ -304,15 +319,16 @@ void AaudioFifoPlayer::configure_builder(void* builder_ptr) {
         AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
         AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
     }
-    // deep_retry_ downgrades a low-latency session to the deep-buffer path:
-    // some HALs refuse to start low-latency streams (the stream opens but
-    // never renders), while the deep-buffer session starts fine.
+#endif
+    // Performance mode is available since API 26 and MUST be applied on every
+    // build (not just API 28+): it selects the stream path. LOW_LATENCY uses
+    // the MMAP path when the HAL supports it; on devices where that path never
+    // produces timestamps (every write returns 0), deep_retry_ downgrades to
+    // PERFORMANCE_MODE_NONE, which uses the legacy AudioTrack path that runs
+    // through the normal mixer.
     AAudioStreamBuilder_setPerformanceMode(builder,
         (deep_retry_ || mode_ == "deep") ? AAUDIO_PERFORMANCE_MODE_NONE
                                          : AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-#else
-    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-#endif
 }
 
 bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms) {
@@ -322,16 +338,41 @@ bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms) {
     const uint64_t deadline = get_time_ms() + timeout_ms;
     while (get_time_ms() < deadline) {
         const aaudio_stream_state_t state = AAudioStream_getState(stream);
-        if (state == AAUDIO_STREAM_STATE_STARTED || state == AAUDIO_STREAM_STATE_STARTING) {
-            return true;  // started, or the HAL accepted the start request
+        if (state == AAUDIO_STREAM_STATE_STARTED) {
+            return true;  // fully started
         }
         if (state == AAUDIO_STREAM_STATE_DISCONNECTED ||
             state == AAUDIO_STREAM_STATE_CLOSED ||
             state == AAUDIO_STREAM_STATE_UNINITIALIZED) {
             return false;  // dead stream, no point waiting
         }
-        // Not started yet: keep (re)issuing the start request and poll.
+        // STARTING / OPEN / UNKNOWN: keep (re)issuing the start request and
+        // poll. AAudioStream_write returns 0 until the stream is STARTED, so
+        // open() must not proceed before this.
         AAudioStream_requestStart(stream);
+        sleep_ms(50);
+    }
+    return false;
+}
+
+bool AaudioFifoPlayer::probe_stream_ready() {
+    std::lock_guard<std::mutex> lock(stream_mutex_);
+    if (stream_ == nullptr) return false;
+    auto* stream = static_cast<AAudioStream*>(stream_);
+
+    // A STARTED stream whose data path is dead (e.g. the HAL claims MMAP
+    // support but the server never delivers timestamps) returns 0 from every
+    // AAudioStream_write forever. getTimestamp() only succeeds once the data
+    // path is actually running, so poll it: success = the device consumes.
+    const uint64_t deadline = get_time_ms() + kStartWaitMs;
+    while (get_time_ms() < deadline) {
+        int64_t frame_position = 0;
+        int64_t time_ns = 0;
+        const aaudio_result_t res =
+            AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &frame_position, &time_ns);
+        if (res == AAUDIO_OK && time_ns > 0) {
+            return true;
+        }
         sleep_ms(50);
     }
     return false;
@@ -458,14 +499,22 @@ void AaudioFifoPlayer::pump_loop() {
         residual = total_bytes % bytes_per_frame;
 
         if (frames_available > 0) {
-            std::lock_guard<std::mutex> lock(stream_mutex_);
-            if (stream_ == nullptr) break;
-            if (!ensure_stream_started_locked()) continue;
+            // Resolve the stream under the lock, but DO NOT hold the lock
+            // across AAudioStream_write(): close() (shutdown) must be able to
+            // close the stream to unblock a write that is stuck on a dead
+            // output path (the legacy AudioTrack path can block forever).
+            AAudioStream* stream = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(stream_mutex_);
+                if (stream_ == nullptr) break;  // closed (shutdown)
+                stream = static_cast<AAudioStream*>(stream_);
+                if (!ensure_stream_started_locked()) continue;
+            }
 
-            auto* stream = static_cast<AAudioStream*>(stream_);
             const aaudio_result_t frames_written =
                 AAudioStream_write(stream, buffer.data(), static_cast<int32_t>(frames_available),
                                    kWriteTimeoutNs);
+
             if (frames_written < 0 || static_cast<size_t>(frames_written) < frames_available) {
                 // The write failed or only partially completed (timeout): the
                 // stream may be paused or wedged. Auto-restart it; if it stays
@@ -475,29 +524,49 @@ void AaudioFifoPlayer::pump_loop() {
                 const uint64_t now_ms = get_time_ms();
                 if (now_ms - last_write_warn_ms_ >= 5000) {
                     last_write_warn_ms_ = now_ms;
-                    LOG_WARN("AaudioFifoPlayer: AAudioStream_write stalled (result="
-                             << frames_written << ", state="
-                             << AAudioStream_getState(stream) << ", failures="
+                    LOG_WARN("AaudioFifoPlayer: AAudioStream_write wrote " << frames_written
+                             << " of " << frames_available << " frames (state="
+                             << AAudioStream_getState(stream) << ", written="
+                             << AAudioStream_getFramesWritten(stream) << ", read="
+                             << AAudioStream_getFramesRead(stream) << ", failures="
                              << consecutive_write_failures_ << ')');
                 }
                 const bool disconnected =
                     frames_written == AAUDIO_ERROR_DISCONNECTED ||
                     AAudioStream_getState(stream) == AAUDIO_STREAM_STATE_DISCONNECTED;
+                std::lock_guard<std::mutex> lock(stream_mutex_);
+                if (stream_ == nullptr) break;  // closed concurrently (shutdown)
                 if (disconnected) {
                     // Routing changed (headphones unplugged, BT reconnect, ...).
-                    if (get_time_ms() - last_rebuild_ms_ >= kMinRebuildIntervalMs) {
-                        last_rebuild_ms_ = get_time_ms();
+                    if (now_ms - last_rebuild_ms_ >= kMinRebuildIntervalMs) {
+                        last_rebuild_ms_ = now_ms;
                         LOG_WARN("AaudioFifoPlayer: stream disconnected; recreating AAudio stream");
                         rebuild_stream_locked();
                     }
                 } else if (consecutive_write_failures_ >= kStallRebuildThreshold) {
                     // Persistent stall: the session opened but never renders
-                    // (HAL cannot start it). Recreate the session; after the
+                    // (the data path is dead). Recreate the session; after the
                     // first stall-rebuild, drop to the deep-buffer performance
-                    // mode, which starts on HALs that refuse low-latency.
-                    if (get_time_ms() - last_rebuild_ms_ >= kMinRebuildIntervalMs) {
-                        last_rebuild_ms_ = get_time_ms();
+                    // mode (legacy AudioTrack path instead of MMAP).
+                    if (now_ms - last_rebuild_ms_ >= kMinRebuildIntervalMs) {
+                        last_rebuild_ms_ = now_ms;
                         ++stall_rebuilds_;
+                        if (stall_rebuilds_ > kMaxStallRebuilds) {
+                            // Never going to render on this device; stop the
+                            // pointless rebuild loop and mark the player dead
+                            // so the playback thread stops feeding it.
+                            LOG_ERROR("AaudioFifoPlayer: giving up on AAudio after "
+                                      << kMaxStallRebuilds << " stalled stream rebuilds - the "
+                                      "AAudio data path cannot render on this device. Restart "
+                                      "the client with '-d agm' or '-d default' (or reboot "
+                                      "Android audio: 'stop audioserver && start audioserver').");
+                            if (stream_ != nullptr) {
+                                AAudioStream_close(static_cast<AAudioStream*>(stream_));
+                                stream_ = nullptr;
+                            }
+                            frames_in_flight_.store(0);
+                            break;  // exits the while loop; lock released by scope exit
+                        }
                         if (stall_rebuilds_ > 1 && !deep_retry_) {
                             deep_retry_ = true;
                             LOG_WARN("AaudioFifoPlayer: stream keeps stalling; retrying with "
@@ -515,15 +584,32 @@ void AaudioFifoPlayer::pump_loop() {
             }
 
             consecutive_write_failures_ = 0;
-            const int64_t written_total = AAudioStream_getFramesWritten(stream);
-            const int64_t read_total = AAudioStream_getFramesRead(stream);
-            frames_in_flight_.store(written_total - read_total);
+            {
+                std::lock_guard<std::mutex> lock(stream_mutex_);
+                if (stream_ == nullptr) break;  // closed concurrently (shutdown)
+                const int64_t written_total = AAudioStream_getFramesWritten(stream);
+                const int64_t read_total = AAudioStream_getFramesRead(stream);
+                frames_in_flight_.store(written_total - read_total);
+            }
         }
 
         // Keep unused fractional-frame bytes for the next iteration.
         if (residual > 0) {
             std::memmove(buffer.data(), buffer.data() + (frames_available * bytes_per_frame), residual);
         }
+    }
+
+    // The pump can exit with the player still "open" only when it gave up on
+    // a permanently stalled stream (the give-up path closed the stream and
+    // broke out of the loop). Mark the player closed so write_frames() stops
+    // feeding a dead stream.
+    if (stream_ == nullptr && is_open_.load()) {
+        is_open_.store(false);
+        if (fifo_fd_ >= 0) {
+            ::close(fifo_fd_);
+            fifo_fd_ = -1;
+        }
+        ::unlink(kFifoPath);
     }
 }
 
