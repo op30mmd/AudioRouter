@@ -34,6 +34,47 @@ else
     EXE_EXT =
 endif
 
+# AAudio (Android API 26+) support: the aaudio player and the standalone
+# stream_daemon are compiled in only when the toolchain targets Android and
+# can link libaaudio (NDK sysroot, or Termux with the ndk-sysroot package).
+# On plain Linux/CI hosts these probes fail and aaudio_player.cpp compiles as
+# a no-op stub, so the client still builds everywhere.
+ANDROID_TARGET := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ -dM -E - 2>/dev/null | grep -q '__ANDROID__' && echo 1)
+ANDROID_TRIPLE := $(shell $(CXX) -dumpmachine 2>/dev/null)
+ANDROID_TRIPLE_BASE := $(shell printf '%s' '$(ANDROID_TRIPLE)' | sed -E 's/[0-9]+$$//')
+ifeq ($(ANDROID_TARGET),1)
+    # Termux's bionic defaults to API 24; AAudio requires 26+.
+    # Hoisting with -D__ANDROID_API__=26 alone is NOT enough: bionic gates
+    # fortify declarations on __ANDROID_MIN_SDK_VERSION__ (android/versioning.h)
+    # and clang enforces availability attributes (strtof_l, strtod_l,
+    # __sendto_chk: introduced in 26) against the API level baked into the
+    # target triple, neither of which a -D macro can change. Raise the triple.
+    # Target API 30 to match the proven standalone stream_daemon build
+    # (clang++ -target aarch64-linux-android30), which plays correctly on the
+    # reference device. 26+ is required for AAudio.
+    CXXFLAGS += --target=$(ANDROID_TRIPLE_BASE)30 -Wno-unavailable-declarations
+endif
+# Probe with the same raised target triple used for compilation (a -D define
+# is not enough for library selection). Termux's sysroot ships no libaaudio
+# stub, so fall back to the device's system lib (Android 8+ has
+# /system/lib64/libaaudio.so), linked by absolute path - no -L search needed.
+ANDROID_LIBDIR := $(if $(findstring aarch64,$(ANDROID_TRIPLE_BASE)),/system/lib64,/system/lib)
+AAUDIO_SYSROOT_LINKABLE := $(shell echo 'int main(){return 0;}' | $(CXX) -x c++ --target=$(ANDROID_TRIPLE_BASE)30 -laaudio -o /dev/null 2>/dev/null && echo 1)
+AAUDIO_SYSTEM_AVAILABLE := $(shell test -f $(ANDROID_LIBDIR)/libaaudio.so && echo 1)
+ifeq ($(AAUDIO_SYSROOT_LINKABLE),1)
+    CLIENT_LIBS += -laaudio
+    HAVE_AAUDIO = 1
+else ifeq ($(AAUDIO_SYSTEM_AVAILABLE),1)
+    CLIENT_LIBS += $(ANDROID_LIBDIR)/libaaudio.so
+    HAVE_AAUDIO = 1
+endif
+ifeq ($(HAVE_AAUDIO),1)
+    # Compile the real AAudio backend only when libaaudio is linkable
+    # (it is NOT on stock Termux); otherwise aaudio_player.cpp must stub out,
+    # or the link fails with undefined AAudio* symbols.
+    CXXFLAGS += -DAAUDIO_ENABLED=1
+endif
+
 BUILD_DIR = build
 BIN_DIR = bin
 
@@ -52,10 +93,14 @@ CLIENT_SRCS = src/client/main.cpp \
               src/client/alsa_player.cpp \
               src/client/direct_alsa.cpp \
               src/client/agm_fifo_player.cpp \
+              src/client/aaudio_player.cpp \
               src/client/dummy_player.cpp \
               src/client/jitter_buffer.cpp \
               src/client/android_helpers.cpp
 CLIENT_OBJS = $(patsubst src/client/%.cpp,$(BUILD_DIR)/client_%.o,$(CLIENT_SRCS))
+
+STREAM_DAEMON_SRCS = src/tools/stream_daemon.cpp
+STREAM_DAEMON_TARGET = $(BIN_DIR)/stream_daemon$(EXE_EXT)
 
 TEST_SRCS = tests/test_main.cpp \
             tests/test_protocol.cpp \
@@ -72,13 +117,29 @@ SERVER_TARGET = $(BIN_DIR)/audiorouter_server$(EXE_EXT)
 CLIENT_TARGET = $(BIN_DIR)/audiorouter_client$(EXE_EXT)
 TEST_TARGET = $(BIN_DIR)/audiorouter_tests$(EXE_EXT)
 
-.PHONY: all clean test server client directories sanitize
+.PHONY: all clean test server client directories sanitize stream-daemon
 
 all: directories $(SERVER_TARGET) $(CLIENT_TARGET) $(TEST_TARGET)
+ifeq ($(HAVE_AAUDIO),1)
+all: $(STREAM_DAEMON_TARGET)
+endif
 
 server: directories $(SERVER_TARGET)
 
 client: directories $(CLIENT_TARGET)
+
+ifeq ($(HAVE_AAUDIO),1)
+stream-daemon: directories $(STREAM_DAEMON_TARGET)
+
+$(STREAM_DAEMON_TARGET): $(STREAM_DAEMON_SRCS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(CLIENT_LIBS)
+	@echo "Built: $(STREAM_DAEMON_TARGET)"
+else
+stream-daemon:
+	@echo "stream_daemon needs an Android API 26+ toolchain that can link libaaudio."
+	@echo "Build it with the NDK (or run ./scripts/build_stream_daemon.sh):"
+	@echo "  clang++ -O2 -Wno-unavailable-declarations -target aarch64-linux-android30 -o stream_daemon src/tools/stream_daemon.cpp -laaudio -lm"
+endif
 
 test: directories $(TEST_TARGET)
 	@echo "Running AudioRouter unit tests..."

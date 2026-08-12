@@ -1,5 +1,6 @@
 #include "client.hpp"
 #include "alsa_player.hpp"
+#include "aaudio_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
@@ -8,16 +9,13 @@
 #include <string>
 #include <csignal>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
 namespace {
     std::atomic<bool> g_shutdown_requested{false};
-
-    void signal_handler(int sig) {
-        (void)sig;
-        g_shutdown_requested.store(true);
-    }
 }
 
 int get_terminal_width() {
@@ -28,37 +26,60 @@ int get_terminal_width() {
     return 80;
 }
 
+// ANSI color for the banner: only when stdout is a terminal and the user has
+// not opted out (NO_COLOR / TERM=dumb). When piped or redirected, the banner
+// is plain ASCII so logs stay clean.
+namespace {
+bool banner_use_color() {
+    static const bool enabled = [] {
+        if (std::getenv("NO_COLOR") != nullptr) return false;
+        const char* term = std::getenv("TERM");
+        if (term != nullptr && std::strcmp(term, "dumb") == 0) return false;
+        return ::isatty(STDOUT_FILENO) == 1;
+    }();
+    return enabled;
+}
+const char* banner_cyan()   { return banner_use_color() ? "\x1b[36m" : ""; }
+const char* banner_green()  { return banner_use_color() ? "\x1b[32m" : ""; }
+const char* banner_bold()   { return banner_use_color() ? "\x1b[1m" : ""; }
+const char* banner_reset()  { return banner_use_color() ? "\x1b[0m" : ""; }
+}  // namespace
+
 void print_banner() {
     const int term_width = get_terminal_width();
+    const char* cyan  = banner_cyan();
+    const char* green = banner_green();
+    const char* bold  = banner_bold();
+    const char* reset = banner_reset();
+    const char* tag   = "Windows PC audio -> Android speakers  (AAudio / AGM / ALSA)";
 
-    if (term_width >= 90) {
-        std::cout << R"(
+    if (term_width >= 84) {
+        std::cout << cyan << R"(
   █████╗ ██╗   ██╗██████╗ ██╗ ██████╗ ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗
  ██╔══██╗██║   ██║██╔══██╗██║██╔═══██╗██╔══██╗██╔═══██╗██║   ██║╚══██╔══╝██╔════╝██╔══██╗
  ███████║██║   ██║██║  ██║██║██║   ██║██████╔╝██║   ██║██║   ██║   ██║   █████╗  ██████╔╝
  ██╔══██║██║   ██║██║  ██║██║██║   ██║██╔══██╗██║   ██║██║   ██║   ██║   ██╔══╝  ██╔══██╗
  ██║  ██║╚██████╔╝██████╔╝██║╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝
-                       [Android Termux ALSA Client (Rooted)]
-    )" << std::endl;
-    } else if (term_width >= 60) {
-        std::cout << R"(
-  ╔═╗╦ ╦╔╦╗╦╔═╗╦═╗╦ ╦╦ ╦╔╦╗╔═╗╦═╗
-  ╠═╣║ ║ ║║║║ ║╠╦╝║ ║║ ║ ║ ║╣╠╦╝
-  ╩ ╩╚═╝═╩╝╩╚═╝╩╚═╚═╝╚═╝ ╩ ╚═╝╩╚═
-        [Android Termux ALSA Client]
-    )" << std::endl;
-    } else if (term_width >= 40) {
-        std::cout << R"(
-  ╔═╗╦ ╦╔╦╗╦╔═╗
-  ╠═╣║ ║ ║║║║ ║
-  ╩ ╩╚═╝═╩╝╩╚═╝
-   AudioRouter
-   ALSA Client
-    )" << std::endl;
+)" << reset;
+    } else if (term_width >= 44) {
+        std::cout << cyan << R"(
+  ╔═╗╦ ╦╔╦╗╦╔═╗╦═╗╔═╗╦ ╦╔╦╗╔═╗╦═╗
+  ╠═╣║ ║║ ║║╠═╣╠╦╝║ ║║ ║ ║║╣╠╦╝
+  ╩ ╩╚═╝╚═╝╩╩ ╩╩╚═╚═╝╚═╝ ╩╚═╝╩╚═
+)" << reset;
     } else {
-        std::cout << "AudioRouter ALSA Client" << std::endl;
+        std::cout << cyan << bold << "AudioRouter" << reset;
     }
+
+    // Tagline on its own line, trimmed for narrow terminals.
+    std::cout << green << bold;
+    if (term_width < 52) {
+        std::cout << " - Windows PC audio -> Android speakers";
+    } else {
+        std::cout << "   " << tag;
+    }
+    std::cout << reset << "\n\n";
 }
 
 void print_usage(const char* prog) {
@@ -66,8 +87,11 @@ void print_usage(const char* prog) {
               << "Options:\n"
               << "  -s, --server <ip>         Windows PC Server IP address (e.g. 192.168.43.45 or 192.168.137.1)\n"
               << "  -p, --port <port>         Server UDP port (default: 44100)\n"
-              << "  -d, --device <dev>        ALSA device name (default: 'default', 'hw:0,0', 'direct:/dev/snd/pcmC0D0p',\n"
-              << "                              'agm' = Qualcomm AGM backend 'CODEC_DMA-LPAIF_RXTX-RX-1', 'agm:<backend>')\n"
+              << "  -d, --device <dev>        Audio device (default: 'default'):\n"
+              << "                              ALSA: 'default', 'hw:0,0', 'plughw:0,0'\n"
+              << "                              Direct kernel: 'direct:/dev/snd/pcmC0D0p' or any '/dev/snd/...'\n"
+              << "                              Qualcomm AGM: 'agm' or 'agm:<backend>'\n"
+              << "                              AAudio (NO ROOT needed): 'aaudio', 'aaudio:deep', 'aaudio:voip'\n"
               << "  -l, --latency <ms>        Target Jitter Buffer latency in ms (default: 35ms)\n"
               << "  -b, --bind <iface>        Pin UDP socket to a network interface (bypasses Android VPN tunnels):\n"
               << "                              'auto' = detect physical NIC (e.g. wlan0), or specify e.g. 'wlan0'\n"
@@ -91,6 +115,29 @@ void print_usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+    // Install signal handlers FIRST, before anything else, so Ctrl+C / kill
+    // always reach the graceful path (and never interrupt a thread mid-
+    // shutdown in a way that could crash).
+    {
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = [](int) { g_shutdown_requested.store(true); };
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;  // no SA_RESTART: interrupt blocking calls promptly
+        ::sigaction(SIGINT, &sa, nullptr);
+        ::sigaction(SIGTERM, &sa, nullptr);
+        // Terminal closed (or the su session detached): shut down gracefully
+        // instead of streaming into the void.
+        ::sigaction(SIGHUP, &sa, nullptr);
+        struct sigaction sa_ign;
+        std::memset(&sa_ign, 0, sizeof(sa_ign));
+        sa_ign.sa_handler = SIG_IGN;
+        sigemptyset(&sa_ign.sa_mask);
+        // The AAudio FIFO's reader can disappear (agmplay restart); a SIGPIPE
+        // on a FIFO write must not take the client down.
+        ::sigaction(SIGPIPE, &sa_ign, nullptr);
+    }
+
     audiorouter::ClientConfig config;
     bool list_devs = false;
 
@@ -140,17 +187,16 @@ int main(int argc, char* argv[]) {
         for (const auto& c : cards) {
             std::cout << "  " << c << "\n";
         }
+        std::cout << "\nAAudio (no root, Android 8.0+):\n";
+        if (audiorouter::AaudioFifoPlayer::is_supported()) {
+            std::cout << "  -> available — use -d aaudio (or aaudio:deep / aaudio:voip)\n";
+        } else {
+            std::cout << "  -> not compiled in this build (needs an Android API 26+ toolchain with libaaudio)\n";
+        }
         return 0;
     }
 
     print_banner();
-
-    // Register signal handlers for clean disconnect
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-    // The AGM FIFO's reader can disappear (agmplay is restarted on a stall);
-    // a SIGPIPE on a FIFO write must not take the whole client down.
-    std::signal(SIGPIPE, SIG_IGN);
 
     audiorouter::AudioRouterClient client(config);
 
@@ -175,6 +221,7 @@ int main(int argc, char* argv[]) {
                      << "RTT: " << rtt_ms << " ms | "
                      << "Buffer: " << stats.jitter_stats.current_buffer_ms << " ms | "
                      << "Jitter: " << stats.jitter_stats.avg_jitter_ms << " ms | "
+                     << "Audio: " << stats.audio_backend_delay_ms << " ms | "
                      << "Lost: " << stats.jitter_stats.packets_lost << " pkts | "
                      << "Underruns: " << stats.jitter_stats.underruns << " | "
                      << "Played: " << stats.frames_played << " frames");

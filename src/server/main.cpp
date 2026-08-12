@@ -7,9 +7,14 @@
 #include <vector>
 #include <csignal>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 #if defined(_WIN32)
     #include <windows.h>
+    #include <io.h>
+#else
+    #include <unistd.h>
 #endif
 
 namespace {
@@ -53,15 +58,25 @@ namespace {
 }
 
 void print_banner() {
-    std::cout << R"(
+    // ANSI color only for a real console (the setup_console() call on
+    // Windows already enables VT processing); plain when redirected/piped.
+    const bool color = ::isatty(1) == 1 && std::getenv("NO_COLOR") == nullptr;
+    const char* cyan  = color ? "\x1b[36m" : "";
+    const char* green = color ? "\x1b[32m" : "";
+    const char* bold  = color ? "\x1b[1m" : "";
+    const char* reset = color ? "\x1b[0m" : "";
+
+    std::cout << cyan << R"(
   █████╗ ██╗   ██╗██████╗ ██╗ ██████╗ ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗ 
  ██╔══██╗██║   ██║██╔══██╗██║██╔═══██╗██╔══██╗██╔═══██╗██║   ██║╚══██╔══╝██╔════╝██╔══██╗
  ███████║██║   ██║██║  ██║██║██║   ██║██████╔╝██║   ██║██║   ██║   ██║   █████╗  ██████╔╝
  ██╔══██║██║   ██║██║  ██║██║██║   ██║██╔══██╗██║   ██║██║   ██║   ██║   ██╔══╝  ██╔══██╗
  ██║  ██║╚██████╔╝██████╔╝██║╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝
-                       [Windows Audio Router Server -> Android ALSA]
-    )" << std::endl;
+)" << reset;
+    std::cout << green << bold
+              << "   Windows PC audio loopback -> Android  (WASAPI / UDP)" << reset
+              << "\n\n";
 }
 
 void print_usage(const char* prog) {
@@ -93,6 +108,19 @@ void print_usage(const char* prog) {
 int main(int argc, char* argv[]) {
 #if defined(_WIN32)
     setup_console();
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+#else
+    // Install signal handlers FIRST so Ctrl+C / kill always take the graceful
+    // path (sigaction: reliable handler + no SA_RESTART so blocking calls
+    // return promptly).
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    ::sigaction(SIGINT, &sa, nullptr);
+    ::sigaction(SIGTERM, &sa, nullptr);
+    ::sigaction(SIGHUP, &sa, nullptr);
 #endif
     audiorouter::ServerConfig config;
     bool list_ifaces_only = false;
@@ -144,13 +172,6 @@ int main(int argc, char* argv[]) {
     }
 
     print_banner();
-
-    // Register signal handlers
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-#if defined(_WIN32)
-    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
-#endif
 
     audiorouter::AudioRouterServer server(config);
 

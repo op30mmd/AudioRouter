@@ -54,6 +54,10 @@ struct ClientStats {
     uint64_t bytes_received = 0;
     uint64_t frames_played = 0;
     uint32_t round_trip_time_us = 0;
+    // End-to-end audio delay in the playback backend (FIFO + AAudio/ALSA
+    // in-flight buffered frames), sampled from the active player. This is the
+    // audio latency ON TOP of the jitter buffer; 0 when no player is open.
+    uint32_t audio_backend_delay_ms = 0;
     JitterBufferStats jitter_stats;
 };
 

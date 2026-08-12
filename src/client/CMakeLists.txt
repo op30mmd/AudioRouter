@@ -4,6 +4,7 @@ set(CLIENT_SOURCES
     alsa_player.cpp
     direct_alsa.cpp
     agm_fifo_player.cpp
+    aaudio_player.cpp
     dummy_player.cpp
     jitter_buffer.cpp
     android_helpers.cpp
@@ -16,6 +17,7 @@ set(CLIENT_HEADERS
     alsa_player.hpp
     direct_alsa.hpp
     agm_fifo_player.hpp
+    aaudio_player.hpp
     dummy_player.hpp
     jitter_buffer.hpp
     android_helpers.hpp
@@ -44,6 +46,19 @@ elseif (ANDROID)
         dl
         log
     )
+    # AAudio (no-root playback) requires API 26+; on older platform targets
+    # aaudio_player.cpp compiles as a stub and nothing extra is linked.
+    if (ANDROID_PLATFORM MATCHES "^android-(2[6-9]|[3-9][0-9])$" OR
+        ANDROID_PLATFORM MATCHES "^(2[6-9]|[3-9][0-9])$")
+        target_link_libraries(audiorouter_client PRIVATE aaudio)
+        # AAUDIO_ENABLED gates the real AAudio backend in aaudio_player.cpp
+        # (matches the Makefile probe); without it the player is a stub.
+        target_compile_definitions(audiorouter_client PRIVATE AAUDIO_ENABLED=1)
+        # Standalone AAudio FIFO daemon (see src/tools/stream_daemon.cpp).
+        add_executable(stream_daemon ../tools/stream_daemon.cpp)
+        target_link_libraries(stream_daemon PRIVATE aaudio)
+        target_compile_definitions(stream_daemon PRIVATE AAUDIO_ENABLED=1)
+    endif()
 else()
     target_link_libraries(audiorouter_client PRIVATE
         pthread

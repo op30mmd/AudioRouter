@@ -3,18 +3,48 @@
 
 #include <unistd.h>
 #include <sys/stat.h>
+#include <grp.h>
 #include <dirent.h>
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <cerrno>
 
 namespace audiorouter {
+
+namespace {
+// Termux home directory; its owning uid/gid is the app user to drop to.
+constexpr const char* kTermuxHomeDefault = "/data/data/com.termux/files/home";
+} // namespace
 
 bool AndroidHelpers::is_running_as_root() {
 #if defined(__linux__) || defined(__ANDROID__)
     return (geteuid() == 0);
 #else
+    return false;
+#endif
+}
+
+bool AndroidHelpers::termux_user(uid_t* out_uid, gid_t* out_gid, std::string* out_home) {
+#if defined(__linux__) || defined(__ANDROID__)
+    const char* override = std::getenv("AUDIOROUTER_TERMUX_HOME");
+    const std::string home =
+        (override != nullptr && override[0] != '\0') ? override : kTermuxHomeDefault;
+
+    struct stat st;
+    if (::stat(home.c_str(), &st) != 0 || st.st_uid == 0) {
+        return false;  // not installed, or owned by root - no app user to use
+    }
+    if (out_uid != nullptr) *out_uid = st.st_uid;
+    if (out_gid != nullptr) *out_gid = st.st_gid;
+    if (out_home != nullptr) *out_home = home;
+    return true;
+#else
+    (void)out_uid;
+    (void)out_gid;
+    (void)out_home;
     return false;
 #endif
 }

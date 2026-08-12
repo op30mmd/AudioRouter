@@ -12,7 +12,10 @@ if (MSVC)
     add_compile_options(/W4 /EHsc /O2 /permissive-)
     add_definitions(-D_CRT_SECURE_NO_WARNINGS -DNOMINMAX)
 elseif (ANDROID)
-    add_compile_options(-Wall -Wextra -O3)
+    # -Wno-unavailable-declarations: AAudio.h tags newer APIs with availability
+    # attributes; the aaudio player guards them by API level, this silences the
+    # annotations when targeting android-26 exactly.
+    add_compile_options(-Wall -Wextra -O3 -Wno-unavailable-declarations)
 else()
     add_compile_options(-Wall -Wextra -O3 -pthread)
 endif()

@@ -2,6 +2,7 @@
 #include "alsa_player.hpp"
 #include "direct_alsa.hpp"
 #include "agm_fifo_player.hpp"
+#include "aaudio_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -34,6 +35,10 @@ namespace {
     // library is absent (many Samsung/entry-level builds ship the classic ALSA
     // HAL instead) those attempts fail fast and the client falls back.
     constexpr size_t kMaxAgmOpenAttempts = 2;
+    // AAudio opens are quick user-space calls (no kernel driver to hang on),
+    // so a small retry budget is plenty before falling back to the
+    // root-requiring backends.
+    constexpr size_t kMaxAaudioOpenAttempts = 2;
 
     // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
     // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
@@ -46,6 +51,12 @@ namespace {
     // (vendor libagmclient.so) instead of raw PCM nodes.
     bool is_agm_device(const std::string& device_name) {
         return device_name.rfind("agm:", 0) == 0 || device_name == "agm";
+    }
+
+    // "aaudio" / "aaudio:..." plays through Android's native AAudio API (audio
+    // HAL / AudioFlinger) — the only backend that needs NO root.
+    bool is_aaudio_device(const std::string& device_name) {
+        return device_name.rfind("aaudio:", 0) == 0 || device_name == "aaudio";
     }
 
     std::vector<std::string> build_node_candidates(const std::string& device_name) {
@@ -101,12 +112,18 @@ namespace {
         }
     }
 
-    enum class OpenStrategy { AGM, NODES, LEGACY };
+    enum class OpenStrategy { AAUDIO, AGM, NODES, LEGACY };
 
-    // "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds don't ship
-    // libagmclient.so at all), then direct kernel PCM nodes, then ALSA-lib.
-    // Node-based names open PCM nodes only; everything else is ALSA-lib only.
+    // "aaudio"/"aaudio:<mode>" uses AAudio first (no root, works on stock
+    // devices; needs Android 8.0+), then falls back to the root-requiring
+    // backends. "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds
+    // don't ship libagmclient.so at all), then direct kernel PCM nodes, then
+    // ALSA-lib. Node-based names open PCM nodes only; everything else is
+    // ALSA-lib only.
     std::vector<OpenStrategy> build_open_strategies(const std::string& device_name) {
+        if (is_aaudio_device(device_name)) {
+            return {OpenStrategy::AAUDIO, OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
+        }
         if (is_agm_device(device_name)) {
             return {OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
         }
@@ -118,6 +135,7 @@ namespace {
 
     const char* strategy_label(OpenStrategy strategy, bool node_based) {
         switch (strategy) {
+            case OpenStrategy::AAUDIO: return "AAudio native audio via Android audio HAL (no root)";
             case OpenStrategy::AGM: return "AGM playback via vendor agmplay subprocess (FIFO)";
             case OpenStrategy::NODES: return node_based ? "direct kernel PCM nodes (/dev/snd)" : "direct kernel PCM nodes";
             default: return "ALSA-lib device (default/hw:0,0)";
@@ -140,7 +158,8 @@ namespace {
 
         while (!open->shutdown.load() && strategy_index < strategies.size()) {
             const OpenStrategy strategy = strategies[strategy_index];
-            const size_t max_attempts = strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
+            const size_t max_attempts = strategy == OpenStrategy::AAUDIO ? kMaxAaudioOpenAttempts
+                                      : strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
                                       : strategy == OpenStrategy::NODES ? kMaxNodeOpenAttempts
                                                                         : std::numeric_limits<size_t>::max();
             const bool node_based = strategy == OpenStrategy::NODES;
@@ -172,6 +191,7 @@ namespace {
 
                 std::shared_ptr<IAudioPlayer> device =
                     node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
+                    : strategy == OpenStrategy::AAUDIO ? std::shared_ptr<IAudioPlayer>(std::make_shared<AaudioFifoPlayer>())
                     : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>())
                                                     : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
                 auto finished = std::make_shared<std::atomic<bool>>(false);
@@ -275,6 +295,11 @@ bool AudioRouterClient::start() {
     if (AndroidHelpers::is_running_as_root()) {
         LOG_INFO("Running with root privileges (UID 0). Direct ALSA access enabled.");
         AndroidHelpers::fix_snd_permissions();
+        if (is_aaudio_device(config_.device_name)) {
+            LOG_INFO("AAudio requested while running as root: the AAudio stream is opened "
+                     "in-process, exactly like the standalone stream_daemon (which runs as "
+                     "root and works). No privilege games needed.");
+        }
     } else {
         LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'sudo' in Termux.");
     }
@@ -364,6 +389,11 @@ bool AudioRouterClient::start() {
     playback_thread_ = std::thread(&AudioRouterClient::audio_playback_thread, this);
     heartbeat_thread_ = std::thread(&AudioRouterClient::heartbeat_thread, this);
 
+    // AAudio runs in-process (like the standalone stream_daemon, which is
+    // proven to work as root), so no privilege handling is needed here: the
+    // socket binding (-b auto) and the AGM/ALSA fallback keep working in the
+    // same process either way.
+
     // Open the audio player on a bounded, cancellable path: a hung ALSA /
     // kernel driver must never block the main thread or stall shutdown.
     open_player_with_timeout(config_.device_name, kPlayerOpenTimeoutMs);
@@ -381,8 +411,12 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
 
     // Route the codec to the speaker before any open attempt so a successful
     // open has an audible path right away. Best effort: some devices name the
-    // mixer controls differently.
-    AndroidHelpers::apply_speaker_routing();
+    // mixer controls differently. NOT for AAudio: the audio HAL owns the mixer
+    // for AAudio streams, and force-routing the codec from outside (tinymix)
+    // can jam the HAL's session start - the stream opens but never renders.
+    if (!is_aaudio_device(device_name)) {
+        AndroidHelpers::apply_speaker_routing();
+    }
 
     {
         std::lock_guard<std::mutex> lock(open_->mutex);
@@ -717,8 +751,29 @@ void AudioRouterClient::audio_playback_thread() {
             if (player && player->is_open()) {
                 size_t written = player->write_frames(play_buffer.data(), frames);
                 if (written > 0) {
-                    std::lock_guard<std::mutex> lock(stats_mutex_);
-                    stats_.frames_played += written;
+                    uint32_t backend_ms = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex_);
+                        stats_.frames_played += written;
+                        // Sample the real backend delay (pipe + in-stream buffers)
+                        // so the status line shows the actual audio latency on
+                        // top of the jitter buffer.
+                        const uint32_t rate = audio_config_.sample_rate > 0 ? audio_config_.sample_rate : 48000;
+                        stats_.audio_backend_delay_ms =
+                            static_cast<uint32_t>((player->get_buffer_delay_frames() * 1000ULL) / rate);
+                        backend_ms = stats_.audio_backend_delay_ms;
+                    }
+                    // Self-pace against the device for the AAudio backend: the
+                    // pipe between the playback thread and the AAudio pump can
+                    // otherwise accumulate a full backlog (the jitter prefill
+                    // burst + the STARTING ramp), which shows up as a constant
+                    // multi-hundred-ms audio delay. Sleep so the backend drains
+                    // back toward ~40 ms. Other backends (ALSA/AGM/dummy)
+                    // report ~0 buffered delay and are unaffected.
+                    if (backend_ms > 60 &&
+                        player->get_device_name().rfind("aaudio", 0) == 0) {
+                        sleep_ms(backend_ms - 40);
+                    }
                 } else {
                     // Audio device returned 0 frames written or was busy; pace the thread
                     sleep_ms(fallback_sleep_ms);

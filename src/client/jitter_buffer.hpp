@@ -18,6 +18,9 @@ struct JitterBufferStats {
     uint64_t packets_duplicate = 0;
     uint64_t underruns = 0;
     uint64_t overruns = 0;
+    // Frames shed by the drain-to-target mechanism (excess latency removed
+    // after a burst/stall left the buffer above the configured target).
+    uint64_t drained_frames = 0;
     double current_buffer_ms = 0.0;
     double avg_jitter_ms = 0.0;
 };
@@ -44,6 +47,10 @@ public:
 private:
     size_t available_frames_unlocked() const;
     double available_duration_ms_unlocked() const;
+    // Skips `frames` of buffered audio at the playhead (drops whole/partial
+    // slots; holes are skipped freely). Used by the drain-to-target logic to
+    // shed excess latency; the caller holds mutex_.
+    void advance_playhead_locked(size_t frames);
 
     struct PacketSlot {
         uint32_t seq_num = 0;
@@ -77,6 +84,14 @@ private:
 
     // Partial frame consumption within current slot
     size_t slot_frame_offset_;
+
+    // Drain-to-target state: timestamp of the last drain (rate-limited) so
+    // the excess is shed gently instead of as one audible gap, and the
+    // timestamp of the first-fill completion - draining is disabled during a
+    // startup grace period so the deliberate prefill (which protects the
+    // first seconds of delivery) is never shed immediately.
+    uint64_t last_drain_ms_ = 0;
+    uint64_t startup_complete_ms_ = 0;
 
     // Metrics & Skew tracking
     JitterBufferStats stats_;
