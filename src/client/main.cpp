@@ -95,6 +95,9 @@ void print_usage(const char* prog) {
               << "  -l, --latency <ms>        Target Jitter Buffer latency in ms (default: 35ms)\n"
               << "  -b, --bind <iface>        Pin UDP socket to a network interface (bypasses Android VPN tunnels):\n"
               << "                              'auto' = detect physical NIC (e.g. wlan0), or specify e.g. 'wlan0'\n"
+              << "  -u, --usb                 Voice over USB: stream over the USB cable via adb reverse (no Wi-Fi).\n"
+              << "                              Connect phone by USB (USB debugging on) and on the PC run:\n"
+              << "                              'adb reverse udp:44100 udp:44100' (or scripts\\usb_setup.bat)\n"
               << "      --discover            Auto-discover server on local Wi-Fi Hotspot subnet\n"
               << "      --dummy               Use dummy audio player instead of ALSA (for testing/benchmarks)\n"
               << "      --list-devices        List detected ALSA and kernel PCM devices and exit\n"
@@ -110,7 +113,13 @@ void print_usage(const char* prog) {
               << "  Scenario B: Android connected to Windows Mobile Hotspot\n"
               << "    1. Turn on Windows Mobile Hotspot on PC (default gateway is usually 192.168.137.1).\n"
               << "    2. Connect Android phone to the PC Hotspot.\n"
-              << "    3. On Android Termux: su && ./audiorouter_client -s 192.168.137.1 -p 44100\n"
+              << "    3. On Android Termux: su && ./audiorouter_client -s 192.168.137.1 -p 44100\n\n"
+              << "  Scenario C: Voice over USB (no Wi-Fi)\n"
+              << "    1. Connect the phone to the PC with a USB cable (USB debugging enabled).\n"
+              << "    2. On the PC, set up the USB tunnel: adb reverse udp:44100 udp:44100\n"
+              << "       (or run scripts\\usb_setup.bat)\n"
+              << "    3. Start the server: audiorouter_server.exe --usb\n"
+              << "    4. On Android Termux: ./audiorouter_client -u\n"
               << std::endl;
 }
 
@@ -160,6 +169,8 @@ int main(int argc, char* argv[]) {
             config.target_latency_ms = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if ((arg == "-b" || arg == "--bind") && i + 1 < argc) {
             config.bind_iface = argv[++i];
+        } else if (arg == "-u" || arg == "--usb") {
+            config.usb_mode = true;
         } else if (arg == "--discover") {
             config.auto_discover = true;
         } else if (arg == "--dummy") {

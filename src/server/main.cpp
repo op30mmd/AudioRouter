@@ -5,6 +5,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <sstream>
+#include <cstdio>
 #include <csignal>
 #include <atomic>
 #include <cstdlib>
@@ -23,6 +25,66 @@ namespace {
     void signal_handler(int sig) {
         (void)sig;
         g_shutdown_requested.store(true);
+    }
+
+    // Runs a shell command and captures its stdout/stderr. Empty on failure.
+    // Windows toolchains (MSVC, MinGW) spell these _popen/_pclose; POSIX
+    // systems use popen/pclose.
+    std::string run_command(const std::string& cmd) {
+        std::string result;
+#if defined(_WIN32)
+        FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+        FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+        if (!pipe) return result;
+        char buf[256];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf) - 1, pipe)) > 0) {
+            buf[n] = '\0';
+            result += buf;
+        }
+#if defined(_WIN32)
+        _pclose(pipe);
+#else
+        pclose(pipe);
+#endif
+        return result;
+    }
+
+    // Voice over USB: "adb reverse udp:<port> udp:<port>" makes the phone's
+    // loopback UDP port tunnel over the USB cable into this PC's loopback,
+    // where the server (bound to 127.0.0.1) picks it up. Best effort from the
+    // server; usb_setup.bat is the manual equivalent.
+    void setup_usb_tunnel(uint16_t port) {
+        std::ostringstream rev;
+        // 2>&1: adb reports diagnostics on stderr; popen/_popen capture only
+        // stdout, so fold stderr in or the "no devices" check would miss it.
+        rev << "adb reverse udp:" << port << " udp:" << port << " 2>&1";
+        std::ostringstream list;
+        list << "adb reverse --list 2>&1";
+
+        LOG_INFO("Voice over USB: setting up the USB tunnel...");
+        LOG_INFO("  " << rev.str());
+
+        std::string out = run_command(rev.str());
+        if (!out.empty()) {
+            // adb writes diagnostics to stderr which popen still captures.
+            LOG_DEBUG("adb reverse output: " << out);
+        }
+
+        std::string listed = run_command(list.str());
+        if (listed.find("udp:" + std::to_string(port)) != std::string::npos) {
+            LOG_INFO("USB tunnel active: udp:" << port << " (phone loopback) <-> this PC's loopback over USB");
+        } else {
+            if (listed.find("no devices") != std::string::npos) {
+                LOG_WARN("adb reports no connected device. Make sure the phone is plugged in with USB debugging enabled.");
+            } else {
+                LOG_WARN("adb reverse did not confirm the tunnel.");
+            }
+            LOG_WARN("Set it up manually in another terminal and restart with --usb:");
+            LOG_WARN("    adb reverse udp:" << port << " udp:" << port);
+        }
     }
 
 #if defined(_WIN32)
@@ -90,19 +152,25 @@ void print_usage(const char* prog) {
               << "      --mute-mode <mode>    Mute method: 'mute' (default), 'zero' (volume 0), 'both'\n"
               << "  -t, --test-tone           Generate test sine tone instead of WASAPI loopback\n"
               << "      --freq <hz>           Test tone frequency in Hz (default: 440.0)\n"
+              << "      --usb                 Voice over USB: bind to loopback and stream over the USB cable\n"
+              << "                              via 'adb reverse udp:<port> udp:<port>' (no Wi-Fi)\n"
               << "  -l, --list-if             List all available network interfaces and exit\n"
               << "  -v, --verbose             Enable debug logging\n"
               << "  -h, --help                Show this help message\n\n"
               << "Hotspot Quick Start:\n"
               << "  1. If PC is connected to Android Wi-Fi Hotspot:\n"
               << "     Note your PC's IP address (e.g. 192.168.43.x) from the interface list.\n"
-              << "  2. Start this server on Windows:\n"
-              << "     " << prog << "\n"
-              << "  3. In Termux on Android with root privileges, run:\n"
-              << "     su\n"
-              << "     ./audiorouter_client -s <PC_IP> -p 44100\n"
-              << "  4. PC speaker will automatically go quiet and audio will play on Android!\n"
-              << std::endl;
+               << "  2. Start this server on Windows:\n"
+               << "     " << prog << "\n"
+               << "  3. In Termux on Android with root privileges, run:\n"
+               << "     su\n"
+               << "     ./audiorouter_client -s <PC_IP> -p 44100\n"
+               << "  4. PC speaker will automatically go quiet and audio will play on Android!\n\n"
+               << "Voice over USB (no Wi-Fi):\n"
+               << "  1. Connect the phone by USB (USB debugging on).\n"
+               << "  2. " << prog << " --usb   (sets up 'adb reverse udp:44100 udp:44100' automatically)\n"
+               << "  3. On the phone: ./audiorouter_client -u\n"
+               << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -153,6 +221,8 @@ int main(int argc, char* argv[]) {
             config.use_test_tone = true;
         } else if (arg == "--freq" && i + 1 < argc) {
             config.test_tone_freq = std::stod(argv[++i]);
+        } else if (arg == "--usb") {
+            config.usb_mode = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage(argv[0]);
@@ -172,6 +242,14 @@ int main(int argc, char* argv[]) {
     }
 
     print_banner();
+
+    if (config.usb_mode) {
+        if (config.bind_ip != "0.0.0.0" && config.bind_ip != "127.0.0.1") {
+            LOG_WARN("--usb active: -b/--bind (" << config.bind_ip << ") is ignored; binding loopback for the USB tunnel");
+        }
+        config.bind_ip = "127.0.0.1";
+        setup_usb_tunnel(config.port);
+    }
 
     audiorouter::AudioRouterServer server(config);
 

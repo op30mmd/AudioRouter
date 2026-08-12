@@ -51,12 +51,15 @@ bool AudioRouterServer::start() {
     socket_.set_buffer_sizes(1024 * 1024, 1024 * 1024);
     socket_.set_qos_priority(true);
 
-    // List available network interfaces for user convenience
-    auto ifaces = UdpSocket::get_local_interfaces();
-    LOG_INFO("Available Network Interfaces for Android Client Connection:");
-    for (const auto& iface : ifaces) {
-        if (iface.is_up && !iface.is_loopback) {
-            LOG_INFO("  -> " << iface.ip_address << " (" << iface.name << ")");
+    // List available network interfaces for user convenience (not in USB
+    // mode: the stream comes in over the loopback, not the LAN)
+    if (!config_.usb_mode) {
+        auto ifaces = UdpSocket::get_local_interfaces();
+        LOG_INFO("Available Network Interfaces for Android Client Connection:");
+        for (const auto& iface : ifaces) {
+            if (iface.is_up && !iface.is_loopback) {
+                LOG_INFO("  -> " << iface.ip_address << " (" << iface.name << ")");
+            }
         }
     }
     LOG_INFO("Listening for Android client on UDP port " << config_.port << "...");

@@ -313,49 +313,70 @@ bool AudioRouterClient::start() {
     socket_.set_buffer_sizes(1024 * 1024, 1024 * 1024);
     socket_.set_qos_priority(true);
 
-    // Optional VPN bypass: pin the socket to the physical Wi-Fi interface so
-    // an Android VPN tunnel (tun0) cannot swallow the LAN traffic to the PC.
-    // Requires root (SO_BINDTODEVICE / CAP_NET_RAW); best-effort otherwise.
-    if (!config_.bind_iface.empty()) {
-        std::string iface = config_.bind_iface;
-        if (iface == "auto") {
-            iface = UdpSocket::pick_physical_interface();
-            if (iface.empty()) {
-                LOG_WARN("No physical interface found to bind to; continuing with default routing");
-            } else {
-                LOG_INFO("Auto-selected physical interface '" << iface << "' for VPN bypass");
+    if (config_.usb_mode) {
+        // Voice over USB: the PC-side "adb reverse udp:PORT udp:PORT" tunnel
+        // exposes the server at the phone's loopback. The Wi-Fi/VPN interface
+        // machinery below does not apply to lo.
+        if (!config_.bind_iface.empty()) {
+            LOG_WARN("--usb active: -b/--bind (" << config_.bind_iface << ") is ignored; the stream runs over the USB cable via loopback");
+        }
+        if (config_.auto_discover) {
+            LOG_WARN("--usb active: --discover is ignored; connecting straight to 127.0.0.1 (adb reverse tunnel)");
+        }
+        server_addr_ = SocketAddress("127.0.0.1", config_.server_port);
+        if (!server_addr_.is_valid()) {
+            LOG_ERROR("Invalid USB tunnel address: 127.0.0.1:" << config_.server_port);
+            socket_.close();
+            return false;
+        }
+        LOG_INFO("USB mode: targeting the adb reverse tunnel at " << server_addr_.to_string()
+                 << " (start 'adb reverse udp:" << config_.server_port
+                 << " udp:" << config_.server_port << "' on the PC)");
+    } else {
+        // Optional VPN bypass: pin the socket to the physical Wi-Fi interface so
+        // an Android VPN tunnel (tun0) cannot swallow the LAN traffic to the PC.
+        // Requires root (SO_BINDTODEVICE / CAP_NET_RAW); best-effort otherwise.
+        if (!config_.bind_iface.empty()) {
+            std::string iface = config_.bind_iface;
+            if (iface == "auto") {
+                iface = UdpSocket::pick_physical_interface();
+                if (iface.empty()) {
+                    LOG_WARN("No physical interface found to bind to; continuing with default routing");
+                } else {
+                    LOG_INFO("Auto-selected physical interface '" << iface << "' for VPN bypass");
+                }
+            }
+            if (!iface.empty()) {
+                socket_.bind_to_interface(iface);
+            }
+        } else {
+            auto ifaces = UdpSocket::get_local_interfaces();
+            bool vpn_active = false;
+            for (const auto& info : ifaces) {
+                if (info.is_loopback || !info.is_up) continue;
+                if (info.name.rfind("tun", 0) == 0 || info.name.rfind("ppp", 0) == 0) vpn_active = true;
+            }
+            if (vpn_active) {
+                LOG_WARN("VPN tunnel detected but no -b/--bind given. If the handshake fails, rerun with "
+                         << "'-b auto' (or '-b wlan0') to bypass the VPN: e.g. -b auto");
             }
         }
-        if (!iface.empty()) {
-            socket_.bind_to_interface(iface);
-        }
-    } else {
-        auto ifaces = UdpSocket::get_local_interfaces();
-        bool vpn_active = false;
-        for (const auto& info : ifaces) {
-            if (info.is_loopback || !info.is_up) continue;
-            if (info.name.rfind("tun", 0) == 0 || info.name.rfind("ppp", 0) == 0) vpn_active = true;
-        }
-        if (vpn_active) {
-            LOG_WARN("VPN tunnel detected but no -b/--bind given. If the handshake fails, rerun with "
-                     << "'-b auto' (or '-b wlan0') to bypass the VPN: e.g. -b auto");
-        }
-    }
 
-    // Auto-discovery if requested
-    if (config_.auto_discover) {
-        state_ = ClientState::DISCOVERING;
-        if (!discover_server(server_addr_)) {
-            LOG_ERROR("Server auto-discovery failed. Please specify server IP manually: -s <IP>");
-            socket_.close();
-            return false;
-        }
-    } else {
-        server_addr_ = SocketAddress(config_.server_ip, config_.server_port);
-        if (!server_addr_.is_valid()) {
-            LOG_ERROR("Invalid server address: " << config_.server_ip << ":" << config_.server_port);
-            socket_.close();
-            return false;
+        // Auto-discovery if requested
+        if (config_.auto_discover) {
+            state_ = ClientState::DISCOVERING;
+            if (!discover_server(server_addr_)) {
+                LOG_ERROR("Server auto-discovery failed. Please specify server IP manually: -s <IP>");
+                socket_.close();
+                return false;
+            }
+        } else {
+            server_addr_ = SocketAddress(config_.server_ip, config_.server_port);
+            if (!server_addr_.is_valid()) {
+                LOG_ERROR("Invalid server address: " << config_.server_ip << ":" << config_.server_port);
+                socket_.close();
+                return false;
+            }
         }
     }
 
@@ -370,7 +391,14 @@ bool AudioRouterClient::start() {
     // Connect & Handshake with Windows Server
     state_ = ClientState::CONNECTING;
     if (!perform_handshake()) {
-        LOG_ERROR("Failed to connect to Windows AudioRouter Server at " << server_addr_.to_string());
+        if (config_.usb_mode) {
+            LOG_ERROR("Failed to connect to the USB tunneled server at 127.0.0.1:" << config_.server_port);
+            LOG_ERROR("Check that on the PC the tunnel is up and the server is listening:");
+            LOG_ERROR("    adb reverse udp:" << config_.server_port << " udp:" << config_.server_port);
+            LOG_ERROR("    audiorouter_server.exe --usb");
+        } else {
+            LOG_ERROR("Failed to connect to Windows AudioRouter Server at " << server_addr_.to_string());
+        }
         socket_.close();
         return false;
     }

@@ -26,6 +26,10 @@ struct ServerConfig {
     uint32_t client_timeout_ms = 8000;
     bool use_test_tone = false;
     double test_tone_freq = 440.0;
+    // Voice over USB: bind to loopback only and accept the client through an
+    // "adb reverse udp:PORT udp:PORT" tunnel instead of the LAN. The tunnel
+    // injects the phone's UDP traffic straight into the PC's loopback.
+    bool usb_mode = false;
 };
 
 enum class ServerState {

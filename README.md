@@ -5,7 +5,8 @@ system audio output (WASAPI loopback) and streams it to an Android device over U
 where it is rendered through one of several pluggable playback backends (ALSA, direct
 kernel PCM, Qualcomm AGM, or Android AAudio). The server automatically mutes the PC
 speakers while a client is attached and restores the previous volume state on
-disconnect.
+disconnect. The stream runs over Wi-Fi (hotspot) by default; a **Voice over USB**
+mode carries the same stream over the USB cable via `adb reverse` — no Wi-Fi at all.
 
 ```
 ┌──────────────────────────── Windows PC (server) ────────────────────────────┐
@@ -99,7 +100,16 @@ and a watchdog:
   generator for network/pipeline testing without a sound source.
 
 Options: `-p/--port`, `-b/--bind`, `-r/--rate`, `-f/--frames`, `--no-mute`,
-`--mute-mode`, `-t/--test-tone`, `-l/--list-if`.
+`--mute-mode`, `-t/--test-tone`, `-l/--list-if`, `--usb`.
+
+### 2.1 Voice over USB
+
+`--usb` binds the server to loopback (`127.0.0.1`) only and sets up an
+`adb reverse udp:<port> udp:<port>` tunnel (best effort; falls back to printed
+instructions if `adb` is missing or no device is connected). The phone's UDP
+traffic then travels over the USB cable straight into the PC's loopback — no
+hotspot, no Wi-Fi, no VPN issues. Any client that connects to `127.0.0.1:<port>`
+is treated like any other client (same mute/heartbeat/watchdog logic).
 
 ## 3. Client (Android / Termux)
 
@@ -262,6 +272,7 @@ explicit "source checkout required" error in this layout.
 ```bat
 bin\audiorouter_server.exe                  :: loopback capture, port 44100
 bin\audiorouter_server.exe -t               :: 440 Hz test tone
+bin\audiorouter_server.exe --usb            :: Voice over USB (binds loopback, sets up adb reverse)
 ```
 
 ### Client
@@ -275,6 +286,22 @@ su
 ./scripts/termux_run.sh -s 192.168.43.45 -d agm -b auto
 ```
 
+### Voice over USB (no Wi-Fi)
+Phone plugged into the PC with USB debugging enabled; server and client speak
+over the USB cable only:
+```bat
+REM on the PC:
+scripts\usb_setup.bat            :: adb reverse udp:44100 udp:44100 (or let the server do it)
+bin\audiorouter_server.exe --usb
+```
+```bash
+# on the phone (no hotspot, no root needed for the transport):
+./bin/audiorouter_client -u -d aaudio
+```
+`-u/--usb` forces the client to `127.0.0.1:<port>` (the adb reverse tunnel) and
+disables Wi-Fi/VPN interface handling; `--discover` and `-b` are ignored in USB
+mode. Works with every playback backend.
+
 `scripts/termux_run.sh` resolves the binary to an absolute path and launches it via
 `su -c` for root backends (the AAudio build links `/system/lib64/libaaudio.so` by
 absolute path — only the system linker resolves it); `-b auto` runs via `su` and the
@@ -287,6 +314,8 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
 -d, --device <dev>    backend/device (see table above; default 'default')
 -l, --latency <ms>    target jitter-buffer latency (default 35 ms)
 -b, --bind <iface>    pin UDP socket to an interface ('auto' = physical NIC)
+-u, --usb             Voice over USB: stream over the USB cable via adb reverse
+                      (targets 127.0.0.1; ignored with -b/--discover)
     --discover        auto-discover the server on the local hotspot subnet
     --dummy           DummyPlayer (benchmarks)
     --list-devices    list ALSA nodes, kernel PCM nodes, AAudio availability
@@ -299,6 +328,10 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
 - **B: Android → Windows mobile hotspot**: PC hotspot gateway is typically
   `192.168.137.1`; client connects there. If a VPN tunnel is active, use
   `-b auto` to bypass it.
+- **C: USB cable (Voice over USB)**: no Wi-Fi at all. Phone connected by USB
+  with USB debugging on; PC runs `adb reverse udp:44100 udp:44100` (server
+  `--usb` does it automatically) and the client uses `-u`. The link is the
+  USB cable, so RTT drops to sub-ms and interference/hotspot stalls vanish.
 
 ## 7. Troubleshooting / operational notes
 
@@ -319,6 +352,15 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   need `tinymix` speaker-path setup when no Android audio has played yet.
 - **Runtime linking**: the AAudio build needs the system linker (run via
   `termux_run.sh` / `su -c "<abs path>"`), not a Termux-shell exec.
+- **Voice over USB does not connect**: enable **USB debugging** on the phone
+  (Developer options) and confirm `adb devices` lists it as `device` (not
+  `unauthorized` — authorize the RSA prompt). The tunnel needs platform-tools
+  ≥ 31 for `udp:` reverse sockets; `scripts/usb_setup.bat` checks and sets
+  everything up. Because the server runs elevated (UAC), its `adb` call talks
+  to the adb server already running in your user session; if none is running it
+  starts one that uses your normal `%USERPROFILE%\.android\adbkey`, so the
+  device stays authorized. If the tunnel never confirms, run
+  `adb reverse udp:44100 udp:44100` from a normal terminal and retry.
 - **Ctrl+C under `su`**: Magisk's `su` can put the client in its own session,
   so the terminal's Ctrl+C never reaches it. `termux_run.sh` runs su in the
   background and bridges INT/TERM to the client (matching it by absolute
@@ -338,7 +380,7 @@ src/client/    main.cpp, client.*, jitter_buffer.*, audio_player.hpp,
 src/tools/     stream_daemon.cpp
 scripts/       termux_setup.sh, termux_run.sh, build_client.sh,
                build_stream_daemon.sh, android_mixer_setup.sh,
-               build_server_msvc.bat, build_server_mingw.bat
+               build_server_msvc.bat, build_server_mingw.bat, usb_setup.bat
 tests/         protocol, ring buffer, jitter buffer/PLC, socket,
                conversion, thread/type/memory safety
 ```
