@@ -177,31 +177,43 @@ done
 # foreground process group) never reaches the client - which is why Ctrl+C
 # appears ignored even though the client handles SIGINT. Solution: run su in
 # the background (same process group), trap INT/TERM in this script, and
-# forward the signal to su AND directly to the client (matched by its
-# absolute path), escalating INT -> TERM -> KILL.
+# forward the signal to the client, escalating INT -> TERM -> KILL.
+#
+# CRITICAL: the client runs as ROOT (via su) while this script runs as the
+# non-root Termux app user. Android (uid rules + SELinux) silently refuses
+# (EPERM) a non-root process signaling a root process, so a plain pkill here
+# does nothing. The signal must be delivered AS ROOT, through su itself:
+#   su -c "pkill -<sig> -f '<client path>'"
 run_via_su() {
     local cmd="$1"
     su -c "$cmd" &
     local su_pid=$!
+
+    # Pattern that matches the client's command line but NOT this script's own
+    # pkill/su command lines: "[a]udiorouter_client" as a regex matches the
+    # real path, while the literal "[a]..." in our own cmdline does not match.
+    local base pat
+    base="$(basename "$ABS_BIN")"
+    pat="[${base%${base#?}}]${base#?}"
+
+    signal_client() {
+        local sig="$1"
+        # Direct (works when this script is root, or the client is same-uid).
+        pkill -"$sig" -f "$pat" 2>/dev/null
+        # The real delivery path for the su case: signal AS ROOT.
+        su -c "pkill -$sig -f '$pat'" 2>/dev/null
+    }
+
     cleanup() {
         trap - INT TERM   # no re-entry while we are tearing down
         echo ""
         echo "Stopping AudioRouter client..."
         kill -INT "$su_pid" 2>/dev/null
-        if command -v pkill >/dev/null 2>&1; then
-            pkill -INT -f "$ABS_BIN" 2>/dev/null
-            sleep 2
-            pkill -TERM -f "$ABS_BIN" 2>/dev/null
-            sleep 1
-            pkill -KILL -f "$ABS_BIN" 2>/dev/null
-        else
-            for sig in INT TERM KILL; do
-                for pid in $(pgrep -f "$ABS_BIN" 2>/dev/null); do
-                    [ "$pid" != "$$" ] && kill -"$sig" "$pid" 2>/dev/null
-                done
-                sleep 1
-            done
-        fi
+        signal_client INT
+        sleep 2
+        signal_client TERM
+        sleep 1
+        signal_client KILL
     }
     trap cleanup INT TERM
     wait "$su_pid"
