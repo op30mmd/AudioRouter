@@ -543,6 +543,15 @@ void AaudioFifoPlayer::pump_loop() {
                 continue;
             }
 
+            // A fully successful write: the stream is consuming again. If the
+            // pump just recovered from a stall (including the startup ramp,
+            // where writes blocked while the stream was STARTING), the FIFO
+            // holds stale audio that accumulated while the device was not
+            // draining - discard it so playback resumes at LIVE audio instead
+            // of replaying the stall period (this is what keeps the audible
+            // delay at ~0 in steady state rather than a permanently full
+            // pipe).
+            const bool was_stalled = consecutive_write_failures_ > 0;
             consecutive_write_failures_ = 0;
             {
                 std::lock_guard<std::mutex> lock(stream_mutex_);
@@ -550,6 +559,18 @@ void AaudioFifoPlayer::pump_loop() {
                 const int64_t written_total = AAudioStream_getFramesWritten(stream);
                 const int64_t read_total = AAudioStream_getFramesRead(stream);
                 frames_in_flight_.store(written_total - read_total);
+
+                if (was_stalled) {
+                    int fifo_bytes = 0;
+                    if (fifo_fd_ >= 0) ::ioctl(fifo_fd_, FIONREAD, &fifo_bytes);
+                    // Only when a meaningful backlog accumulated (>= one pump
+                    // chunk); a few bytes is just in-flight live audio.
+                    if (fifo_bytes >= static_cast<int>(buffer.size())) {
+                        LOG_INFO("AaudioFifoPlayer: stream recovered from a stall; discarding "
+                                 << fifo_bytes << " stale bytes buffered during the stall");
+                        drain_fifo();
+                    }
+                }
             }
         }
 
