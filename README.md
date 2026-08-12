@@ -147,7 +147,7 @@ End-to-end audio delay = jitter buffer + backend delay:
 
 | Component | Typical | Worst case | Bound by |
 |-----------|---------|------------|----------|
-| Jitter buffer | target `-l` (default 35 ms) | startup prefill 120–500 ms (one-time) | `push_packet` prefill / stability gate |
+| Jitter buffer | target `-l` (default 35 ms); excess drained back to ~target+25 ms after bursts | startup prefill 120–500 ms (one-time, protected by a 3 s grace) | prefill / stability gate + drain-to-target |
 | FIFO (AAudio pipe) | ~40 ms (playback thread self-paced against the backend; stale backlog discarded on stall recovery / rebuild) | **341 ms** transient (64 KB @ 192 KB/s, only while a stall is active) | `kFifoSizeBytes` + playback pacing + pump drain-on-recovery |
 | AAudio in-stream | ≤ 40 ms (capacity capped at 1920 frames on LOW_LATENCY); deep mode uses the HAL default | 40 ms | `setBufferCapacityInFrames` |
 | Network / UDP | RTT + jitter (see status line) | — | — |
@@ -176,6 +176,13 @@ Three client-specific latency controls keep the AAudio backend tight:
   exactly the pump's drain rate), which showed up as a constant
   `Audio: 350 ms` on device. The thread now sleeps when the backend
   reports > 60 ms buffered (AAudio only), holding the pipe near ~40 ms.
+- **Jitter drain-to-target**: a burst (startup prefill, a stall that let the
+  buffer accumulate, a reconnect) can leave the jitter buffer well above the
+  configured `-l` target — the level then stays high forever, adding constant
+  latency. After a 3 s startup grace, `pop_frames()` sheds the excess back to
+  ~target + 25 ms in small 5 ms chunks, at most one per 400 ms, so the
+  catch-up is a few near-inaudible skips instead of one gap or permanent
+  added delay (`JitterBufferStats::drained_frames` counts what was shed).
 - **FIFO drain on recovery**: whenever the pump transitions from stalled
   to consuming — the startup ramp (writes block while the stream is
   STARTING, priming the pipe full), a mid-stream stall, or a stream

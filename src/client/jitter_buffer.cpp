@@ -20,6 +20,20 @@ constexpr uint32_t kStartupPrefillMaxMs = 500;
 // restarts into a delivery stall that would immediately dry it out again.
 constexpr uint32_t kStableArrivalCount = 24;
 
+// Drain-to-target: after a burst (startup prefill, a stall that let the
+// buffer accumulate, a reconnect) the playhead can sit far above the
+// configured target latency. pop_frames() gently sheds the excess instead of
+// leaving it as permanent added latency. Only drains when the buffered level
+// exceeds target + margin; sheds at most one small chunk per interval, so the
+// catch-up is a few near-inaudible 5ms skips rather than one big gap.
+constexpr uint32_t kDrainMarginMs = 25;
+constexpr uint32_t kDrainIntervalMs = 400;
+constexpr size_t kDrainChunkFrames = 240;  // 5 ms @ 48 kHz
+// Draining is disabled until this long after the first fill completes: the
+// startup prefill is deliberate protection for the first seconds of delivery
+// and must not be shed the moment playback starts.
+constexpr uint32_t kDrainStartGraceMs = 3000;
+
 } // namespace
 
 namespace audiorouter {
@@ -69,6 +83,8 @@ void JitterBuffer::reset() {
     last_arrived_seq_ = 0;
     slot_frame_offset_ = 0;
     last_arrival_timestamp_us_ = 0;
+    last_drain_ms_ = 0;
+    startup_complete_ms_ = 0;
     last_transit_us_ = 0;
     jitter_estimate_us_ = 0.0;
 }
@@ -200,7 +216,10 @@ bool JitterBuffer::push_packet(uint32_t seq_num, uint64_t timestamp_us, const vo
         if ((buffered >= fill_target && delivery_stable) ||
             total_valid_frames >= escape_target) {
             is_buffering_ = false;
-            startup_pending_ = false;
+            if (startup_pending_) {
+                startup_pending_ = false;
+                startup_complete_ms_ = get_time_ms();
+            }
             LOG_DEBUG("JitterBuffer: Pre-buffering complete (" << buffered << " frames, "
                       << (config_.sample_rate > 0 ? (buffered * 1000 / config_.sample_rate) : 0) << " ms). Starting playback.");
         }
@@ -218,6 +237,29 @@ size_t JitterBuffer::pop_frames(int16_t* dest, size_t num_frames) {
         // Fill output with silence while buffering
         std::fill(dest, dest + (num_frames * config_.channels), 0);
         return num_frames;
+    }
+
+    // Drain-to-target: in steady state (startup prefill done, past the
+    // startup grace, not re-buffering), if the buffered level is well above
+    // the configured target, shed the excess gently - a burst/stall left the
+    // buffer high and it would otherwise stay high forever (constant added
+    // latency).
+    if (!startup_pending_ && config_.sample_rate > 0) {
+        const uint64_t now_ms = get_time_ms();
+        const bool past_grace =
+            startup_complete_ms_ == 0 || now_ms - startup_complete_ms_ >= kDrainStartGraceMs;
+        if (past_grace && now_ms - last_drain_ms_ >= kDrainIntervalMs) {
+            const size_t buffered = available_frames_unlocked();
+            const size_t margin =
+                (static_cast<uint64_t>(config_.sample_rate) * kDrainMarginMs) / 1000;
+            if (buffered > target_buffer_frames_ + margin) {
+                const size_t excess = buffered - target_buffer_frames_ - margin;
+                const size_t drop = std::min(excess, kDrainChunkFrames);
+                advance_playhead_locked(drop);
+                stats_.drained_frames += drop;
+                last_drain_ms_ = now_ms;
+            }
+        }
     }
 
     size_t frames_delivered = 0;
@@ -319,6 +361,32 @@ size_t JitterBuffer::available_frames_unlocked() const {
         total -= slot_frame_offset_;
     }
     return total;
+}
+
+void JitterBuffer::advance_playhead_locked(size_t frames) {
+    while (frames > 0) {
+        const size_t slot_idx = next_play_seq_ % MAX_SLOTS;
+        auto& slot = slots_[slot_idx];
+        if (slot.is_valid && slot.seq_num == next_play_seq_) {
+            const size_t remaining = slot.num_frames - slot_frame_offset_;
+            if (frames < remaining) {
+                slot_frame_offset_ += frames;
+                frames = 0;
+            } else {
+                frames -= remaining;
+                slot.is_valid = false;
+                slot.pcm_data.clear();
+                slot_frame_offset_ = 0;
+                ++next_play_seq_;
+            }
+        } else {
+            // Hole (missing packet): the playhead skips it without counting
+            // against the frames to drop (it is already a gap).
+            slot.is_valid = false;
+            slot_frame_offset_ = 0;
+            ++next_play_seq_;
+        }
+    }
 }
 
 double JitterBuffer::available_duration_ms() const {

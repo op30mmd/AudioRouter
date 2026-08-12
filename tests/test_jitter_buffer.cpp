@@ -1,6 +1,8 @@
 #include "../src/client/jitter_buffer.hpp"
 #include <iostream>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 #define TEST_ASSERT(cond) do { \
     if (!(cond)) { \
@@ -130,6 +132,42 @@ bool run_jitter_buffer_tests() {
 
     auto stats_final = jb.get_stats();
     TEST_ASSERT(stats_final.packets_lost == 1);
+
+    // ---- Drain-to-target: excess latency is shed gently ----
+    // After a burst (startup prefill / stall) leaves the buffer well above
+    // the configured target, pop_frames() must shed the excess back toward
+    // target + margin without underrunning or dropping live audio.
+    {
+        JitterBuffer jb2(35);
+        jb2.configure(config, 35);  // target 35 ms = 1680 frames
+
+        std::vector<int16_t> pkt(240 * 2, 123);
+        // 30 packets = 150 ms buffered (> target 35 ms + margin 25 ms).
+        for (uint32_t seq = 0; seq < 30; ++seq) {
+            jb2.push_packet(seq, 1000 + seq * 1000, pkt.data(), 240);
+        }
+        TEST_ASSERT(jb2.is_ready());
+        TEST_ASSERT(jb2.available_duration_ms() > 100.0);  // over-buffered
+
+        // Simulate real-time streaming: pop one 5 ms chunk, push one packet,
+        // paced at the real 5 ms period (the drain is time-gated: startup
+        // grace 3 s + one 240-frame chunk per 400 ms).
+        std::vector<int16_t> out2(240 * 2, 0);
+        uint32_t seq2 = 30;
+        const double level_before = jb2.available_duration_ms();
+        for (int i = 0; i < 1000; ++i) {  // ~5 s of playback
+            jb2.pop_frames(out2.data(), 240);
+            jb2.push_packet(seq2, 1000 + static_cast<uint64_t>(seq2) * 1000, pkt.data(), 240);
+            ++seq2;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        const auto st = jb2.get_stats();
+        TEST_ASSERT(st.drained_frames > 0);               // excess was shed
+        TEST_ASSERT(st.underruns == 0);                   // never ran dry
+        // The level came down from the over-buffered start.
+        TEST_ASSERT(jb2.available_duration_ms() < level_before);
+    }
 
     return true;
 }
