@@ -172,6 +172,44 @@ for a in "${CLIENT_ARGS[@]}"; do
     esac
 done
 
+# Run the client under 'su -c' with a SIGNAL BRIDGE. Magisk's su can place
+# the command in its own session, so the terminal's Ctrl+C (SIGINT to the
+# foreground process group) never reaches the client - which is why Ctrl+C
+# appears ignored even though the client handles SIGINT. Solution: run su in
+# the background (same process group), trap INT/TERM in this script, and
+# forward the signal to su AND directly to the client (matched by its
+# absolute path), escalating INT -> TERM -> KILL.
+run_via_su() {
+    local cmd="$1"
+    su -c "$cmd" &
+    local su_pid=$!
+    cleanup() {
+        trap - INT TERM   # no re-entry while we are tearing down
+        echo ""
+        echo "Stopping AudioRouter client..."
+        kill -INT "$su_pid" 2>/dev/null
+        if command -v pkill >/dev/null 2>&1; then
+            pkill -INT -f "$ABS_BIN" 2>/dev/null
+            sleep 2
+            pkill -TERM -f "$ABS_BIN" 2>/dev/null
+            sleep 1
+            pkill -KILL -f "$ABS_BIN" 2>/dev/null
+        else
+            for sig in INT TERM KILL; do
+                for pid in $(pgrep -f "$ABS_BIN" 2>/dev/null); do
+                    [ "$pid" != "$$" ] && kill -"$sig" "$pid" 2>/dev/null
+                done
+                sleep 1
+            done
+        fi
+    }
+    trap cleanup INT TERM
+    wait "$su_pid"
+    local status=$?
+    trap - INT TERM
+    return $status
+}
+
 if [ "$(id -u)" -ne 0 ]; then
     if [ "$IS_AAUDIO" -eq 1 ] && [ "$HAS_BIND" -eq 1 ]; then
         # Root for the socket binding; AAudio runs in-process like the
@@ -181,7 +219,7 @@ if [ "$(id -u)" -ne 0 ]; then
             exit 1
         fi
         echo "Requesting root privileges via su (for -b auto); AAudio runs in-process like stream_daemon..."
-        su -c "$CMD"
+        run_via_su "$CMD"
     elif [ "$IS_AAUDIO" -eq 1 ]; then
         echo "AAudio backend: running as the current user (like: ./stream_daemon)."
         echo "Note: if AAudio does not work on this device, the AGM/ALSA fallbacks need root -"
@@ -193,7 +231,7 @@ if [ "$(id -u)" -ne 0 ]; then
             exit 1
         fi
         echo "Requesting root privileges via su..."
-        su -c "$CMD"
+        run_via_su "$CMD"
     fi
 elif [ "$IS_AAUDIO" -eq 1 ]; then
     # Already root (e.g. a root shell) and AAudio requested: launch directly;

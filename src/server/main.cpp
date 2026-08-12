@@ -120,6 +120,7 @@ int main(int argc, char* argv[]) {
     sa.sa_flags = 0;
     ::sigaction(SIGINT, &sa, nullptr);
     ::sigaction(SIGTERM, &sa, nullptr);
+    ::sigaction(SIGHUP, &sa, nullptr);
 #endif
     audiorouter::ServerConfig config;
     bool list_ifaces_only = false;

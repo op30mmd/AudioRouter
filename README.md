@@ -309,6 +309,11 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   need `tinymix` speaker-path setup when no Android audio has played yet.
 - **Runtime linking**: the AAudio build needs the system linker (run via
   `termux_run.sh` / `su -c "<abs path>"`), not a Termux-shell exec.
+- **Ctrl+C under `su`**: Magisk's `su` can put the client in its own session,
+  so the terminal's Ctrl+C never reaches it. `termux_run.sh` runs su in the
+  background and bridges INT/TERM to the client (matching it by absolute
+  path), escalating INT → TERM → KILL; the client also shuts down on
+  SIGHUP (terminal closed).
 
 ## 8. Repository layout
 

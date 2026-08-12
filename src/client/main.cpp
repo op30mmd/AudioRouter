@@ -126,6 +126,9 @@ int main(int argc, char* argv[]) {
         sa.sa_flags = 0;  // no SA_RESTART: interrupt blocking calls promptly
         ::sigaction(SIGINT, &sa, nullptr);
         ::sigaction(SIGTERM, &sa, nullptr);
+        // Terminal closed (or the su session detached): shut down gracefully
+        // instead of streaming into the void.
+        ::sigaction(SIGHUP, &sa, nullptr);
         struct sigaction sa_ign;
         std::memset(&sa_ign, 0, sizeof(sa_ign));
         sa_ign.sa_handler = SIG_IGN;
