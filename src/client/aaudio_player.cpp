@@ -75,6 +75,12 @@ constexpr int kProbeConsumeWaitMs = 500;
 // How long the parent waits for the forked AAudio helper to report ready.
 constexpr int kHelperReadyTimeoutMs = 10000;
 
+// How many times the parent retries the AAudio helper after an audioserver
+// restart. A HAL wedged by stale AAudio sessions (e.g. sessions left behind
+// by earlier root runs) is the most common cause of a stream stuck in
+// STARTING; one restart + retry clears it.
+constexpr int kMaxHelperAttempts = 1;
+
 // A stream that fails/stalls this many consecutive writes (~1.6 s at the
 // 200 ms write timeout) is considered wedged and gets recreated.
 constexpr int kStallRebuildThreshold = 8;
@@ -198,70 +204,93 @@ bool AaudioFifoPlayer::open_via_helper() {
     // Create the FIFO as root (the helper inherits the open fd), then fork.
     if (!create_fifo()) return false;
 
-    int status_pipe[2];
-    if (::pipe(status_pipe) != 0) {
-        LOG_ERROR("AaudioFifoPlayer: pipe() failed: " << std::strerror(errno));
-        destroy_fifo();
-        return false;
-    }
-
-    const pid_t pid = ::fork();
-    if (pid < 0) {
-        LOG_ERROR("AaudioFifoPlayer: fork() failed: " << std::strerror(errno));
-        ::close(status_pipe[0]);
-        ::close(status_pipe[1]);
-        destroy_fifo();
-        return false;
-    }
-    if (pid == 0) {
-        // Child: the AAudio stream lives here, as the Termux app user.
-        ::close(status_pipe[0]);
-        helper_child_main(status_pipe[1]);
-        _exit(1);  // not reached
-    }
-
-    // Parent: keep root. Wait for the helper to report ready/failed.
-    ::close(status_pipe[1]);
-    child_pid_ = pid;
-    status_fd_ = status_pipe[0];
-
-    bool ready = false;
-    char c = 0;
-    const uint64_t deadline = get_time_ms() + kHelperReadyTimeoutMs;
-    while (get_time_ms() < deadline) {
-        struct pollfd pfd = {status_fd_, POLLIN, 0};
-        const int pr = ::poll(&pfd, 1, 100);
-        if (pr > 0 && (pfd.revents & POLLIN)) {
-            const ssize_t n = ::read(status_fd_, &c, 1);
-            if (n == 1) {
-                ready = (c == 'R');
-                break;
+    for (int attempt = 0; attempt <= kMaxHelperAttempts; ++attempt) {
+        if (attempt > 0) {
+            // The helper opened the stream but it stalled in STARTING (or never
+            // consumed): the HAL is likely wedged by stale AAudio sessions from
+            // earlier runs. Restart audioserver once to clear them, then retry
+            // with a fresh helper.
+            LOG_WARN("AaudioFifoPlayer: AAudio stream stalled; the audio HAL may be wedged by "
+                     "stale AAudio sessions. Restarting audioserver once and retrying...");
+            {
+                std::lock_guard<std::mutex> lock(AndroidHelpers::subprocess_mutex());
+                ::system("/system/bin/stop audioserver 2>/dev/null; sleep 1; "
+                         "/system/bin/start audioserver 2>/dev/null");
             }
-            if (n == 0) break;  // helper exited without reporting
+            sleep_ms(2000);  // let audioserver come back up
         }
-        if (pr < 0 && errno != EINTR) break;
+
+        int status_pipe[2];
+        if (::pipe(status_pipe) != 0) {
+            LOG_ERROR("AaudioFifoPlayer: pipe() failed: " << std::strerror(errno));
+            destroy_fifo();
+            return false;
+        }
+
+        const pid_t pid = ::fork();
+        if (pid < 0) {
+            LOG_ERROR("AaudioFifoPlayer: fork() failed: " << std::strerror(errno));
+            ::close(status_pipe[0]);
+            ::close(status_pipe[1]);
+            destroy_fifo();
+            return false;
+        }
+        if (pid == 0) {
+            // Child: the AAudio stream lives here, as the Termux app user.
+            ::close(status_pipe[0]);
+            helper_child_main(status_pipe[1]);
+            _exit(1);  // not reached
+        }
+
+        // Parent: keep root. Wait for the helper to report ready/failed.
+        ::close(status_pipe[1]);
+        child_pid_ = pid;
+        status_fd_ = status_pipe[0];
+
+        char status = 0;
+        const uint64_t deadline = get_time_ms() + kHelperReadyTimeoutMs;
+        while (get_time_ms() < deadline) {
+            struct pollfd pfd = {status_fd_, POLLIN, 0};
+            const int pr = ::poll(&pfd, 1, 100);
+            if (pr > 0 && (pfd.revents & POLLIN)) {
+                const ssize_t n = ::read(status_fd_, &status, 1);
+                if (n == 1) break;
+                if (n == 0) break;  // helper exited without reporting
+            }
+            if (pr < 0 && errno != EINTR) break;
+        }
+
+        if (status == 'R') {
+            is_open_.store(true);
+            stop_monitor_.store(false);
+            monitor_thread_ = std::thread(&AaudioFifoPlayer::monitor_loop, this);
+            LOG_INFO("AaudioFifoPlayer: AAudio helper (pid " << pid
+                     << ") ready - stream renders as the Termux app user, FIFO " << fifo_path());
+            return true;
+        }
+
+        // Failure: reap the helper. 'S' (stream opened but stalled) is retried
+        // once after an audioserver restart; anything else fails immediately.
+        const bool retry = (status == 'S' && attempt < kMaxHelperAttempts);
+        LOG_ERROR("AaudioFifoPlayer: AAudio helper failed (status '"
+                  << (status != 0 ? status : '?') << "')"
+                  << (retry ? " - retrying after an audioserver restart" : ""));
+        ::kill(pid, SIGKILL);
+        int wstatus = 0;
+        ::waitpid(pid, &wstatus, 0);
+        child_pid_ = -1;
+        ::close(status_fd_);
+        status_fd_ = -1;
+
+        if (!retry) break;
     }
 
-    if (ready) {
-        is_open_.store(true);
-        stop_monitor_.store(false);
-        monitor_thread_ = std::thread(&AaudioFifoPlayer::monitor_loop, this);
-        LOG_INFO("AaudioFifoPlayer: AAudio helper (pid " << pid
-                 << ") ready - stream renders as the Termux app user, FIFO " << fifo_path());
-        return true;
-    }
-
-    LOG_ERROR("AaudioFifoPlayer: AAudio helper failed to open a renderable stream "
-              "(no Termux app user to drop to, or the AAudio data path is blocked on this "
-              "device). Falling back to AGM/ALSA. Run without '-b auto' and without su for "
-              "plain non-root AAudio, or use '-d agm'.");
-    ::kill(pid, SIGKILL);
-    int status = 0;
-    ::waitpid(pid, &status, 0);
-    child_pid_ = -1;
-    ::close(status_fd_);
-    status_fd_ = -1;
     destroy_fifo();
+    LOG_ERROR("AaudioFifoPlayer: AAudio helper failed to open a renderable stream "
+              "(no Termux app user to drop to, or the AAudio data path is blocked/stalled on "
+              "this device). Falling back to AGM/ALSA. Run without '-b auto' and without su "
+              "for plain non-root AAudio, or use '-d agm'. You can also restart Android "
+              "audio manually ('stop audioserver && start audioserver') or reboot.");
     return false;
 }
 
@@ -279,7 +308,7 @@ void AaudioFifoPlayer::helper_child_main(int status_fd) {
     if (!AndroidHelpers::termux_user(&uid, &gid, &home)) {
         std::fprintf(stderr, "AaudioFifoPlayer: helper: no Termux app user found; AAudio "
                              "cannot render under root\n");
-        ::write(status_fd, "F", 1);
+        ::write(status_fd, "N", 1);
         _exit(1);
     }
     // Note: we do NOT setenv HOME here. The helper uses the FIFO fd inherited
@@ -288,15 +317,25 @@ void AaudioFifoPlayer::helper_child_main(int status_fd) {
     if (::setgroups(0, nullptr) != 0 || ::setgid(gid) != 0 || ::setuid(uid) != 0) {
         std::fprintf(stderr, "AaudioFifoPlayer: helper: privilege drop failed: %s\n",
                      std::strerror(errno));
-        ::write(status_fd, "F", 1);
+        ::write(status_fd, "O", 1);
         _exit(1);
     }
 
     g_child_stop.store(false);
     ::signal(SIGTERM, [](int) { g_child_stop.store(true); });
 
-    if (!open_stream_and_probe(true)) {
-        ::write(status_fd, "F", 1);
+    std::string reason;
+    if (!open_stream_and_probe(true, &reason)) {
+        // 'S' = the stream opened but stalled (stuck STARTING / no
+        // consumption) - the parent will retry once after restarting
+        // audioserver, since a wedged HAL from stale sessions is the usual
+        // cause. 'O' = open/start failed outright - no point retrying.
+        const char status = (reason.find("stuck in state") != std::string::npos ||
+                             reason.find("no consumption") != std::string::npos)
+                                ? 'S'
+                                : 'O';
+        std::fprintf(stderr, "AaudioFifoPlayer: helper: %s\n", reason.c_str());
+        ::write(status_fd, &status, 1);
         _exit(1);
     }
     std::fprintf(stderr, "AaudioFifoPlayer: helper (uid %u): AAudio stream ready\n", uid);
@@ -565,7 +604,7 @@ bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms, std::string* fail_r
     return false;
 }
 
-bool AaudioFifoPlayer::open_stream_and_probe(bool quiet) {
+bool AaudioFifoPlayer::open_stream_and_probe(bool quiet, std::string* out_reason) {
     auto report = [quiet](const char* level, const std::string& msg) {
         if (quiet) {
             std::fprintf(stderr, "AaudioFifoPlayer: %s: %s\n", level, msg.c_str());
@@ -631,6 +670,9 @@ bool AaudioFifoPlayer::open_stream_and_probe(bool quiet) {
             ready = stream_ != nullptr && wait_for_start_locked(kStartWaitMs, &fail_reason);
         }
         if (ready) ready = probe_stream_ready(&fail_reason);
+    }
+    if (out_reason != nullptr) {
+        *out_reason = fail_reason;
     }
     if (!ready) {
         report("ERROR",

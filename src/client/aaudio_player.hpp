@@ -88,6 +88,10 @@ private:
     // UID 0). The parent keeps root for the socket binding (-b auto) and for
     // the AGM/ALSA fallback, and only streams PCM into the FIFO.
     bool open_via_helper();
+    // Runs in the forked child: drops to the Termux app user, opens the AAudio
+    // stream, pumps the FIFO. Reports over status_fd: 'R' ready, 'N' no
+    // Termux user, 'O' open/start failed, 'S' opened but stalled (parent
+    // retries once after restarting audioserver).
     void helper_child_main(int status_fd);
     void monitor_loop();
     void mark_dead();
@@ -95,8 +99,9 @@ private:
     // the device actually consumes audio (writes a probe chunk and watches
     // framesRead/timestamps). Retries once with the deep-buffer performance
     // mode. quiet: no LOG (forked child - the logger mutex may be held by a
-    // vanished thread, so the child uses fprintf instead).
-    bool open_stream_and_probe(bool quiet);
+    // vanished thread, so the child uses fprintf instead). out_reason receives
+    // the failure detail when it fails.
+    bool open_stream_and_probe(bool quiet, std::string* out_reason = nullptr);
     void pump_loop();
     void configure_builder(void* builder);   // AAudioStreamBuilder*
     // Blocks (up to timeout_ms) until the stream is fully STARTED. Issues
