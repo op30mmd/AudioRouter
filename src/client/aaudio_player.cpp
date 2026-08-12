@@ -531,10 +531,11 @@ bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms, std::string* fail_r
     }
     auto* stream = static_cast<AAudioStream*>(stream_);
 
-    // requestStart() is asynchronous; issue it once and poll. Re-issuing it
-    // every 50 ms (as before) can itself return errors while the stream is
-    // STARTING and never helps the state machine along.
-    aaudio_result_t start_result = AAudioStream_requestStart(stream);
+    // requestStart() was already issued once by the caller right after open
+    // (its result is reported via the state transition). Do NOT re-issue it
+    // here: calling requestStart() on a stream that is already STARTING
+    // returns AAUDIO_ERROR_INVALID_STATE and never helps the state machine.
+    // Just poll for the asynchronous STARTING -> STARTED transition.
     const uint64_t deadline = get_time_ms() + timeout_ms;
     while (get_time_ms() < deadline) {
         const aaudio_stream_state_t state = AAudioStream_getState(stream);
@@ -546,9 +547,7 @@ bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms, std::string* fail_r
             state == AAUDIO_STREAM_STATE_UNINITIALIZED) {
             if (fail_reason) {
                 *fail_reason = "stream went dead while starting (state=" +
-                               std::to_string(static_cast<int>(state)) +
-                               ", start_result=" +
-                               std::to_string(static_cast<int>(start_result)) + ")";
+                               std::to_string(static_cast<int>(state)) + ")";
             }
             return false;
         }
@@ -556,10 +555,12 @@ bool AaudioFifoPlayer::wait_for_start_locked(int timeout_ms, std::string* fail_r
         sleep_ms(50);
     }
     if (fail_reason) {
-        *fail_reason = "never STARTED within " + std::to_string(timeout_ms) +
-                       " ms (state=" +
+        *fail_reason = "stuck in state " +
                        std::to_string(static_cast<int>(AAudioStream_getState(stream))) +
-                       ", start_result=" + std::to_string(static_cast<int>(start_result)) + ")";
+                       " (" +
+                       std::string(AAudio_convertStreamStateToText(AAudioStream_getState(stream))) +
+                       ") for " + std::to_string(timeout_ms) +
+                       " ms - the requestStart() never completed";
     }
     return false;
 }
@@ -594,7 +595,16 @@ bool AaudioFifoPlayer::open_stream_and_probe(bool quiet) {
             return false;
         }
         stream_ = opened;
-        AAudioStream_requestStart(opened);
+        const aaudio_result_t start_res = AAudioStream_requestStart(opened);
+        if (start_res != AAUDIO_OK) {
+            report("ERROR", "AAudioStream_requestStart failed immediately: " +
+                                std::string(AAudio_convertResultToText(start_res)) + " (" +
+                                std::to_string(static_cast<int>(start_res)) + ")");
+            // Already holding stream_mutex_: close and clear in place.
+            AAudioStream_close(static_cast<AAudioStream*>(stream_));
+            stream_ = nullptr;
+            return false;
+        }
     }
 
     // requestStart() is asynchronous. Wait for STARTED, then verify the data
