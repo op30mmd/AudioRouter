@@ -27,50 +27,24 @@ bool AndroidHelpers::is_running_as_root() {
 #endif
 }
 
-bool AndroidHelpers::drop_to_termux_user() {
+bool AndroidHelpers::termux_user(uid_t* out_uid, gid_t* out_gid, std::string* out_home) {
 #if defined(__linux__) || defined(__ANDROID__)
-    if (geteuid() != 0) return false;  // already a normal user - nothing to drop
-
     const char* override = std::getenv("AUDIOROUTER_TERMUX_HOME");
-    const std::string termux_home =
+    const std::string home =
         (override != nullptr && override[0] != '\0') ? override : kTermuxHomeDefault;
 
     struct stat st;
-    if (::stat(termux_home.c_str(), &st) != 0) {
-        LOG_WARN("AndroidHelpers: cannot find the Termux home ('" << termux_home
-                 << "') to drop privileges for AAudio; AAudio will be blocked under root "
-                    "(rerun AAudio without su, or use -d agm/-d default)");
-        return false;
+    if (::stat(home.c_str(), &st) != 0 || st.st_uid == 0) {
+        return false;  // not installed, or owned by root - no app user to use
     }
-    if (st.st_uid == 0) {
-        LOG_WARN("AndroidHelpers: Termux home '" << termux_home
-                 << "' is owned by root; cannot determine the app user to drop to");
-        return false;
-    }
-
-    // Point the AAudio FIFO at the Termux home (writable by the app user).
-    ::setenv("HOME", termux_home.c_str(), 1);
-
-    // Drop supplementary groups first, then gid, then uid. The uid drop is
-    // permanent; do it only now that everything root-only (socket binding,
-    // /dev/snd permissions) is done.
-    if (::setgroups(0, nullptr) != 0) {
-        LOG_WARN("AndroidHelpers: setgroups failed: " << std::strerror(errno));
-        return false;
-    }
-    if (::setgid(st.st_gid) != 0) {
-        LOG_WARN("AndroidHelpers: setgid(" << st.st_gid << ") failed: " << std::strerror(errno));
-        return false;
-    }
-    if (::setuid(st.st_uid) != 0) {
-        LOG_WARN("AndroidHelpers: setuid(" << st.st_uid << ") failed: " << std::strerror(errno));
-        return false;
-    }
-    LOG_INFO("AndroidHelpers: dropped privileges to UID " << st.st_uid << " (Termux app user) "
-             << "so AAudio can render (Android blocks the AAudio data path for root)");
+    if (out_uid != nullptr) *out_uid = st.st_uid;
+    if (out_gid != nullptr) *out_gid = st.st_gid;
+    if (out_home != nullptr) *out_home = home;
     return true;
 #else
-    (void)0;
+    (void)out_uid;
+    (void)out_gid;
+    (void)out_home;
     return false;
 #endif
 }

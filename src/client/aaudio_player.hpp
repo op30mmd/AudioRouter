@@ -79,15 +79,34 @@ public:
 
 private:
 #if defined(__ANDROID__) && defined(AAUDIO_ENABLED)
+    // In-process path (non-root, or root with AUDIOROUTER_AAUDIO_AS_ROOT):
+    // creates the FIFO, opens the stream in this process, starts the pump
+    // thread.
+    bool open_in_process();
+    // Root path: the AAudio stream is created in a forked helper process that
+    // drops to the Termux app user (Android blocks the AAudio data path for
+    // UID 0). The parent keeps root for the socket binding (-b auto) and for
+    // the AGM/ALSA fallback, and only streams PCM into the FIFO.
+    bool open_via_helper();
+    void helper_child_main(int status_fd);
+    void monitor_loop();
+    void mark_dead();
+    // Opens the AAudio stream, requests start, waits for STARTED and verifies
+    // the device actually consumes audio (writes a probe chunk and watches
+    // framesRead/timestamps). Retries once with the deep-buffer performance
+    // mode. quiet: no LOG (forked child - the logger mutex may be held by a
+    // vanished thread, so the child uses fprintf instead).
+    bool open_stream_and_probe(bool quiet);
     void pump_loop();
     void configure_builder(void* builder);   // AAudioStreamBuilder*
     // Blocks (up to timeout_ms) until the stream is fully STARTED. Caller
     // must hold stream_mutex_. Returns false on timeout or if the stream
     // went DISCONNECTED/CLOSED/UNINITIALIZED.
     bool wait_for_start_locked(int timeout_ms);
-    // Verifies the stream's data path is actually running: a STARTED stream
-    // whose timestamps never appear is a dead MMAP/HAL path (AAudioStream_
-    // write would return 0 forever). Non-blocking - polls getTimestamp.
+    // Verifies the stream's data path is actually running: writes a small
+    // silence chunk and checks that the device consumes it (framesRead
+    // advances or a valid timestamp appears). Non-blocking except for the
+    // probe write. Caller must hold stream_mutex_.
     bool probe_stream_ready();
     bool ensure_stream_started_locked();
     bool rebuild_stream_locked();
@@ -131,6 +150,14 @@ private:
     // when the low-latency stream never starts, and by the pump after
     // repeated mid-stream stalls.
     bool deep_retry_ = false;
+
+    // Forked-helper state (root mode only): the helper process pid, the read
+    // end of the status pipe ('R' ready, 'F' failed to open, 'D' died), and
+    // the monitor thread that watches it.
+    pid_t child_pid_ = -1;
+    int status_fd_ = -1;
+    std::thread monitor_thread_;
+    std::atomic<bool> stop_monitor_{false};
 };
 
 } // namespace audiorouter

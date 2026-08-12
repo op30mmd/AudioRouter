@@ -296,9 +296,10 @@ bool AudioRouterClient::start() {
         LOG_INFO("Running with root privileges (UID 0). Direct ALSA access enabled.");
         AndroidHelpers::fix_snd_permissions();
         if (is_aaudio_device(config_.device_name)) {
-            LOG_INFO("AAudio requested while running as root: the client will drop to the "
-                     "Termux app user before opening AAudio (Android blocks the AAudio data "
-                     "path for UID 0), keeping root for the socket binding (-b auto).");
+            LOG_INFO("AAudio requested while running as root: the AAudio stream will be opened "
+                     "by a forked helper that runs as the Termux app user (Android blocks the "
+                     "AAudio data path for UID 0), while this process keeps root for the socket "
+                     "binding (-b auto) and the AGM/ALSA fallback.");
         }
     } else {
         LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'sudo' in Termux.");
@@ -390,17 +391,12 @@ bool AudioRouterClient::start() {
     heartbeat_thread_ = std::thread(&AudioRouterClient::heartbeat_thread, this);
 
     // AAudio must run as a normal app user: Android audio policy blocks the
-    // AAudio/MMAP data path for UID 0 (root has no app attribution token), so
-    // a root-launched AAudio stream opens but never renders. When the client
-    // was started as root (needed for -b auto / SO_BINDTODEVICE and the ALSA
-    // backends), drop to the Termux app user right before opening the player:
-    // the socket binding keeps its root privilege, while the AAudio stream is
-    // attributed to a real app. If the drop fails, AaudioFifoPlayer::open()
-    // refuses under root and the client falls back to the root-capable
-    // backends (AGM/ALSA) instead of playing silence.
-    if (!config_.use_dummy_player && is_aaudio_device(config_.device_name)) {
-        AndroidHelpers::drop_to_termux_user();
-    }
+    // AAudio data path for UID 0 (root has no app attribution token). When the
+    // client was started as root (needed for -b auto / SO_BINDTODEVICE and the
+    // ALSA backends), AaudioFifoPlayer::open() forks a helper process that
+    // drops to the Termux app user for the AAudio stream; this process keeps
+    // root, so the socket binding and the AGM/ALSA fallback keep working.
+    // No action needed here - the player handles it.
 
     // Open the audio player on a bounded, cancellable path: a hung ALSA /
     // kernel driver must never block the main thread or stall shutdown.

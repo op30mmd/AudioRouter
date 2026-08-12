@@ -232,20 +232,21 @@ another app's audio should keep working alongside AudioRouter.
 > no app attribution token, so the stream opens and reaches STARTED but never
 > actually renders (every `AAudioStream_write` returns 0). AAudio is designed
 > to run as the standard Termux app user (`u0_a...`). The client handles this
-> automatically: when started as root it **drops to the Termux app user right
-> before opening the AAudio stream**, so you can combine root-only features
-> with AAudio in one run:
+> automatically: when started as root it **forks a helper process that drops
+> to the Termux app user and owns the AAudio stream**, while the main process
+> keeps root for the socket binding (`-b auto`) and the AGM/ALSA fallback.
 >
 > ```bash
 > # -b auto needs root (SO_BINDTODEVICE); AAudio runs as the Termux user:
 > ./scripts/termux_run.sh -s 192.168.43.45 -d aaudio -b auto
-> #   -> termux_run.sh starts the client via su; the client drops to u0_a...
-> #      for the AAudio stream while keeping the socket bound.
+> #   -> termux_run.sh starts the client via su; the client keeps root for
+> #      the socket, and the AAudio stream lives in the forked helper as
+> #      u0_a... (PCM flows into it over the FIFO).
 > # No root needed at all (no -b):
 > ./bin/audiorouter_client -s 192.168.43.45 -d aaudio
 > ```
 >
-> If the drop is not possible (no Termux install), the client fails fast and
+> If no Termux app user is available, the helper fails fast and the client
 > falls back to the root-capable backends (AGM/ALSA) instead of silence.
 
 ### How it works
