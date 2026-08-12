@@ -1,401 +1,276 @@
-# AudioRouter 🎵
+# AudioRouter
 
-High-performance, ultra-low-latency C++ audio routing engine that streams PC audio output from **Windows** to an **Android** device over **UDP**, playing directly through the phone speakers using **ALSA** in **Termux with root privileges**.
-
-When the Android client connects to the Windows server via `IP:PORT`, the server automatically makes the PC speakers go quiet (mutes/silences master output) and routes the system audio stream directly to the Android speakers. When the client disconnects or times out, the PC speaker volume is immediately restored to its original state.
-
----
-
-## 🌟 Key Features
-
-- **⚡ Ultra-Low Latency & High Performance**:
-  - Direct Windows Audio Session API (**WASAPI Loopback Capture**) for bit-perfect audio capture without third-party drivers.
-  - Native **ALSA (Advanced Linux Sound Architecture)** playback on Android with zero intermediate framework layers (AudioFlinger bypassed).
-  - Packet chunking tuned to MTU (5ms - 10ms frame packets, ~960 bytes) preventing IP fragmentation over Wi-Fi.
-
-- **🔇 Automatic PC Speaker Silencing**:
-  - When the Android client connects, the server saves the PC's volume and mute state, then makes the PC speakers quiet (`IAudioEndpointVolume`).
-  - Seamlessly restores PC volume when the client exits, disconnects, or drops off Wi-Fi.
-
-- **📶 Built for Mobile Hotspots & Wi-Fi Jitter**:
-  - Custom binary protocol with monotonic sequence numbering, microsecond timestamps, and packet loss concealment (PLC).
-  - **Adaptive Jitter Buffer** smoothing out bursty Wi-Fi packet arrivals, reordering out-of-order UDP packets, and handling clock drift.
-  - Bidirectional UDP keep-alive heartbeats to keep Wi-Fi NAT routing tables open and compute real-time Round-Trip Time (RTT).
-  - Automatic network interface enumeration and auto-discovery probes across hotspot subnets.
-
-- **📱 Rooted Android & Termux Support**:
-  - Dual ALSA backend: supports both dynamic `libasound.so` (`pkg install alsa-lib`) and direct kernel ioctl driver (`/dev/snd/pcmC*D*p`) with zero external dynamic dependencies.
-  - Mixer setup scripts (`tinymix`) for Qualcomm Snapdragon and MediaTek Android hardware.
-
-- **🔊 AAudio Backend — No Root Required**:
-  - Plays through Android's native AAudio API (NDK `<aaudio/AAudio.h>`, API 26+): the stream is owned by AudioFlinger / the audio HAL, so it works on **stock, non-rooted devices** — no `/dev/snd`, no ALSA, no `tinymix`.
-  - PCM is pumped through a 1 MB FIFO into a low-latency AAudio stream in ~20 ms chunks with automatic underrun/pause recovery and stream recreation on routing changes (headphone unplug, Bluetooth switch).
-  - Three profiles: `aaudio` (media + low latency), `aaudio:deep` (power saver / deep buffer), `aaudio:voip` (call-style routing).
-  - Includes the standalone `stream_daemon` tool: a continuous real-time AAudio FIFO daemon (`/data/local/tmp/audio_pipe`) that any process can feed raw S16 stereo PCM into.
-
----
-
-## 🏗️ Architecture & Protocol
+High-performance, ultra-low-latency C++ audio routing engine that captures Windows
+system audio output (WASAPI loopback) and streams it to an Android device over UDP,
+where it is rendered through one of several pluggable playback backends (ALSA, direct
+kernel PCM, Qualcomm AGM, or Android AAudio). The server automatically mutes the PC
+speakers while a client is attached and restores the previous volume state on
+disconnect.
 
 ```
-+-------------------------------------------------------------+
-|                 Windows PC (Server / Sender)                |
-|                                                             |
-|   +---------------------+        +----------------------+   |
-|   |   WASAPI Loopback   | -----> |   IAudioEndpoint     |   |
-|   |   Audio Capture     |        |   Volume Mute / Quiet|   |
-|   +----------+----------+        +----------------------+   |
-|              |                                              |
-|              v                                              |
-|   +---------------------+                                   |
-|   |  Packetizer / QoS   |                                   |
-|   |  Low-Latency UDP    |                                   |
-|   +----------+----------+                                   |
-+--------------|----------------------------------------------+
-               |
-               |  UDP Packets (Port 44100)
-               |  [CONNECT / ACK / AUDIO_DATA / HEARTBEAT]
-               v
-+-------------------------------------------------------------+
-|               Android Device (Client / Receiver)            |
-|                   Termux (Root Privileges)                  |
-|                                                             |
-|   +---------------------+                                   |
-|   |  UDP Receiver &     |                                   |
-|   |  NAT Heartbeat Ping |                                   |
-|   +----------+----------+                                   |
-|              |                                              |
-|              v                                              |
-|   +---------------------+                                   |
-|   | Adaptive Jitter     | (Loss Concealment & Reordering)   |
-|   | Buffer & Ring Queue |                                   |
-|   +----------+----------+                                   |
-|              |                                              |
-|              v                                              |
-|   +---------------------+        +----------------------+   |
-|   |  ALSA Audio Player  | -----> |  /dev/snd/pcmC0D0p   |   |
-|   |  (libasound / ioctl)|        |  Phone Speakers      |   |
-|   +---------------------+        +----------------------+   |
-+-------------------------------------------------------------+
-```
-
-### Packet Structure
-All packets use packed binary headers:
-- `MAGIC` (`0x41554452` = "AUDR")
-- `version` (uint8_t)
-- `msg_type` (`CONNECT_REQ`, `CONNECT_ACK`, `AUDIO_DATA`, `HEARTBEAT_PING`, `HEARTBEAT_PONG`, `DISCONNECT_REQ`, `DISCONNECT_ACK`, `DISCOVERY_REQ`, `DISCOVERY_RESP`)
-- `seq_num` (uint32_t)
-- `timestamp_us` (uint64_t)
-- `payload_size` (uint32_t) + PCM Payload (16-bit signed integer stereo, 48kHz).
-
----
-
-## 🚀 Quick Start
-
-### 1. Hotspot Scenarios
-
-#### **Scenario A: PC Connected to Android Wi-Fi Hotspot** (Recommended)
-1. Turn on **Personal Hotspot / Wi-Fi Hotspot** on your Android phone.
-2. Connect your Windows PC to the Android hotspot.
-3. Start the server on Windows (see below). The server will display your PC's IP address (e.g. `192.168.43.45`).
-4. On Android in Termux, connect using the PC's IP.
-
-#### **Scenario B: Android Connected to Windows Mobile Hotspot**
-1. Turn on **Mobile Hotspot** in Windows Settings.
-2. Connect your Android phone to the PC's hotspot.
-3. The PC's gateway IP is typically `192.168.137.1`.
-4. On Android in Termux, connect to `192.168.137.1`.
-
----
-
-### 2. Building & Running the Windows Server
-
-#### Option A: Build with CMake & Visual Studio (MSVC)
-```bat
-scripts\build_server_msvc.bat
-```
-
-#### Option B: Build with MinGW (g++)
-```bat
-scripts\build_server_mingw.bat
-```
-
-#### Running the Server
-```bat
-bin\audiorouter_server.exe
-```
-
-Server Options:
-```
-Usage: audiorouter_server [options]
-  -p, --port <port>         UDP listening port (default: 44100)
-  -b, --bind <ip>           Bind IP address (default: 0.0.0.0)
-  -r, --rate <hz>           Sample rate in Hz (default: 48000)
-  -f, --frames <count>      Audio frames per UDP packet (default: 240 = 5ms)
-      --no-mute             Keep PC speaker unmuted during streaming (debug)
-      --mute-mode <mode>    'mute' (default), 'zero' (volume 0), or 'both'
-  -t, --test-tone           Generate test sine tone instead of loopback
-  -l, --list-if             List network interface IPs and exit
+┌──────────────────────────── Windows PC (server) ────────────────────────────┐
+│                                                                             │
+│  WASAPI Loopback ──► Packetizer ──► UDP socket          IAudioEndpointVolume │
+│  (IAudioCaptureClient,  (5 ms chunks,   (port 44100,     (mute PC speaker   │
+│   shared-mode, 48 kHz   240 frames,     QoS priority,    while streaming;   │
+│   stereo S16)            seq + ts)      MTU-safe)        restore on exit)   │
+└───────────────────────────────────┬─────────────────────────────────────────┘
+                                    │ UDP: DISCOVERY / CONNECT / AUDIO_DATA /
+                                    │       HEARTBEAT / DISCONNECT / CONTROL
+┌───────────────────────────────────▼─────────────────────────────────────────┐
+│                        Android device (client, Termux)                      │
+│                                                                             │
+│  UDP receiver ──► Adaptive Jitter Buffer ──► Audio Player (pluggable)       │
+│  (reorder + PLC  (256-slot ring, RFC3550   ├─ AAudio   (no root, in-process │
+│   + NAT keepalive) jitter EMA, prefill     │  like stream_daemon)           │
+│                  + stability gate)         ├─ AGM      (vendor agmplay +    │
+│                                             │           FIFO, root)         │
+│                                             ├─ ALSA     (libasound, root)   │
+│                                             └─ direct   (/dev/snd ioctl,    │
+│                                                         root)               │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### 3. Building & Running the Android Client (Termux)
+## 1. Protocol
 
-#### Setup Termux
-Inside Termux on your Android phone:
-```bash
-# 1. Clone repository
-git clone https://github.com/op30mmd/AudioRouter.git
-cd AudioRouter
+All packets are binary, little-endian, and start with a packed `CommonHeader`
+(`#pragma pack(1)`):
 
-# 2. Run automated setup script (installs clang, make, alsa-lib, sudo)
-chmod +x scripts/*.sh
-./scripts/termux_setup.sh
+```
+offset  size  field
+0       4     magic       0x41554452 ("AUDR")
+4       1     version     CURRENT_VERSION (1)
+5       1     msg_type    MsgType
+6       2     flags       PacketFlags (reserved; FLAG_NONE)
+8       4     seq_num     uint32 (per-message; audio packets carry the audio sequence)
+12      8     timestamp_us uint64 monotonic source timestamp
+20      4     payload_size
 ```
 
-#### Run with Root Privileges
-```bash
-# Request root
-su
+Message types (`protocol::MsgType`):
 
-# Start client connecting to Windows Server IP
-./bin/audiorouter_client -s 192.168.43.45 -p 44100
-```
-Or use the automated helper:
-```bash
-./scripts/termux_run.sh 192.168.43.45
-```
+| Type              | ID   | Direction      | Payload                                    |
+|-------------------|------|----------------|--------------------------------------------|
+| `DISCOVERY_REQ`   | 0x01 | client → server| `DiscoveryReqPayload` (client name, version)|
+| `DISCOVERY_RESP`  | 0x02 | server → client| `DiscoveryRespPayload` (server name, port, busy, muted) |
+| `CONNECT_REQ`     | 0x10 | client → server| `ConnectReqPayload` (preferred rate/channels/format, target latency) |
+| `CONNECT_ACK`     | 0x11 | server → client| `ConnectAckPayload` (negotiated format, frames/packet, PC muted, status) |
+| `CONNECT_NAK`     | 0x12 | server → client| `ConnectNakPayload` (error code, reason)   |
+| `DISCONNECT_REQ`  | 0x20 | either         | `DisconnectPayload` (reason)               |
+| `DISCONNECT_ACK`  | 0x21 | server → client| `DisconnectPayload`                         |
+| `AUDIO_DATA`      | 0x30 | server → client| `AudioPacketHeader` + interleaved PCM       |
+| `HEARTBEAT_PING`  | 0x40 | client → server| `HeartbeatPayload` (orig ts, buffer level, loss stats) |
+| `HEARTBEAT_PONG`  | 0x41 | server → client| `HeartbeatPayload` (echoes orig ts → RTT)   |
+| `CONTROL_CMD`     | 0x50 | client → server| `ControlCmdPayload` (mute / volume commands)|
 
-Client Options:
-```
-Usage: audiorouter_client [options]
-  -s, --server <ip>         Windows PC Server IP address
-  -p, --port <port>         Server UDP port (default: 44100)
-  -d, --device <dev>        Audio device (default: 'default'):
-                              ALSA:  'default', 'hw:0,0', 'plughw:0,0'
-                              Direct kernel: 'direct:/dev/snd/pcmC0D0p' or any '/dev/snd/...'
-                              Qualcomm AGM: 'agm' or 'agm:<backend>'
-                              AAudio (NO ROOT needed): 'aaudio', 'aaudio:deep', 'aaudio:voip'
-  -l, --latency <ms>        Target Jitter Buffer latency in ms (default: 35ms)
-      --discover            Auto-discover server on local hotspot subnet
-      --dummy               Use simulated audio player (benchmarking/testing)
-      --list-devices        List detected ALSA, kernel PCM nodes and AAudio availability
-```
+`AudioPacketHeader` extends `CommonHeader` with `sample_rate`, `channels`, `format`
+and `num_frames`; PCM follows as interleaved S16LE (48 kHz, stereo, negotiated at
+connect). `SAFE_PAYLOAD_MTU = 1400` bounds the audio payload so a single packet never
+fragments over Wi-Fi (default 240 frames = 5 ms = 960 bytes).
 
-#### No-Root Quick Start (AAudio)
+Validation helpers (`is_valid_header`, `validate_audio_header`, `validate`) enforce
+magic/version/type and payload-size consistency on every receive; malformed packets
+are dropped.
+
+## 2. Server (Windows)
+
+`src/server/` — WASAPI loopback capture, packetization, endpoint-volume control,
+and a watchdog:
+
+- **Capture** (`wasapi_capture.cpp`): `IAudioClient` in `AUDCLNT_SHAREMODE_SHARED` +
+  `AUDCLNT_STREAMFLAGS_LOOPBACK`, `IAudioCaptureClient::GetBuffer` on a dedicated
+  thread. The device mix format is queried and the client is told the negotiated
+  format in `CONNECT_ACK`.
+- **Packetization** (`server.cpp::on_audio_captured`): captured frames are chunked to
+  `frames_per_packet` (default 240 = 5 ms @ 48 kHz, single-MTU), stamped with a
+  monotonically increasing `seq_num` and a µs timestamp, and sent over a
+  QoS-prioritized UDP socket.
+- **Endpoint control** (`audio_endpoint_control.cpp`): on client connect the current
+  master volume/mute is saved and the PC speaker is silenced (`IAudioEndpointVolume`),
+  using either `mute`, `zero` (volume 0) or `both` (`--mute-mode`); on disconnect the
+  saved state is restored.
+- **Watchdog** (`server.cpp::watchdog_thread`): if no client traffic arrives within
+  `client_timeout_ms` (8 s), the client is disconnected and the speaker restored.
+- **Test tone** (`dummy_capture.cpp`): `-t` replaces loopback with a 440 Hz sine
+  generator for network/pipeline testing without a sound source.
+
+Options: `-p/--port`, `-b/--bind`, `-r/--rate`, `-f/--frames`, `--no-mute`,
+`--mute-mode`, `-t/--test-tone`, `-l/--list-if`.
+
+## 3. Client (Android / Termux)
+
+`src/client/` — UDP receiver, adaptive jitter buffer, pluggable playback backends,
+and a supervised device-open/retry machinery.
+
+### 3.1 Network receive thread
+Drains the UDP socket (512 KB buffers, QoS priority) and dispatches by type. Audio
+packets go to the jitter buffer; `HEARTBEAT_PONG` computes RTT from the echoed
+`orig_timestamp_us`; `DISCONNECT_*` tears down the session. Optional `-b auto`
+pins the socket to the physical Wi-Fi interface via `SO_BINDTODEVICE` (bypasses
+Android VPN tunnels; requires root).
+
+### 3.2 Adaptive jitter buffer (`jitter_buffer.cpp`)
+- **256-slot ring** (`MAX_SLOTS`), indexed by `seq_num % 256`.
+- **Reorder + loss detection**: out-of-window late packets are dropped;
+  a gap ≥ `MAX_SLOTS` resyncs the play pointer (stats `overruns`).
+- **Jitter estimate**: RFC 3550-style exponential moving average over inter-arrival
+  transit-time deltas (`jitter_estimate_us_ += (d - jitter_estimate_us_) / 16`).
+- **Prefill / stability gate**: first fill targets `max(120 ms, 3 × target)`
+  (capped 500 ms); the playhead starts only after 24 consecutive gap-free arrivals,
+  so it does not restart into a delivery stall. Re-buffers use the configured
+  `target_latency_ms` (default 35 ms).
+- **PLC**: on a missing slot, one packet's worth of silence is emitted and the
+  sequence is advanced (stats `packets_lost`, `underruns`).
+
+### 3.3 Playback backends
+All implement `IAudioPlayer` (`open/close/is_open/write_frames/get_buffer_delay_frames/flush`).
+The device name selects both the backend and the fallback chain:
+
+| `-d` value | Backend | Privilege | Notes |
+|------------|---------|-----------|-------|
+| `aaudio` / `aaudio:deep` / `aaudio:voip` | **AAudio** (NDK, in-process) | none | Byte-for-byte mirror of `stream_daemon`: 1 MB `O_RDWR` FIFO, ~20 ms pump chunks, 500 ms write timeout, no usage hints, no readiness probe; lenient watchdog (20 failed writes → recreate, deep-buffer mode on 2nd rebuild, fall back after 3). FIFO at `/data/local/tmp` as root, `$HOME` otherwise. |
+| `agm` / `agm:<backend>` | **AGM** via vendor `agmplay` subprocess + WAV-over-FIFO | root | Default backend `CODEC_DMA-LPAIF_RXTX-RX-1`; auto-recover: FIFO-stall detection, logcat/mixer preemption watcher, HAL restart. |
+| `direct:/dev/snd/pcmC0D0p` or `/dev/snd/...` | **Direct kernel PCM** (ioctl) | root | No ALSA userspace deps; enumerates `/dev/snd` nodes; per-node retry with hang detection. |
+| `default`, `hw:0,0`, `plughw:0,0` | **ALSA** via `libasound.so` | root | dlopen-based, optional direct fallback. |
+| `dummy` | DummyPlayer | — | Benchmarking / CI. |
+
+Fallback chains (`build_open_strategies`): `aaudio*` → `AAUDIO → AGM → NODES → LEGACY`;
+`agm*` → `AGM → NODES → LEGACY`; node paths → `NODES`; everything else → `LEGACY`.
+Each attempt runs on its own thread with a 20 s hang timeout; abandoned attempts
+hot-swap the device in if they later succeed.
+
+### 3.4 Heartbeat / keep-alive
+A 1 s heartbeat thread sends `HEARTBEAT_PING` with buffer level and loss counters
+(keeps NAT mappings open, feeds server-side stats), and re-handshakes when the
+server goes silent beyond `reconnect_timeout_ms`.
+
+### 3.5 Standalone tool: `stream_daemon`
+`src/tools/stream_daemon.cpp` — continuous real-time AAudio FIFO daemon. Creates
+`/data/local/tmp/audio_pipe` (or `$HOME/audio_pipe`), opens it `O_RDWR` (never EOF),
+expands it to 1 MB, and pumps 20 ms chunks into a low-latency AAudio stream with
+500 ms write timeouts. The client's `aaudio` backend is its in-process twin.
 
 ```bash
-# On a stock (non-rooted) device, Android 8.0+ — no 'su', no ALSA setup:
-./bin/audiorouter_client -s 192.168.43.45 -d aaudio
-
-# With the interface bind (needs root for -b auto; AAudio still runs as the
-# Termux user because the client drops privileges for it):
-./scripts/termux_run.sh -s 192.168.43.45 -d aaudio -b auto
-```
-
----
-
-## 🛠️ Android ALSA & Speaker Routing Details
-
-Android's Linux kernel provides raw ALSA hardware devices located in `/dev/snd/`:
-- `/dev/snd/pcmC0D0p`: Card 0, Device 0 Playback (Primary Speaker / DAC)
-- `/dev/snd/pcmC0D1p`: Deep buffer playback / secondary stream
-
-### Permissions & Mixer Routing
-When running in Termux with root (`su`):
-1. **Device Permissions**: AudioRouter automatically applies `chmod 666 /dev/snd/*` on launch.
-2. **Audio Hardware Unmuting**: On Qualcomm Snapdragon and MediaTek devices, Android's audio HAL might sleep mixer paths when no Android Java MediaPlayer is active. If no sound is audible, run:
-   ```bash
-   su
-   ./scripts/android_mixer_setup.sh
-   ```
-   Or set mixer controls directly with `tinymix`:
-   ```bash
-   tinymix "Speaker Function" "On"
-   tinymix "RX_CDC_DMA_RX_0 Audio Mixer MultiMedia1" 1
-   ```
-
----
-
-## 🔊 AAudio Playback (No Root Required)
-
-AAudio is the NDK's native audio API (Android 8.0+). Unlike the ALSA / direct
-`/dev/snd` / AGM backends, an AAudio stream is owned by **AudioFlinger and the
-audio HAL**, so playback goes through the normal Android audio policy —
-speaker, Bluetooth, USB — **without root and without touching the mixer**.
-This makes it the best option for stock, non-rooted devices, or whenever
-another app's audio should keep working alongside AudioRouter.
-
-> ℹ️ **Runs in-process, exactly like the standalone `stream_daemon`** — the
-> same engine, opened in the client's own process, no privilege games. The
-> daemon is proven to play as root (`sudo ./stream_daemon` + `ffmpeg` into
-> the pipe), and the client mirrors it: no usage/content-type hints, no
-> readiness probe that can reject a slow-starting stream, the daemon's
-> 500 ms write timeout, and a lenient watchdog that recreates the stream
-> after ~10 s of silence and falls back to AGM/ALSA after repeated failures.
->
-> ```bash
-> # With the interface bind (needs root for -b auto):
-> ./scripts/termux_run.sh -s 192.168.43.45 -d aaudio -b auto
-> # No root needed at all (no -b):
-> ./bin/audiorouter_client -s 192.168.43.45 -d aaudio
-> ```
->
-> If the device's audio HAL has no working AAudio output (some vendor HALs),
-> the watchdog detects it and the client falls back to the AGM/ALSA backends
-> instead of looping.
-
-### How it works
-
-- The client writes PCM into a FIFO under the Termux user's home —
-  `$HOME/audiorouter_aaudio.fifo` (falling back to
-  `/data/local/tmp/audiorouter_aaudio.fifo` when `$HOME` is unset). The
-  home is writable by the non-root app user, `/data/local/tmp` is not.
-  The FIFO is opened `O_RDWR` with the capacity expanded to 1 MB ≈ 5 s.
-- A background pump thread reads the FIFO (never EOF) and feeds
-  `AAudioStream_write()` in ~20 ms chunks with a 200 ms timeout — the same
-  engine as the standalone `stream_daemon`.
-- The FIFO provides natural back-pressure: if the network delivers faster than
-  the device consumes, the pipe fills and the jitter buffer drains instead of
-  dropping packets.
-- **Underrun/pause recovery**: if the stream is PAUSED/STOPPED or a write
-  fails, the stream is restarted automatically. If it is DISCONNECTED
-  (headphones unplugged, Bluetooth reconnect, USB audio removed), the stream
-  is recreated from scratch (rate-limited to once per second).
-
-### Device profiles
-
-| `-d` value         | Profile                                                     |
-|--------------------|-------------------------------------------------------------|
-| `aaudio`           | `USAGE_MEDIA` + `LOW_LATENCY` — default, lowest latency      |
-| `aaudio:deep`      | `USAGE_MEDIA` + `PERFORMANCE_MODE_NONE` — power saver / deep buffer, slightly higher latency, very stable |
-| `aaudio:voip`      | `USAGE_VOICE_COMMUNICATION` + `LOW_LATENCY` — call-style routing (useful if the stock policy ducks your stream) |
-
-### Building
-
-The AAudio backend is compiled in automatically when the toolchain targets
-Android API 26+ and `libaaudio` is linkable:
-
-- **Termux**: `pkg install ndk-sysroot` (provides the Android platform stub
-  libraries), then `make client` as usual. The Makefile probes for
-  `-laaudio`; on plain Linux/CI hosts the player compiles as a harmless stub.
-- **NDK / CMake**: set `-DANDROID_PLATFORM=android-26` (or newer); the
-  `aaudio` library is linked and the `stream_daemon` tool is built too.
-- If the probe finds no `libaaudio`, the client still builds — `-d aaudio`
-  simply fails fast and falls back to the other backends.
-
-### Standalone stream_daemon tool
-
-`src/tools/stream_daemon.cpp` is the standalone version of the same engine:
-it exposes a FIFO (default `$HOME/audio_pipe`, falling back to
-`/data/local/tmp/audio_pipe` when `$HOME` is unset; 48 kHz stereo S16) and
-plays whatever is written into it through AAudio. Useful when another
-process owns the PCM and you do not want the full client. Like the client
-backend, it must run as a normal (non-root) user — it prints a warning if
-started as root.
-
-```bash
-# Build with the NDK (or: ./scripts/build_stream_daemon.sh)
+# build (NDK, or scripts/build_stream_daemon.sh):
 clang++ -O2 -Wno-unavailable-declarations -target aarch64-linux-android30 \
     -o stream_daemon src/tools/stream_daemon.cpp -laaudio -lm
-
-# Run it (no su!), then feed it raw interleaved S16 stereo PCM:
+# run, then feed raw interleaved S16 stereo PCM:
 ./stream_daemon
-cat audio.raw > ~/audio_pipe
+ffmpeg -re -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+    -f s16le -ac 2 -fflags nobuffer -y /data/local/tmp/audio_pipe
 ```
 
----
+## 4. Build
 
-## 🧪 Testing & Verification
+### Windows server
+```bat
+scripts\build_server_msvc.bat     :: MSVC + CMake
+scripts\build_server_mingw.bat    :: MinGW
+```
 
-The project includes an automated unit test suite covering protocol packing, ring buffers, adaptive jitter buffers with loss concealment, and UDP networking:
-
+### Android client (Termux)
 ```bash
-make test
+./scripts/termux_setup.sh         # clang, make, alsa-utils, optional ndk-sysroot
+make client                       # probes: Android target, libaaudio (sysroot or
+                                  #   /system/lib64 absolute path), defines AAUDIO_ENABLED
+```
+The Makefile probes the toolchain (`--target=<triple>30` for AAudio, matching the
+proven stream_daemon build) and only compiles the AAudio backend when `libaaudio` is
+linkable; otherwise the player compiles as a stub and `-d aaudio` fails fast into the
+fallback chain. `make stream-daemon` builds the standalone tool.
+
+### NDK / CMake
+```bash
+cmake -B build-android -DCMAKE_TOOLCHAIN_FILE=$NDK/toolchain.cmake \
+      -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-android --target audiorouter_client stream_daemon
 ```
 
-Expected Output:
-```
-=========================================
- Running AudioRouter Comprehensive Tests
-=========================================
-
-[ RUN      ] Protocol & Packet Serialization
-[       OK ] Protocol & Packet Serialization
-[ RUN      ] Audio Ring Buffer
-[       OK ] Audio Ring Buffer
-[ RUN      ] Adaptive Jitter Buffer & PLC
-[       OK ] Adaptive Jitter Buffer & PLC
-[ RUN      ] Socket & Network Address Parsing
-[       OK ] Socket & Network Address Parsing
-[ RUN      ] Audio Converter & Downmixing
-[       OK ] Audio Converter & Downmixing
-
-=========================================
- Test Summary: 5 Passed, 0 Failed
-=========================================
+### Host tests
+```bash
+make test          # 8 suites: protocol, ring buffer, jitter buffer/PLC,
+                   # socket, conversion, thread/type/memory safety
 ```
 
----
+## 5. Usage
 
-## 📂 Project Structure
-
-```
-AudioRouter/
-├── CMakeLists.txt                 # Root CMake build configuration
-├── Makefile                       # Universal GNU Makefile (builds client, server, tests)
-├── README.md                      # Comprehensive documentation
-├── LICENSE                        # Apache 2.0 License
-├── src/
-│   ├── common/                    # Shared networking, protocol, and DSP
-│   │   ├── protocol.hpp           # Binary packet formats and message types
-│   │   ├── socket_util.hpp/.cpp   # Cross-platform UDP socket wrapper
-│   │   ├── audio_types.hpp        # Format descriptors and SIMD sample converters
-│   │   ├── ring_buffer.hpp        # Thread-safe lock-free circular audio buffer
-│   │   ├── logger.hpp             # Leveled colored timestamp logging
-│   │   └── time_util.hpp          # Monotonic clocks & microsecond timers
-│   ├── server/                    # Windows PC Audio Server
-│   │   ├── CMakeLists.txt
-│   │   ├── main.cpp               # Server CLI and signal handling
-│   │   ├── server.hpp/.cpp        # Server streaming engine & keep-alive
-│   │   ├── wasapi_capture.hpp/.cpp# Windows WASAPI Loopback Capture
-│   │   ├── audio_endpoint_control.hpp/.cpp # IAudioEndpointVolume PC speaker mute
-│   │   ├── dummy_capture.hpp/.cpp # Synthetic tone generator (Linux/fallback)
-│   │   └── audio_capture.hpp      # Audio capture interface
-│   ├── client/                    # Android Termux ALSA Client
-│   │   ├── CMakeLists.txt
-│   │   ├── main.cpp               # Client CLI and signal handling
-│   │   ├── client.hpp/.cpp        # Client receiver engine & NAT heartbeat
-│   │   ├── alsa_player.hpp/.cpp   # ALSA player (dynamic libasound)
-│   │   ├── direct_alsa.hpp/.cpp   # Direct kernel /dev/snd/pcmC0D0p ioctl driver
-│   │   ├── agm_fifo_player.hpp/.cpp # AGM playback via vendor agmplay subprocess + FIFO
-│   │   ├── aaudio_player.hpp/.cpp # AAudio FIFO player (no root, Android 8.0+)
-│   │   ├── dummy_player.hpp/.cpp  # Simulated audio sink (benchmarks/CI)
-│   │   ├── jitter_buffer.hpp/.cpp # Adaptive Jitter Buffer with PLC
-│   │   ├── android_helpers.hpp/.cpp # Root verification & tinymix helpers
-│   │   └── audio_player.hpp       # Audio player interface
-│   └── tools/
-│       └── stream_daemon.cpp      # Standalone AAudio FIFO daemon (no root)
-├── tests/                         # Unit tests suite
-│   ├── CMakeLists.txt
-│   ├── test_main.cpp
-│   ├── test_protocol.cpp
-│   ├── test_ring_buffer.cpp
-│   ├── test_jitter_buffer.cpp
-│   ├── test_socket.cpp
-│   └── test_conversion.cpp
-└── scripts/                       # Setup and execution scripts
-    ├── build_server_msvc.bat      # Windows MSVC build script
-    ├── build_server_mingw.bat     # Windows MinGW build script
-    ├── build_client.sh            # Linux / Android build script
-    ├── build_stream_daemon.sh     # NDK/Termux build of the AAudio stream daemon
-    ├── termux_setup.sh            # Termux environment setup script
-    ├── termux_run.sh              # Termux root execution script
-    └── android_mixer_setup.sh     # Android ALSA mixer speaker routing helper
+### Server
+```bat
+bin\audiorouter_server.exe                  :: loopback capture, port 44100
+bin\audiorouter_server.exe -t               :: 440 Hz test tone
 ```
 
----
+### Client
+```bash
+# root backends (AGM recommended on Qualcomm devices):
+su
+./bin/audiorouter_client -s 192.168.43.45 -d agm
+# no-root AAudio (in-process, like stream_daemon):
+./bin/audiorouter_client -s 192.168.43.45 -d aaudio
+# with interface binding (root; bypasses VPN):
+./scripts/termux_run.sh -s 192.168.43.45 -d agm -b auto
+```
 
-## 📄 License
-This project is licensed under the Apache License 2.0. See `LICENSE` for details.
+`scripts/termux_run.sh` resolves the binary to an absolute path and launches it via
+`su -c` for root backends (the AAudio build links `/system/lib64/libaaudio.so` by
+absolute path — only the system linker resolves it); `-b auto` runs via `su` and the
+client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
+
+### Client options
+```
+-s, --server <ip>     server IP
+-p, --port <port>     server port (default 44100)
+-d, --device <dev>    backend/device (see table above; default 'default')
+-l, --latency <ms>    target jitter-buffer latency (default 35 ms)
+-b, --bind <iface>    pin UDP socket to an interface ('auto' = physical NIC)
+    --discover        auto-discover the server on the local hotspot subnet
+    --dummy           DummyPlayer (benchmarks)
+    --list-devices    list ALSA nodes, kernel PCM nodes, AAudio availability
+```
+
+## 6. Hotspot topologies
+
+- **A: PC → Android hotspot**: PC connects to the phone's Wi-Fi hotspot; server
+  prints its IP (`192.168.43.x`); client connects to it.
+- **B: Android → Windows mobile hotspot**: PC hotspot gateway is typically
+  `192.168.137.1`; client connects there. If a VPN tunnel is active, use
+  `-b auto` to bypass it.
+
+## 7. Troubleshooting / operational notes
+
+- **AAudio does not render on some vendor HALs**: the stream opens but never starts
+  consuming (watchdog logs `AAudioStream_write wrote X of Y frames (state=..., read=...)`).
+  The client falls back to AGM/ALSA automatically; use `-d agm` directly for the
+  best experience on such devices.
+- **`/dev/snd` nodes hang**: Android's `audioserver` usually holds them.
+  `su -c "stop audioserver"` frees them (re-enable with `start audioserver`).
+- **AGM preempted by notifications**: the AGM player watches logcat + mixer state
+  and respawns `agmplay`; if the HAL is wedged it restarts `vendor.audio-hal`.
+- **Mixer routing** (`scripts/android_mixer_setup.sh`): Qualcomm/MediaTek devices may
+  need `tinymix` speaker-path setup when no Android audio has played yet.
+- **Runtime linking**: the AAudio build needs the system linker (run via
+  `termux_run.sh` / `su -c "<abs path>"`), not a Termux-shell exec.
+
+## 8. Repository layout
+
+```
+src/common/    protocol.hpp, socket_util.*, audio_types.hpp, ring_buffer.hpp,
+               logger.hpp, time_util.hpp, span/expected/thread compat
+src/server/    main.cpp, server.*, wasapi_capture.*, dummy_capture.*,
+               audio_endpoint_control.*, audio_capture.hpp
+src/client/    main.cpp, client.*, jitter_buffer.*, audio_player.hpp,
+               aaudio_player.*, agm_fifo_player.*, alsa_player.*,
+               direct_alsa.*, dummy_player.*, android_helpers.*
+src/tools/     stream_daemon.cpp
+scripts/       termux_setup.sh, termux_run.sh, build_client.sh,
+               build_stream_daemon.sh, android_mixer_setup.sh,
+               build_server_msvc.bat, build_server_mingw.bat
+tests/         protocol, ring buffer, jitter buffer/PLC, socket,
+               conversion, thread/type/memory safety
+```
+
+## 9. License
+
+Apache License 2.0 — see `LICENSE`.
