@@ -7,6 +7,7 @@
 # Backward-compatible: ./scripts/termux_run.sh [SERVER_IP] [PORT] [CLIENT_ARGS...]
 # e.g. ./scripts/termux_run.sh 10.16.211.80 44100 -d agm -b auto
 #      ./scripts/termux_run.sh -s 10.58.30.80 -d aaudio -b auto
+#      ./scripts/termux_run.sh -u -d aaudio     (Voice over USB: no server IP)
 #
 # The client is ALWAYS launched through its ABSOLUTE path.
 #   - Root-requiring backends (ALSA/AGM/direct): wrapped in
@@ -23,6 +24,7 @@
 
 SERVER_IP=""
 PORT="44100"
+USB_MODE=0
 declare -a CLIENT_ARGS=()
 
 POS=0
@@ -53,6 +55,11 @@ while [ $# -gt 0 ]; do
             fi
             CLIENT_ARGS+=("$1" "$2")
             shift 2
+            ;;
+        -u|--usb)
+            USB_MODE=1
+            CLIENT_ARGS+=("$1")
+            shift
             ;;
         -*)
             CLIENT_ARGS+=("$1")
@@ -118,26 +125,31 @@ if [ -z "$BIN_PATH" ]; then
     fi
 fi
 
-if [ -z "$SERVER_IP" ]; then
-    HAS_DISCOVER=0
-    for a in "${CLIENT_ARGS[@]}"; do
-        if [ "$a" = "--discover" ]; then
-            HAS_DISCOVER=1
-        fi
-    done
-    if [ "$HAS_DISCOVER" -eq 0 ]; then
-        echo "================================================="
-        echo " AudioRouter Android ALSA Client"
-        echo "================================================="
-        echo ""
-        echo "Enter Windows PC IP address (e.g. 192.168.43.1 or 192.168.137.1):"
-        read -r SERVER_IP
+# USB mode streams over the adb reverse tunnel - no server IP involved.
+# --discover lets the client find the server on the LAN - no IP either.
+HAS_DISCOVER=0
+for a in "${CLIENT_ARGS[@]}"; do
+    if [ "$a" = "--discover" ]; then
+        HAS_DISCOVER=1
     fi
+done
+
+if [ -z "$SERVER_IP" ] && [ "$USB_MODE" -eq 0 ] && [ "$HAS_DISCOVER" -eq 0 ]; then
+    echo "================================================="
+    echo " AudioRouter Android ALSA Client"
+    echo "================================================="
+    echo ""
+    echo "Enter Windows PC IP address (e.g. 192.168.43.1 or 192.168.137.1):"
+    read -r SERVER_IP
 fi
 
-if [ -z "$SERVER_IP" ]; then
+if [ -z "$SERVER_IP" ] && [ "$USB_MODE" -eq 0 ] && [ "$HAS_DISCOVER" -eq 0 ]; then
     echo "Error: No Server IP specified. Exiting."
     exit 1
+fi
+
+if [ "$USB_MODE" -eq 1 ] && [ -n "$SERVER_IP" ]; then
+    echo "Warning: -s/--server ($SERVER_IP) is ignored in USB mode; the stream goes over the USB cable via adb reverse." >&2
 fi
 
 # Resolve the binary to a plain absolute path (su -c needs one).
@@ -152,12 +164,28 @@ sh_quote() {
 }
 
 # Build the exact command: su -c "/abs/path/audiorouter_client <args>"
-CMD="$ABS_BIN -s $(sh_quote "$SERVER_IP") -p $(sh_quote "$PORT")"
+# USB mode passes no -s: the client connects through the adb reverse tunnel.
+# --discover passes no -s either: the client finds the server on its own.
+if [ "$USB_MODE" -eq 1 ] || [ -z "$SERVER_IP" ]; then
+    CMD="$ABS_BIN -p $(sh_quote "$PORT")"
+    FINAL_ARGS=(-p "$PORT")
+else
+    CMD="$ABS_BIN -s $(sh_quote "$SERVER_IP") -p $(sh_quote "$PORT")"
+    FINAL_ARGS=(-s "$SERVER_IP" -p "$PORT")
+fi
 for a in "${CLIENT_ARGS[@]}"; do
     CMD="$CMD $(sh_quote "$a")"
+    FINAL_ARGS+=("$a")
 done
 
-echo "Connecting to Windows Server at $SERVER_IP:$PORT..."
+if [ "$USB_MODE" -eq 1 ]; then
+    echo "USB mode: streaming over the USB cable via adb reverse tcp:$PORT tcp:$PORT"
+    echo "On the PC run first: scripts\\usb_setup.bat   (or: adb reverse tcp:$PORT tcp:$PORT)"
+elif [ "$HAS_DISCOVER" -eq 1 ]; then
+    echo "Auto-discovering the Windows Server on the local network (port $PORT)..."
+else
+    echo "Connecting to Windows Server at $SERVER_IP:$PORT..."
+fi
 echo "Running: $CMD"
 
 # AAudio runs in-process like the stream_daemon (which works as root), so:
@@ -236,7 +264,7 @@ if [ "$(id -u)" -ne 0 ]; then
         echo "AAudio backend: running as the current user (like: ./stream_daemon)."
         echo "Note: if AAudio does not work on this device, the AGM/ALSA fallbacks need root -"
         echo "re-run with '-b auto' (or '-d agm') via su in that case."
-        exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
+        exec "$ABS_BIN" "${FINAL_ARGS[@]}"
     else
         if ! command -v su >/dev/null 2>&1; then
             echo "Error: not running as root and 'su' is not available. Run 'su' first or install su." >&2
@@ -248,9 +276,9 @@ if [ "$(id -u)" -ne 0 ]; then
 elif [ "$IS_AAUDIO" -eq 1 ]; then
     # Already root (e.g. a root shell) and AAudio requested: launch directly;
     # AAudio runs in-process like the stream_daemon (which works as root).
-    exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
+    exec "$ABS_BIN" "${FINAL_ARGS[@]}"
 else
     # Already root (Android/system shell) with a root-requiring backend:
     # launch the absolute path directly.
-    exec "$ABS_BIN" -s "$SERVER_IP" -p "$PORT" "${CLIENT_ARGS[@]}"
+    exec "$ABS_BIN" "${FINAL_ARGS[@]}"
 fi

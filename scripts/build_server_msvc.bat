@@ -2,6 +2,10 @@
 REM AudioRouter - Windows MSVC Build Script
 setlocal enabledelayedexpansion
 
+REM Always run from the project root (script dir/..), no matter where the
+REM user invoked this script from.
+cd /d "%~dp0.."
+
 echo =================================================
 echo  Building AudioRouter Windows Server (MSVC)
 echo =================================================
