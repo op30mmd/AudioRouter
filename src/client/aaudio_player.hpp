@@ -118,6 +118,12 @@ private:
     // watchdog's retry (a deep-buffer session can start on HALs where the
     // low-latency session never renders).
     bool deep_retry_ = false;
+    // When the current stream was opened/created (monotonic ms). The watchdog
+    // uses it to detect a stream that has NEVER consumed a single frame -
+    // such a session will never render on this HAL - and escalates to a
+    // rebuild (deep-buffer mode) after kNeverRenderThresholdMs instead of
+    // burning through ~10 s of 500 ms write timeouts first.
+    uint64_t stream_opened_ms_ = 0;
     // FIFO path resolved for THIS process (see fifo_path()). Stored so
     // create_fifo()/unlink use the same path consistently.
     std::string resolved_fifo_;

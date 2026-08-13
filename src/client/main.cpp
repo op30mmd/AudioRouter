@@ -149,6 +149,7 @@ int main(int argc, char* argv[]) {
 
     audiorouter::ClientConfig config;
     bool list_devs = false;
+    bool latency_explicit = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -167,6 +168,7 @@ int main(int argc, char* argv[]) {
             config.device_name = argv[++i];
         } else if ((arg == "-l" || arg == "--latency") && i + 1 < argc) {
             config.target_latency_ms = static_cast<uint32_t>(std::stoi(argv[++i]));
+            latency_explicit = true;
         } else if ((arg == "-b" || arg == "--bind") && i + 1 < argc) {
             config.bind_iface = argv[++i];
         } else if (arg == "-u" || arg == "--usb") {
@@ -180,6 +182,16 @@ int main(int argc, char* argv[]) {
             print_usage(argv[0]);
             return 1;
         }
+    }
+
+    // The USB tunnel adds two relay threads and the adb reverse forward, so
+    // delivery stalls (tens to ~150 ms) are larger than on a clean LAN path.
+    // The LAN default (35 ms) would keep draining dry; raise the USB default
+    // jitter target. -l/--latency still overrides.
+    if (config.usb_mode && !latency_explicit) {
+        config.target_latency_ms = 80;
+        LOG_INFO("USB mode: default jitter buffer target raised to " << config.target_latency_ms
+                 << " ms (override with -l)");
     }
 
     if (list_devs) {

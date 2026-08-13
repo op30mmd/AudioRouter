@@ -819,15 +819,17 @@ void AudioRouterClient::audio_playback_thread() {
                             static_cast<uint32_t>((player->get_buffer_delay_frames() * 1000ULL) / rate);
                         backend_ms = stats_.audio_backend_delay_ms;
                     }
-                    // Self-pace against the device for the AAudio backend: the
-                    // pipe between the playback thread and the AAudio pump can
-                    // otherwise accumulate a full backlog (the jitter prefill
-                    // burst + the STARTING ramp), which shows up as a constant
-                    // multi-hundred-ms audio delay. Sleep so the backend drains
-                    // back toward ~40 ms. Other backends (ALSA/AGM/dummy)
-                    // report ~0 buffered delay and are unaffected.
+                    // Self-pace against the device for FIFO-style backends
+                    // (AAudio, AGM): their pipe can otherwise accumulate a
+                    // full backlog (the jitter prefill burst + stalls), which
+                    // shows up as a constant multi-hundred-ms audio delay.
+                    // Sleep so the backend drains back toward ~40 ms. Direct
+                    // backends (ALSA) pace themselves on blocking writes and
+                    // report ~0 buffered delay, so they are unaffected.
+                    const std::string dev_name = player->get_device_name();
                     if (backend_ms > 60 &&
-                        player->get_device_name().rfind("aaudio", 0) == 0) {
+                        (dev_name.rfind("aaudio", 0) == 0 ||
+                         dev_name.rfind("agm", 0) == 0)) {
                         sleep_ms(backend_ms - 40);
                     }
                 } else {

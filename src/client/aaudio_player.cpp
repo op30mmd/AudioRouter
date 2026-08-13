@@ -3,6 +3,7 @@
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +68,15 @@ constexpr int kStallRebuildThreshold = 20;
 // Give up (and let the client fall back to AGM/ALSA) after this many stalled
 // stream recreations.
 constexpr int kMaxStallRebuilds = 3;
+
+// A stream that has consumed ZERO frames this long after opening will never
+// render on this HAL (a healthy session's read counter moves within the first
+// 20-100 ms). Some vendor HALs only start their DMA once a large internal
+// buffer threshold is reached, which the capped low-latency capacity can
+// never satisfy - writes then block (or return 0) forever. Escalate to a
+// deep-buffer rebuild after this window instead of waiting through
+// kStallRebuildThreshold * kWriteTimeoutNs (~10 s) of write timeouts.
+constexpr uint64_t kNeverRenderThresholdMs = 1500;
 
 } // namespace
 
@@ -166,6 +176,7 @@ bool AaudioFifoPlayer::open(const AudioConfig& config, const std::string& device
              << " ch, mode '" << mode_ << "', state "
              << AAudioStream_getState(static_cast<AAudioStream*>(stream_))
              << ", FIFO " << fifo_path());
+    stream_opened_ms_ = get_time_ms();
 
     stop_pump_.store(false);
     is_open_.store(true);
@@ -391,6 +402,7 @@ bool AaudioFifoPlayer::rebuild_stream_locked() {
     }
     stream_ = opened;
     AAudioStream_requestStart(opened);
+    stream_opened_ms_ = get_time_ms();
     LOG_INFO("AaudioFifoPlayer: AAudio stream recreated ("
              << AAudioStream_getSampleRate(static_cast<AAudioStream*>(stream_))
              << " Hz, " << AAudioStream_getChannelCount(static_cast<AAudioStream*>(stream_))
@@ -512,6 +524,20 @@ void AaudioFifoPlayer::pump_loop() {
                     AAudioStream_getState(stream) == AAUDIO_STREAM_STATE_DISCONNECTED;
                 std::lock_guard<std::mutex> lock(stream_mutex_);
                 if (stream_ == nullptr) break;  // closed concurrently (shutdown)
+
+                // Fast escalation: a stream that has consumed ZERO frames this
+                // long after opening will never render on this HAL (healthy
+                // sessions show a moving read counter within the first
+                // 20-100 ms). Skip straight to a deep-buffer rebuild instead
+                // of burning through ~10 s of 500 ms write timeouts.
+                if (!disconnected &&
+                    AAudioStream_getFramesRead(stream) == 0 &&
+                    now_ms - stream_opened_ms_ >= kNeverRenderThresholdMs) {
+                    deep_retry_ = true;
+                    consecutive_write_failures_ =
+                        std::max(consecutive_write_failures_, kStallRebuildThreshold);
+                }
+
                 if (disconnected) {
                     // Routing changed (headphones unplugged, BT reconnect, ...).
                     if (now_ms - last_rebuild_ms_ >= kMinRebuildIntervalMs) {

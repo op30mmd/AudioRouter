@@ -114,6 +114,12 @@ traffic then travels over the USB cable straight into the PC's loopback — no
 hotspot, no Wi-Fi, no VPN issues. Any client that connects to `127.0.0.1:<port>`
 is treated like any other client (same mute/heartbeat/watchdog logic).
 
+In USB mode the client's default jitter buffer target rises from 35 ms to
+80 ms (the two relays plus the adb forward add bigger delivery stalls than a
+clean LAN path); pass `-l <ms>` to override. FIFO-style backends (AAudio, AGM)
+self-pace so their pipe backlog stays near ~40 ms instead of accumulating the
+full pipe capacity as constant delay.
+
 ## 3. Client (Android / Termux)
 
 `src/client/` — UDP receiver, adaptive jitter buffer, pluggable playback backends,

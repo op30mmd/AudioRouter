@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <cerrno>
@@ -588,8 +589,17 @@ size_t AgmFifoPlayer::write_frames(const void* pcm_data, size_t num_frames) {
 }
 
 size_t AgmFifoPlayer::get_buffer_delay_frames() const {
-    // agmplay owns the ring buffer; report none.
-    return 0;
+    // agmplay owns its internal ring buffer, but the pipe between us and
+    // agmplay is ours. Report its fill so the playback thread can self-pace
+    // (like the AAudio backend) and keep the FIFO backlog near zero in
+    // steady state - otherwise the pipe absorbs up to its full capacity
+    // (~680 ms of mono S16 at the default 64 KB), which the user hears as a
+    // constant multi-hundred-ms delay after any burst/stall.
+    int fifo_bytes = 0;
+    if (fifo_fd_ >= 0) ::ioctl(fifo_fd_, FIONREAD, &fifo_bytes);
+    if (fifo_bytes <= 0) return 0;
+    // Mono S16 = 2 bytes per frame.
+    return static_cast<size_t>(fifo_bytes) / 2;
 }
 
 void AgmFifoPlayer::flush() {
