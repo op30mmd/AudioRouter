@@ -113,12 +113,23 @@ through the adb relay).
 The phone turns the USB connection into a network link; the client then uses
 the plain UDP protocol over it, exactly like Wi-Fi:
 
+```bat
+REM on the PC (ONE-TIME, run while the phone's USB tethering is active):
+scripts\usb_tether_setup.bat   :: keeps the USB link off your internet routing
+bin\audiorouter_server.exe     :: normal server, no flags needed
+```
 ```bash
-# on the PC (normal server, no flags needed):
-bin\audiorouter_server.exe
 # on the phone (root backends; switches USB to RNDIS and back automatically):
 ./scripts/termux_run.sh --tether -d agm
 ```
+
+`usb_tether_setup.bat` addresses the one wart of USB tethering: the phone's
+DHCP hands the PC a default gateway, so Windows can start routing internet
+traffic through the phone. The script converts the DHCP lease into a static
+address with **no default gateway** (and pins the interface metric low), so
+the cable is reachable for AudioRouter while your internet routing stays
+exactly as it was. It persists per adapter — one run, then every tethering
+session comes up internet-safe.
 
 `--tether` runs `svc usb setFunctions rndis` (root), waits for `rndis0`,
 launches the client with `--discover -b rndis0` (the interface pin keeps the

@@ -213,7 +213,9 @@ fi
 
 if [ "$TETHER" -eq 1 ]; then
     echo "USB tethering mode: native UDP over the cable via RNDIS (no adb, lowest latency)."
-    echo "On the PC just start: bin\\audiorouter_server.exe   (it binds 0.0.0.0 and answers discovery)"
+    echo "On the PC (one-time): run scripts\\usb_tether_setup.bat while tethering is active -"
+    echo "  it keeps the USB link off your internet routing (no default gateway via the phone)."
+    echo "Then just start: bin\\audiorouter_server.exe   (it binds 0.0.0.0 and answers discovery)"
 elif [ "$USB_MODE" -eq 1 ]; then
     echo "USB mode: streaming over the USB cable via adb reverse tcp:$PORT tcp:$PORT"
     echo "On the PC run first: scripts\\usb_setup.bat   (or: adb reverse tcp:$PORT tcp:$PORT)"
