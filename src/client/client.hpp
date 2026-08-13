@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <string>
 #include <memory>
+#include <vector>
 
 namespace audiorouter {
 
@@ -119,6 +120,19 @@ private:
 
     // Device-open supervisor thread (never joined; detached on shutdown).
     std::thread device_thread_;
+
+    // Voice over USB relay (config_.usb_mode only): usb_tcp_ connects to
+    // 127.0.0.1:port (adbd's adb reverse listener); the protocol engine's
+    // UDP traffic goes to usb_relay_udp_ instead, and the relay translates
+    // between the two. server_addr_ points at the relay's loopback UDP port.
+    std::thread usb_relay_thread_;
+    TcpSocket usb_tcp_;
+    UdpSocket usb_relay_udp_;
+    SocketAddress usb_engine_peer_;  // the protocol engine's source address
+    std::vector<uint8_t> usb_frame_; // only touched by the relay thread
+    std::atomic<bool> usb_relay_connected_{false};
+
+    void usb_relay_thread_fn();
 };
 
 } // namespace audiorouter

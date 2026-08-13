@@ -105,8 +105,11 @@ Options: `-p/--port`, `-b/--bind`, `-r/--rate`, `-f/--frames`, `--no-mute`,
 ### 2.1 Voice over USB
 
 `--usb` binds the server to loopback (`127.0.0.1`) only and sets up an
-`adb reverse udp:<port> udp:<port>` tunnel (best effort; falls back to printed
-instructions if `adb` is missing or no device is connected). The phone's UDP
+`adb reverse tcp:<port> tcp:<port>` tunnel (best effort; falls back to printed
+instructions if `adb` is missing or no device is connected). adb cannot forward
+UDP, so the server runs a relay thread: it accepts the tunnel's TCP connection
+and carries each UDP datagram as a length-prefixed frame (`uint32 LE length |
+payload`), so the WASAPI engine above it still speaks plain UDP. The phone's
 traffic then travels over the USB cable straight into the PC's loopback — no
 hotspot, no Wi-Fi, no VPN issues. Any client that connects to `127.0.0.1:<port>`
 is treated like any other client (same mute/heartbeat/watchdog logic).
@@ -291,16 +294,18 @@ Phone plugged into the PC with USB debugging enabled; server and client speak
 over the USB cable only:
 ```bat
 REM on the PC:
-scripts\usb_setup.bat            :: adb reverse udp:44100 udp:44100 (or let the server do it)
+scripts\usb_setup.bat            :: adb reverse tcp:44100 tcp:44100 (or let the server do it)
 bin\audiorouter_server.exe --usb
 ```
 ```bash
 # on the phone (no hotspot, no root needed for the transport):
 ./bin/audiorouter_client -u -d aaudio
 ```
-`-u/--usb` forces the client to `127.0.0.1:<port>` (the adb reverse tunnel) and
-disables Wi-Fi/VPN interface handling; `--discover` and `-b` are ignored in USB
-mode. Works with every playback backend.
+`-u/--usb` routes the client through a loopback relay: the protocol engine
+sends UDP to a local relay socket, and the relay frames each datagram over the
+adb TCP tunnel to `127.0.0.1:<port>`. Wi-Fi/VPN interface handling is disabled;
+`--discover` and `-b` are ignored in USB mode. Works with every playback
+backend.
 
 `scripts/termux_run.sh` resolves the binary to an absolute path and launches it via
 `su -c` for root backends (the AAudio build links `/system/lib64/libaaudio.so` by

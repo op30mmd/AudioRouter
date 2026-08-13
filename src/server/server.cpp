@@ -3,6 +3,7 @@
 #include "dummy_capture.hpp"
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
+#include "../common/usb_tunnel.hpp"
 
 #include <cstring>
 #include <vector>
@@ -90,6 +91,13 @@ bool AudioRouterServer::start() {
     net_thread_ = std::thread(&AudioRouterServer::network_receive_thread, this);
     watchdog_thread_ = std::thread(&AudioRouterServer::watchdog_thread, this);
 
+    // Voice over USB: relay thread accepts the adb reverse TCP connection and
+    // bridges length-prefixed frames to/from this engine's UDP socket. Started
+    // before any client can connect so the tunnel is live on first handshake.
+    if (config_.usb_mode) {
+        usb_relay_thread_ = std::thread(&AudioRouterServer::usb_relay_thread, this);
+    }
+
     LOG_INFO("AudioRouter Server ready. Waiting for Android client connection.");
     return true;
 }
@@ -113,6 +121,11 @@ void AudioRouterServer::stop() {
     }
     if (watchdog_thread_.joinable()) {
         watchdog_thread_.join();
+    }
+    if (usb_relay_thread_.joinable()) {
+        // Time-bounded select() waits let it notice is_running_ == false
+        // within ~100 ms without needing to close sockets cross-thread.
+        usb_relay_thread_.join();
     }
 
     // Ensure endpoint volume is restored
@@ -379,6 +392,76 @@ void AudioRouterServer::handle_control_cmd(const protocol::CommonHeader& hdr, co
             break;
         default:
             break;
+    }
+}
+
+void AudioRouterServer::usb_relay_thread() {
+    if (!usb_listener_.listen(config_.port, "127.0.0.1", 1)) {
+        LOG_ERROR("USB tunnel: cannot listen on tcp:127.0.0.1:" << config_.port);
+        return;
+    }
+    LOG_INFO("USB tunnel: waiting for adb reverse connection on tcp:127.0.0.1:" << config_.port);
+
+    // UDP peer: the engine's UDP socket (bound to 127.0.0.1:port in USB mode)
+    // sees this relay as a normal remote client; the engine's replies come
+    // back here and are re-framed onto the TCP tunnel.
+    if (!usb_relay_udp_.open() || !usb_relay_udp_.bind(0, "127.0.0.1")) {
+        LOG_ERROR("USB tunnel: cannot open relay UDP socket");
+        return;
+    }
+    usb_relay_udp_.set_non_blocking(true);
+    const SocketAddress engine_udp("127.0.0.1", config_.port);
+
+    uint8_t datagram_buf[tunnel::kMaxFramePayload];
+    std::vector<uint8_t> frame;
+
+    while (is_running_) {
+        TcpSocket client;
+        if (!usb_listener_.accept(client, 200)) {
+            if (!is_running_) break;
+            continue;  // timeout: re-check shutdown, keep accepting
+        }
+        client.set_tcp_nodelay(true);
+        client.set_non_blocking(true);
+        tunnel::reset_frame_buffer();
+        // Drop datagrams left over from the previous tunnel (e.g. a
+        // DISCONNECT_ACK sent while the old connection was dying) so the new
+        // session never receives stale control traffic.
+        {
+            SocketAddress stale_from;
+            while (usb_relay_udp_.receive_from(datagram_buf, sizeof(datagram_buf), stale_from) > 0) {}
+        }
+        LOG_INFO("USB tunnel: adb reverse connected; relaying tcp <-> udp");
+
+        bool tunnel_closed = false;
+        while (is_running_ && !tunnel_closed) {
+            int m = tunnel::select2(&client, &usb_relay_udp_, 50);
+            if (m & 1) {
+                auto r = tunnel::read_frame(client, frame);
+                if (r == tunnel::RecvResult::Frame) {
+                    usb_relay_udp_.send_to(frame.data(), frame.size(), engine_udp);
+                } else if (r == tunnel::RecvResult::Closed || r == tunnel::RecvResult::Error) {
+                    tunnel_closed = true;
+                }
+            }
+            if (m & 2) {
+                SocketAddress from;
+                int n = usb_relay_udp_.receive_from(datagram_buf, sizeof(datagram_buf), from);
+                if (n > 0) {
+                    if (!tunnel::write_frame(client, datagram_buf, static_cast<size_t>(n))) {
+                        tunnel_closed = true;
+                    }
+                }
+            }
+        }
+
+        if (is_running_ && tunnel_closed) {
+            LOG_WARN("USB tunnel: client disconnected; restoring speaker state");
+            // Same path as a Wi-Fi client dropping: unmutes the PC speaker and
+            // clears the session so a reconnected tunnel starts clean.
+            disconnect_client("USB tunnel disconnected", true);
+        }
+        client.close();
     }
 }
 

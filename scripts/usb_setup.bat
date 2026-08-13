@@ -15,6 +15,9 @@ echo    * Phone connected to this PC with a USB cable
 echo    * USB debugging enabled on the phone (Developer options)
 echo    * If the phone shows an "Allow USB debugging?" prompt, authorize it
 echo.
+echo  Note: adb cannot forward UDP sockets, so the tunnel is TCP; the
+echo        AudioRouter server and client relay the UDP stream over it.
+echo.
 echo  Checking adb...
 
 where adb >nul 2>&1
@@ -30,8 +33,8 @@ echo  Connected devices:
 adb devices
 
 echo.
-echo  Setting up tunnel: adb reverse udp:%PORT% udp:%PORT%
-adb reverse udp:%PORT% udp:%PORT%
+echo  Setting up tunnel: adb reverse tcp:%PORT% tcp:%PORT%
+adb reverse tcp:%PORT% tcp:%PORT%
 if %ERRORLEVEL% NEQ 0 (
     echo.
     echo [ERROR] adb reverse failed. Check that a device is listed above
@@ -44,7 +47,9 @@ echo  Active reverse tunnels:
 adb reverse --list
 
 echo.
-echo [OK] USB tunnel is up (udp:%PORT% over the USB cable).
+echo [OK] USB tunnel is up (tcp:%PORT% over the USB cable).
+echo      Note: adb cannot forward UDP, so the AudioRouter server/client
+echo      relay the stream over this TCP tunnel automatically.
 echo.
 echo  Next steps:
 echo    * On this PC :  bin\audiorouter_server.exe --usb

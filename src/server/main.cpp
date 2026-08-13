@@ -52,15 +52,16 @@ namespace {
         return result;
     }
 
-    // Voice over USB: "adb reverse udp:<port> udp:<port>" makes the phone's
-    // loopback UDP port tunnel over the USB cable into this PC's loopback,
-    // where the server (bound to 127.0.0.1) picks it up. Best effort from the
-    // server; usb_setup.bat is the manual equivalent.
+    // Voice over USB: "adb reverse tcp:<port> tcp:<port>" tunnels the phone's
+    // loopback TCP port over the USB cable into this PC's loopback. adb cannot
+    // forward UDP, so the server relays datagrams as length-prefixed frames
+    // over that TCP connection (see AudioRouterServer::usb_relay_thread).
+    // Best effort from the server; usb_setup.bat is the manual equivalent.
     void setup_usb_tunnel(uint16_t port) {
         std::ostringstream rev;
         // 2>&1: adb reports diagnostics on stderr; popen/_popen capture only
         // stdout, so fold stderr in or the "no devices" check would miss it.
-        rev << "adb reverse udp:" << port << " udp:" << port << " 2>&1";
+        rev << "adb reverse tcp:" << port << " tcp:" << port << " 2>&1";
         std::ostringstream list;
         list << "adb reverse --list 2>&1";
 
@@ -74,8 +75,8 @@ namespace {
         }
 
         std::string listed = run_command(list.str());
-        if (listed.find("udp:" + std::to_string(port)) != std::string::npos) {
-            LOG_INFO("USB tunnel active: udp:" << port << " (phone loopback) <-> this PC's loopback over USB");
+        if (listed.find("tcp:" + std::to_string(port)) != std::string::npos) {
+            LOG_INFO("USB tunnel active: tcp:" << port << " (phone loopback) <-> this PC's loopback over USB");
         } else {
             if (listed.find("no devices") != std::string::npos) {
                 LOG_WARN("adb reports no connected device. Make sure the phone is plugged in with USB debugging enabled.");
@@ -83,7 +84,7 @@ namespace {
                 LOG_WARN("adb reverse did not confirm the tunnel.");
             }
             LOG_WARN("Set it up manually in another terminal and restart with --usb:");
-            LOG_WARN("    adb reverse udp:" << port << " udp:" << port);
+            LOG_WARN("    adb reverse tcp:" << port << " tcp:" << port);
         }
     }
 
@@ -153,7 +154,7 @@ void print_usage(const char* prog) {
               << "  -t, --test-tone           Generate test sine tone instead of WASAPI loopback\n"
               << "      --freq <hz>           Test tone frequency in Hz (default: 440.0)\n"
               << "      --usb                 Voice over USB: bind to loopback and stream over the USB cable\n"
-              << "                              via 'adb reverse udp:<port> udp:<port>' (no Wi-Fi)\n"
+              << "                              via 'adb reverse tcp:<port> tcp:<port>' (no Wi-Fi)\n"
               << "  -l, --list-if             List all available network interfaces and exit\n"
               << "  -v, --verbose             Enable debug logging\n"
               << "  -h, --help                Show this help message\n\n"
@@ -168,7 +169,7 @@ void print_usage(const char* prog) {
                << "  4. PC speaker will automatically go quiet and audio will play on Android!\n\n"
                << "Voice over USB (no Wi-Fi):\n"
                << "  1. Connect the phone by USB (USB debugging on).\n"
-               << "  2. " << prog << " --usb   (sets up 'adb reverse udp:44100 udp:44100' automatically)\n"
+               << "  2. " << prog << " --usb   (sets up 'adb reverse tcp:44100 tcp:44100' automatically)\n"
                << "  3. On the phone: ./audiorouter_client -u\n"
                << std::endl;
 }

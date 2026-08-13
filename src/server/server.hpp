@@ -27,8 +27,9 @@ struct ServerConfig {
     bool use_test_tone = false;
     double test_tone_freq = 440.0;
     // Voice over USB: bind to loopback only and accept the client through an
-    // "adb reverse udp:PORT udp:PORT" tunnel instead of the LAN. The tunnel
-    // injects the phone's UDP traffic straight into the PC's loopback.
+    // "adb reverse tcp:PORT tcp:PORT" tunnel instead of the LAN. The tunnel
+    // injects the phone's TCP traffic straight into the PC's loopback; the
+    // server relays each UDP datagram as a length-prefixed frame over it.
     bool usb_mode = false;
 };
 
@@ -64,6 +65,7 @@ private:
     void network_receive_thread();
     void watchdog_thread();
     void on_audio_captured(const void* data, size_t num_frames, const AudioConfig& config);
+    void usb_relay_thread();
 
     void handle_discovery_req(const protocol::CommonHeader& hdr, const SocketAddress& sender);
     void handle_connect_req(const protocol::CommonHeader& hdr, const uint8_t* payload, size_t len, const SocketAddress& sender);
@@ -81,6 +83,15 @@ private:
     std::unique_ptr<IAudioCapture> capture_engine_;
     AudioEndpointControl endpoint_control_;
     AudioConfig actual_audio_config_;
+
+    // Voice over USB TCP relay (config_.usb_mode only): the adb server connects
+    // TCP to 127.0.0.1:port; the relay translates length-prefixed frames on the
+    // accepted connection into UDP datagrams to this engine's UDP socket (and
+    // back). usb_listener_ accepts the tunnel's connections; the per-connection
+    // socket lives inside the relay thread.
+    std::thread usb_relay_thread_;
+    TcpSocket usb_listener_;
+    UdpSocket usb_relay_udp_;
 
     // Client Session State
     SocketAddress active_client_;

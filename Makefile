@@ -110,6 +110,7 @@ TEST_SRCS = tests/test_main.cpp \
             tests/test_ring_buffer.cpp \
             tests/test_jitter_buffer.cpp \
             tests/test_socket.cpp \
+            tests/test_usb_tunnel.cpp \
             tests/test_conversion.cpp \
             tests/test_thread_safety.cpp \
             tests/test_type_safety.cpp \

@@ -7,6 +7,7 @@ set(TEST_SOURCES
     test_ring_buffer.cpp
     test_jitter_buffer.cpp
     test_socket.cpp
+    test_usb_tunnel.cpp
     test_conversion.cpp
     test_thread_safety.cpp
     test_type_safety.cpp

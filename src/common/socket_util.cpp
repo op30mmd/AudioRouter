@@ -14,6 +14,34 @@ namespace audiorouter {
 
 namespace {
     static bool g_networking_initialized = false;
+
+    // True when the last socket call failed only because the operation would
+    // block (non-blocking mode). Used by the USB tunnel relay.
+    bool socket_would_block() {
+#if defined(_WIN32)
+        return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS;
+#endif
+    }
+
+    // select()-based readiness wait on a single fd. Returns 1 when ready,
+    // 0 on timeout, -1 on error.
+    int wait_fd_ready(socket_t fd, bool for_write, int timeout_ms) {
+        if (fd == INVALID_SOCKET_HANDLE) return -1;
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        int r = ::select(static_cast<int>(fd + 1),
+                         for_write ? nullptr : &fds,
+                         for_write ? &fds : nullptr,
+                         nullptr, &tv);
+        if (r < 0) return -1;
+        return r > 0 ? 1 : 0;
+    }
 }
 
 void UdpSocket::init_networking() {
@@ -462,6 +490,179 @@ std::vector<NetworkInterfaceInfo> UdpSocket::get_local_interfaces() {
 }
 
 SocketAddress UdpSocket::get_local_address() const {
+    if (!is_open()) return SocketAddress();
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    if (getsockname(handle_, reinterpret_cast<struct sockaddr*>(&addr), &len) == 0) {
+        return SocketAddress(addr);
+    }
+    return SocketAddress();
+}
+
+// TcpSocket Implementation
+
+TcpSocket::TcpSocket() : handle_(INVALID_SOCKET_HANDLE) {}
+
+TcpSocket::~TcpSocket() {
+    close();
+}
+
+TcpSocket::TcpSocket(TcpSocket&& other) noexcept : handle_(other.handle_) {
+    other.handle_ = INVALID_SOCKET_HANDLE;
+}
+
+TcpSocket& TcpSocket::operator=(TcpSocket&& other) noexcept {
+    if (this != &other) {
+        close();
+        handle_ = other.handle_;
+        other.handle_ = INVALID_SOCKET_HANDLE;
+    }
+    return *this;
+}
+
+bool TcpSocket::open() {
+    if (is_open()) return true;
+    handle_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (handle_ == INVALID_SOCKET_HANDLE) {
+        LOG_ERROR("Failed to create TCP socket: " << UdpSocket::get_last_error_string());
+        return false;
+    }
+    return true;
+}
+
+void TcpSocket::close() {
+    if (handle_ != INVALID_SOCKET_HANDLE) {
+#if defined(_WIN32)
+        closesocket(handle_);
+#else
+        ::close(handle_);
+#endif
+        handle_ = INVALID_SOCKET_HANDLE;
+    }
+}
+
+bool TcpSocket::is_open() const {
+    return handle_ != INVALID_SOCKET_HANDLE;
+}
+
+bool TcpSocket::connect(const SocketAddress& addr, int timeout_ms) {
+    if (!is_open()) {
+        if (!open()) return false;
+    }
+    set_non_blocking(true);
+
+    int res = ::connect(handle_, addr.sockaddr_ptr(), static_cast<socklen_t>(SocketAddress::size()));
+    if (res == 0) return true;
+    if (res != SOCKET_ERROR_VAL) return false;
+    if (!socket_would_block()) return false;
+
+    // Connect in progress: wait for writability up to timeout_ms.
+    if (wait_fd_ready(handle_, true, timeout_ms) <= 0) return false;
+
+    int err = 0;
+    socklen_t err_len = sizeof(err);
+#if defined(_WIN32)
+    getsockopt(handle_, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &err_len);
+#else
+    getsockopt(handle_, SOL_SOCKET, SO_ERROR, &err, &err_len);
+#endif
+    return err == 0;
+}
+
+bool TcpSocket::listen(uint16_t port, const std::string& ip, int backlog) {
+    if (!is_open()) {
+        if (!open()) return false;
+    }
+
+    int reuse = 1;
+#if defined(_WIN32)
+    setsockopt(handle_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+#else
+    setsockopt(handle_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
+
+    SocketAddress bind_addr(ip, port);
+    if (!bind_addr.is_valid()) {
+        LOG_ERROR("Invalid TCP bind address: " << ip << ":" << port);
+        return false;
+    }
+
+    if (::bind(handle_, bind_addr.sockaddr_ptr(), static_cast<socklen_t>(SocketAddress::size())) != 0) {
+        LOG_ERROR("TCP bind failed on " << ip << ":" << port << " - " << UdpSocket::get_last_error_string());
+        return false;
+    }
+    if (::listen(handle_, backlog) != 0) {
+        LOG_ERROR("TCP listen failed on " << ip << ":" << port << " - " << UdpSocket::get_last_error_string());
+        return false;
+    }
+    return true;
+}
+
+bool TcpSocket::accept(TcpSocket& out_client, int timeout_ms) {
+    if (!is_open()) return false;
+    if (wait_fd_ready(handle_, false, timeout_ms) <= 0) return false;
+
+    struct sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    socket_t c = ::accept(handle_, reinterpret_cast<struct sockaddr*>(&peer), &peer_len);
+    if (c == INVALID_SOCKET_HANDLE) return false;
+
+    out_client.close();
+    out_client.handle_ = c;
+    return true;
+}
+
+int TcpSocket::send(const void* data, size_t size) {
+    if (!is_open()) return -1;
+#if defined(_WIN32)
+    return ::send(handle_, static_cast<const char*>(data), static_cast<int>(size), 0);
+#else
+    // MSG_NOSIGNAL: a closed remote must not SIGPIPE the client process.
+    return static_cast<int>(::send(handle_, data, size, MSG_NOSIGNAL));
+#endif
+}
+
+int TcpSocket::recv(void* buffer, size_t max_size) {
+    if (!is_open()) return -1;
+#if defined(_WIN32)
+    return ::recv(handle_, static_cast<char*>(buffer), static_cast<int>(max_size), 0);
+#else
+    return static_cast<int>(::recv(handle_, buffer, max_size, 0));
+#endif
+}
+
+int TcpSocket::wait_readable(int timeout_ms) {
+    return wait_fd_ready(handle_, false, timeout_ms);
+}
+
+int TcpSocket::wait_writable(int timeout_ms) {
+    return wait_fd_ready(handle_, true, timeout_ms);
+}
+
+bool TcpSocket::set_tcp_nodelay(bool enable) {
+    if (!is_open()) return false;
+    int opt = enable ? 1 : 0;
+#if defined(_WIN32)
+    return setsockopt(handle_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&opt), sizeof(opt)) == 0;
+#else
+    return setsockopt(handle_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) == 0;
+#endif
+}
+
+bool TcpSocket::set_non_blocking(bool enable) {
+    if (!is_open()) return false;
+#if defined(_WIN32)
+    u_long mode = enable ? 1 : 0;
+    return ioctlsocket(handle_, FIONBIO, &mode) == 0;
+#else
+    int flags = fcntl(handle_, F_GETFL, 0);
+    if (flags < 0) return false;
+    flags = enable ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+    return fcntl(handle_, F_SETFL, flags) == 0;
+#endif
+}
+
+SocketAddress TcpSocket::get_local_address() const {
     if (!is_open()) return SocketAddress();
     struct sockaddr_in addr;
     socklen_t len = sizeof(addr);

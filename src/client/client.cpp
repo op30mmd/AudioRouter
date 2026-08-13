@@ -7,6 +7,7 @@
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
+#include "../common/usb_tunnel.hpp"
 
 #include <cstring>
 #include <vector>
@@ -314,24 +315,46 @@ bool AudioRouterClient::start() {
     socket_.set_qos_priority(true);
 
     if (config_.usb_mode) {
-        // Voice over USB: the PC-side "adb reverse udp:PORT udp:PORT" tunnel
-        // exposes the server at the phone's loopback. The Wi-Fi/VPN interface
-        // machinery below does not apply to lo.
+        // Voice over USB: the PC-side "adb reverse tcp:PORT tcp:PORT" tunnel
+        // exposes the server at the phone's loopback. adb cannot forward UDP,
+        // so this client runs a local relay: the protocol engine sends UDP to
+        // usb_relay_udp_ (a loopback socket), and the relay re-frames each
+        // datagram over the TCP tunnel. The Wi-Fi/VPN interface machinery
+        // below does not apply to lo.
         if (!config_.bind_iface.empty()) {
             LOG_WARN("--usb active: -b/--bind (" << config_.bind_iface << ") is ignored; the stream runs over the USB cable via loopback");
         }
         if (config_.auto_discover) {
-            LOG_WARN("--usb active: --discover is ignored; connecting straight to 127.0.0.1 (adb reverse tunnel)");
+            LOG_WARN("--usb active: --discover is ignored; connecting straight to the adb reverse tunnel");
         }
-        server_addr_ = SocketAddress("127.0.0.1", config_.server_port);
-        if (!server_addr_.is_valid()) {
-            LOG_ERROR("Invalid USB tunnel address: 127.0.0.1:" << config_.server_port);
+
+        if (!usb_relay_udp_.open()) {
+            LOG_ERROR("USB mode: failed to open relay UDP socket");
             socket_.close();
             return false;
         }
-        LOG_INFO("USB mode: targeting the adb reverse tunnel at " << server_addr_.to_string()
-                 << " (start 'adb reverse udp:" << config_.server_port
-                 << " udp:" << config_.server_port << "' on the PC)");
+        if (!usb_relay_udp_.bind(0, "127.0.0.1")) {
+            LOG_ERROR("USB mode: failed to bind relay UDP socket on loopback");
+            socket_.close();
+            return false;
+        }
+        // The protocol engine targets the relay's loopback address; the relay
+        // forwards those datagrams over the USB TCP tunnel.
+        server_addr_ = usb_relay_udp_.get_local_address();
+        if (!server_addr_.is_valid()) {
+            LOG_ERROR("USB mode: cannot determine relay UDP address");
+            socket_.close();
+            return false;
+        }
+        LOG_INFO("USB mode: engine -> loopback relay at " << server_addr_.to_string()
+                 << ", tunnel -> 127.0.0.1:" << config_.server_port
+                 << " (start 'adb reverse tcp:" << config_.server_port
+                 << " tcp:" << config_.server_port << "' on the PC)");
+
+        // Relay must be up before the handshake below: its first CONNECT_REQ
+        // is what the tunnel carries. The loop exits on stop_requested_ only
+        // (is_running_ is still false here), so failure paths stay clean.
+        usb_relay_thread_ = std::thread(&AudioRouterClient::usb_relay_thread_fn, this);
     } else {
         // Optional VPN bypass: pin the socket to the physical Wi-Fi interface so
         // an Android VPN tunnel (tun0) cannot swallow the LAN traffic to the PC.
@@ -394,7 +417,7 @@ bool AudioRouterClient::start() {
         if (config_.usb_mode) {
             LOG_ERROR("Failed to connect to the USB tunneled server at 127.0.0.1:" << config_.server_port);
             LOG_ERROR("Check that on the PC the tunnel is up and the server is listening:");
-            LOG_ERROR("    adb reverse udp:" << config_.server_port << " udp:" << config_.server_port);
+            LOG_ERROR("    adb reverse tcp:" << config_.server_port << " tcp:" << config_.server_port);
             LOG_ERROR("    audiorouter_server.exe --usb");
         } else {
             LOG_ERROR("Failed to connect to Windows AudioRouter Server at " << server_addr_.to_string());
@@ -538,6 +561,11 @@ void AudioRouterClient::stop() {
     }
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
+    }
+    if (usb_relay_thread_.joinable()) {
+        // The relay's select()/read waits are time-bounded (<= 50 ms), so it
+        // exits promptly once stop_requested_ is set.
+        usb_relay_thread_.join();
     }
     if (device_thread_.joinable()) {
         // The device open thread may be stuck in a kernel call; never join it.
@@ -855,6 +883,63 @@ void AudioRouterClient::heartbeat_thread() {
 
         sleep_ms(1000);
     }
+}
+
+void AudioRouterClient::usb_relay_thread_fn() {
+    const SocketAddress tunnel_addr("127.0.0.1", config_.server_port);
+    uint8_t datagram_buf[tunnel::kMaxFramePayload];
+
+    while (!stop_requested_) {
+        // (Re)establish the TCP leg of the tunnel. adb reverse rebinds the
+        // device-side listener automatically, so retrying here is enough to
+        // ride through unplug/replug and server restarts.
+        if (!usb_tcp_.is_open()) {
+            if (usb_tcp_.connect(tunnel_addr, 200)) {
+                usb_tcp_.set_tcp_nodelay(true);
+                usb_tcp_.set_non_blocking(true);
+                tunnel::reset_frame_buffer();
+                usb_relay_connected_.store(true);
+                LOG_INFO("USB tunnel: connected to adb reverse at 127.0.0.1:" << config_.server_port);
+            } else {
+                usb_relay_connected_.store(false);
+                usb_tcp_.close();  // failed connect may leave the socket dead; retry clean
+                sleep_ms(300);
+                continue;
+            }
+        }
+
+        // Only select the UDP leg while the TCP tunnel is up: with the tunnel
+        // down, engine datagrams are left queued in the relay socket's kernel
+        // buffer and are flushed as soon as the TCP leg (re)connects, so the
+        // first CONNECT_REQ survives a tunnel that comes up late.
+        int m = tunnel::select2(&usb_tcp_, usb_tcp_.is_open() ? &usb_relay_udp_ : nullptr, 50);
+        if (m & 1) {
+            auto r = tunnel::read_frame(usb_tcp_, usb_frame_);
+            if (r == tunnel::RecvResult::Frame) {
+                if (usb_engine_peer_.is_valid()) {
+                    usb_relay_udp_.send_to(usb_frame_.data(), usb_frame_.size(), usb_engine_peer_);
+                }
+            } else if (r == tunnel::RecvResult::Closed || r == tunnel::RecvResult::Error) {
+                LOG_WARN("USB tunnel: server connection closed; reconnecting...");
+                usb_tcp_.close();
+                usb_relay_connected_.store(false);
+            }
+        }
+        if (m & 2) {
+            SocketAddress from;
+            int n = usb_relay_udp_.receive_from(datagram_buf, sizeof(datagram_buf), from);
+            if (n > 0) {
+                usb_engine_peer_ = from;  // the protocol engine's loopback address
+                if (!tunnel::write_frame(usb_tcp_, datagram_buf, static_cast<size_t>(n))) {
+                    usb_tcp_.close();
+                    usb_relay_connected_.store(false);
+                }
+            }
+        }
+    }
+
+    usb_tcp_.close();
+    usb_relay_connected_.store(false);
 }
 
 bool AudioRouterClient::send_pc_mute_command(bool mute) {

@@ -19,6 +19,7 @@
     #include <sys/types.h>
     #include <sys/socket.h>
     #include <netinet/in.h>
+    #include <netinet/tcp.h>
     #include <arpa/inet.h>
     #include <unistd.h>
     #include <fcntl.h>
@@ -26,6 +27,7 @@
     #include <netdb.h>
     #include <ifaddrs.h>
     #include <net/if.h>
+    #include <sys/select.h>
     using socket_t = int;
     #define INVALID_SOCKET_HANDLE (-1)
     #define SOCKET_ERROR_VAL (-1)
@@ -97,6 +99,9 @@ public:
 
     SocketAddress get_local_address() const;
 
+    // Raw handle for poll()-style multiplexing (USB tunnel relay).
+    socket_t native_handle() const { return handle_; }
+
     // Forces all traffic on this socket out the named interface (SO_BINDTODEVICE).
     // Linux/Android only (needs root / CAP_NET_RAW); on Windows this is a no-op
     // returning false. Use it to bypass an Android VPN tunnel (tun0) so LAN
@@ -115,6 +120,52 @@ public:
 private:
     socket_t handle_;
     bool is_bound_;
+};
+
+// Minimal TCP socket for the Voice-over-USB tunnel (adb reverse tcp:).
+// The relay in client.cpp/server.cpp multiplexes it with select(), so
+// connect()/accept() leave the socket in NON-blocking mode; read/write
+// helpers in usb_tunnel.hpp handle EAGAIN by waiting on select().
+class TcpSocket {
+public:
+    TcpSocket();
+    ~TcpSocket();
+
+    // Sockets are non-copyable but movable
+    TcpSocket(const TcpSocket&) = delete;
+    TcpSocket& operator=(const TcpSocket&) = delete;
+    TcpSocket(TcpSocket&& other) noexcept;
+    TcpSocket& operator=(TcpSocket&& other) noexcept;
+
+    bool open();
+    void close();
+    bool is_open() const;
+
+    // Blocking connect with a timeout (select-based). Leaves the socket
+    // non-blocking so the caller can multiplex it with select().
+    bool connect(const SocketAddress& addr, int timeout_ms);
+    // Listen on ip:port (loopback in USB mode). Does not alter blocking mode.
+    bool listen(uint16_t port, const std::string& ip, int backlog);
+    // Accept one connection; select-based timeout (0 = timeout, -1 = error,
+    // 1 = success). The accepted socket is left non-blocking.
+    bool accept(TcpSocket& out_client, int timeout_ms);
+
+    // Plain send/recv (non-blocking; EAGAIN/EWOULDBLOCK surfaces as -1).
+    int send(const void* data, size_t size);
+    int recv(void* buffer, size_t max_size);
+
+    // 1 = ready, 0 = timeout, -1 = error.
+    int wait_readable(int timeout_ms);
+    int wait_writable(int timeout_ms);
+
+    bool set_tcp_nodelay(bool enable);
+    bool set_non_blocking(bool enable);
+
+    SocketAddress get_local_address() const;
+    socket_t native_handle() const { return handle_; }
+
+private:
+    socket_t handle_;
 };
 
 } // namespace audiorouter
