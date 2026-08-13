@@ -560,14 +560,15 @@ void AaudioFifoPlayer::pump_loop() {
                 // Fast escalation: a stream that has consumed ZERO frames this
                 // long after opening will never render on this HAL (healthy
                 // sessions show a moving read counter within the first
-                // 20-100 ms). Skip straight to a rebuild instead of burning
-                // through ~10 s of 500 ms write timeouts. The rebuild keeps
-                // the current performance mode first (a wedged session can
-                // clear on reopen); the stall ladder below drops to
-                // deep-buffer mode if the reopened stream stalls again.
+                // 20-100 ms). Skip straight to a deep-buffer rebuild instead
+                // of burning through ~10 s of 500 ms write timeouts. Deep mode
+                // is safe as the immediate fallback: kMaxInFlightFrames bounds
+                // its backlog the same way, so the deep session can't add
+                // multi-hundred-ms lag (it did before the pump pacing existed).
                 if (!disconnected &&
                     AAudioStream_getFramesRead(stream) == 0 &&
                     now_ms - stream_opened_ms_ >= kNeverRenderThresholdMs) {
+                    deep_retry_ = true;
                     consecutive_write_failures_ =
                         std::max(consecutive_write_failures_, kStallRebuildThreshold);
                 }
