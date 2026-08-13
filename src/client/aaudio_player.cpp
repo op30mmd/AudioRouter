@@ -28,8 +28,9 @@ namespace {
 // audio), which shows up as a constant multi-hundred-ms delay between the
 // source and the speaker. Capping the capacity keeps the in-stream backlog
 // to ~40 ms (plus the current write burst); the device then paces the pump
-// through write back-pressure instead of absorbing a big backlog.
-// Deep-buffer mode keeps the HAL default (its purpose is a large buffer).
+// through write back-pressure instead of absorbing a big backlog. The same
+// cap now applies to deep-buffer rebuilds (their HAL defaults can be even
+// larger), with kMaxInFlightFrames as a pump-level backstop.
 constexpr int32_t kBufferCapacityFrames = 1920;  // 40 ms @ 48 kHz
 
 // Pipe capacity for the PCM FIFO: 64 KB ~= 341 ms of 48 kHz stereo S16
@@ -74,9 +75,18 @@ constexpr int kMaxStallRebuilds = 3;
 // 20-100 ms). Some vendor HALs only start their DMA once a large internal
 // buffer threshold is reached, which the capped low-latency capacity can
 // never satisfy - writes then block (or return 0) forever. Escalate to a
-// deep-buffer rebuild after this window instead of waiting through
+// stream rebuild after this window instead of waiting through
 // kStallRebuildThreshold * kWriteTimeoutNs (~10 s) of write timeouts.
 constexpr uint64_t kNeverRenderThresholdMs = 1500;
+
+// Hard ceiling on frames in flight inside the AAudio stream (written - read).
+// Vendor HALs hand out huge buffers even in low-latency mode (the reference
+// device reports ~16.8 k frames = 350 ms, and deep-buffer sessions can be
+// much larger still); writing greedily fills them and adds a constant
+// multi-hundred-ms delay. The pump skips writes above this ceiling and lets
+// the device drain first - the same 40 ms the capped capacity aims for, and
+// a backstop when the HAL ignores the capacity request entirely.
+constexpr int64_t kMaxInFlightFrames = 1920;
 
 } // namespace
 
@@ -342,11 +352,12 @@ void AaudioFifoPlayer::configure_builder(void* builder_ptr) {
     const bool deep = deep_retry_ || mode_ == "deep";
     AAudioStreamBuilder_setPerformanceMode(builder,
         deep ? AAUDIO_PERFORMANCE_MODE_NONE : AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    // Bound the in-stream backlog on the low-latency path (see
-    // kBufferCapacityFrames). Deep-buffer mode keeps the HAL default.
-    if (!deep) {
-        AAudioStreamBuilder_setBufferCapacityInFrames(builder, kBufferCapacityFrames);
-    }
+    // Bound the in-stream backlog in BOTH modes (see kBufferCapacityFrames):
+    // deep-buffer sessions on some HALs otherwise hand out far larger buffers
+    // than low-latency ones, and a huge backlog is exactly what the user hears
+    // as constant delay. The pump additionally enforces kMaxInFlightFrames in
+    // case the HAL ignores this request.
+    AAudioStreamBuilder_setBufferCapacityInFrames(builder, kBufferCapacityFrames);
 }
 
 // Restarts the stream when it is not running (underrun, pause, stop).
@@ -475,6 +486,27 @@ void AaudioFifoPlayer::pump_loop() {
         }
         if (pr == 0 || !(pfd.revents & POLLIN)) continue;
 
+        // Bound the in-stream backlog before reading more PCM (see
+        // kMaxInFlightFrames): vendor HALs hand out buffers of hundreds of ms
+        // and consuming everything the FIFO offers fills them, which the user
+        // hears as a constant large delay. If the device is this far ahead,
+        // leave the data in the FIFO and let the device drain first.
+        {
+            bool capped = false;
+            {
+                std::lock_guard<std::mutex> lock(stream_mutex_);
+                if (stream_ == nullptr) break;  // closed (shutdown)
+                auto* s = static_cast<AAudioStream*>(stream_);
+                const int64_t in_flight =
+                    AAudioStream_getFramesWritten(s) - AAudioStream_getFramesRead(s);
+                capped = in_flight >= kMaxInFlightFrames;
+            }
+            if (capped) {
+                sleep_ms(5);  // outside the lock: close() never waits on this
+                continue;
+            }
+        }
+
         ssize_t bytes_read = ::read(fifo_fd_, buffer.data() + residual, buffer.size() - residual);
         if (bytes_read <= 0) continue;  // EAGAIN or interrupted; never EOF
 
@@ -528,12 +560,14 @@ void AaudioFifoPlayer::pump_loop() {
                 // Fast escalation: a stream that has consumed ZERO frames this
                 // long after opening will never render on this HAL (healthy
                 // sessions show a moving read counter within the first
-                // 20-100 ms). Skip straight to a deep-buffer rebuild instead
-                // of burning through ~10 s of 500 ms write timeouts.
+                // 20-100 ms). Skip straight to a rebuild instead of burning
+                // through ~10 s of 500 ms write timeouts. The rebuild keeps
+                // the current performance mode first (a wedged session can
+                // clear on reopen); the stall ladder below drops to
+                // deep-buffer mode if the reopened stream stalls again.
                 if (!disconnected &&
                     AAudioStream_getFramesRead(stream) == 0 &&
                     now_ms - stream_opened_ms_ >= kNeverRenderThresholdMs) {
-                    deep_retry_ = true;
                     consecutive_write_failures_ =
                         std::max(consecutive_write_failures_, kStallRebuildThreshold);
                 }

@@ -29,6 +29,11 @@ constexpr uint32_t kStableArrivalCount = 24;
 constexpr uint32_t kDrainMarginMs = 25;
 constexpr uint32_t kDrainIntervalMs = 400;
 constexpr size_t kDrainChunkFrames = 240;  // 5 ms @ 48 kHz
+// Fast catch-up for large backlogs (see pop_frames): 10 ms skips every
+// 100 ms shed ~100 ms/s so a post-stall backlog is gone in a couple of
+// seconds instead of lingering as a constant audible lag.
+constexpr uint32_t kDrainFastIntervalMs = 100;
+constexpr size_t kDrainFastChunkFrames = 480;  // 10 ms @ 48 kHz
 // Draining is disabled until this long after the first fill completes: the
 // startup prefill is deliberate protection for the first seconds of delivery
 // and must not be shed the moment playback starts.
@@ -248,16 +253,31 @@ size_t JitterBuffer::pop_frames(int16_t* dest, size_t num_frames) {
         const uint64_t now_ms = get_time_ms();
         const bool past_grace =
             startup_complete_ms_ == 0 || now_ms - startup_complete_ms_ >= kDrainStartGraceMs;
-        if (past_grace && now_ms - last_drain_ms_ >= kDrainIntervalMs) {
+        if (past_grace) {
             const size_t buffered = available_frames_unlocked();
             const size_t margin =
                 (static_cast<uint64_t>(config_.sample_rate) * kDrainMarginMs) / 1000;
             if (buffered > target_buffer_frames_ + margin) {
-                const size_t excess = buffered - target_buffer_frames_ - margin;
-                const size_t drop = std::min(excess, kDrainChunkFrames);
-                advance_playhead_locked(drop);
-                stats_.drained_frames += drop;
-                last_drain_ms_ = now_ms;
+                // Gentle catch-up for small excesses (clock skew, ~1-2 ms/s):
+                // tiny 5 ms skips every 400 ms are near-inaudible. A delivery
+                // stall (USB tunnel bursts can add ~150 ms) leaves a much
+                // larger backlog; shedding that at the gentle rate would leave
+                // the user with a clearly audible ~100 ms of lag for tens of
+                // seconds, so large backlogs shed ~4x faster (10 ms skips
+                // every 100 ms) - a short burst of minor skips beats a long
+                // tail of lag.
+                const size_t large_backlog_threshold =
+                    target_buffer_frames_ + (static_cast<uint64_t>(config_.sample_rate) * 100) / 1000;
+                const bool large = buffered > large_backlog_threshold;
+                const uint64_t interval = large ? kDrainFastIntervalMs : kDrainIntervalMs;
+                const size_t chunk = large ? kDrainFastChunkFrames : kDrainChunkFrames;
+                if (now_ms - last_drain_ms_ >= interval) {
+                    const size_t excess = buffered - target_buffer_frames_ - margin;
+                    const size_t drop = std::min(excess, chunk);
+                    advance_playhead_locked(drop);
+                    stats_.drained_frames += drop;
+                    last_drain_ms_ = now_ms;
+                }
             }
         }
     }
