@@ -115,10 +115,13 @@ hotspot, no Wi-Fi, no VPN issues. Any client that connects to `127.0.0.1:<port>`
 is treated like any other client (same mute/heartbeat/watchdog logic).
 
 In USB mode the client's default jitter buffer target rises from 35 ms to
-120 ms (the two relays plus the adb forward deliver in slow oscillating
-bursts that a smaller buffer cannot ride out); pass `-l <ms>` to override.
-FIFO-style backends (AAudio, AGM) self-pace so their pipe backlog stays near
-~40 ms instead of accumulating the full pipe capacity as constant delay.
+100 ms (measured on-device: the two relays plus the adb forward deliver in
+slow oscillating bursts that smaller buffers cannot ride out); pass
+`-l <ms>` to override. Both relays cap their TCP socket buffers at 64 KB so a
+stalled hop (adb/USB/CPU) drops fast and reconnects to live audio instead of
+queuing and replaying seconds of stale audio. FIFO-style backends (AAudio,
+AGM) self-pace so their pipe backlog stays near ~40 ms instead of
+accumulating the full pipe capacity as constant delay.
 
 ## 3. Client (Android / Termux)
 
