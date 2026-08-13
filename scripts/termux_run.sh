@@ -30,6 +30,7 @@ SERVER_IP=""
 PORT="44100"
 USB_MODE=0
 TETHER=0
+LATENCY_EXPLICIT=0
 declare -a CLIENT_ARGS=()
 
 POS=0
@@ -57,6 +58,9 @@ while [ $# -gt 0 ]; do
             if [ $# -lt 2 ]; then
                 echo "Error: $1 requires an argument." >&2
                 exit 1
+            fi
+            if [ "$1" = "-l" ] || [ "$1" = "--latency" ]; then
+                LATENCY_EXPLICIT=1
             fi
             CLIENT_ARGS+=("$1" "$2")
             shift 2
@@ -203,8 +207,13 @@ done
 # the server over the cable. Unicast routes on-link via rndis0 by itself, but
 # the DISCOVERY broadcast would follow the default route (a VPN would swallow
 # it), so the interface pin is what makes discovery reliable.
+# The RNDIS link has a slow ~130 ms transit oscillation (measured on-device),
+# so the LAN default (35 ms) starves; default to 100 ms unless -l was given.
 if [ "$TETHER" -eq 1 ]; then
     FINAL_ARGS=(-b rndis0 --discover "${FINAL_ARGS[@]}")
+    if [ "$LATENCY_EXPLICIT" -eq 0 ]; then
+        FINAL_ARGS+=(-l 100)
+    fi
     CMD="$ABS_BIN"
     for a in "${FINAL_ARGS[@]}"; do
         CMD="$CMD $(sh_quote "$a")"
@@ -216,6 +225,7 @@ if [ "$TETHER" -eq 1 ]; then
     echo "On the PC (one-time): run scripts\\usb_tether_setup.bat while tethering is active -"
     echo "  it keeps the USB link off your internet routing (no default gateway via the phone)."
     echo "Then just start: bin\\audiorouter_server.exe   (it binds 0.0.0.0 and answers discovery)"
+    echo "Jitter buffer: 100 ms by default (the RNDIS link has a slow transit oscillation; -l overrides)."
 elif [ "$USB_MODE" -eq 1 ]; then
     echo "USB mode: streaming over the USB cable via adb reverse tcp:$PORT tcp:$PORT"
     echo "On the PC run first: scripts\\usb_setup.bat   (or: adb reverse tcp:$PORT tcp:$PORT)"

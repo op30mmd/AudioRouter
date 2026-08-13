@@ -135,11 +135,13 @@ session comes up internet-safe.
 launches the client with `--discover -b rndis0` (the interface pin keeps the
 discovery broadcast off a VPN's default route), and restores the adb USB
 function on exit. The server answers discovery on the RNDIS interface — no IPs
-to type. AAudio cannot use `--tether` (the pin needs root, and AAudio does not
-render as root); enable tethering in the phone Settings and pass the PC's USB
-IP instead: `./scripts/termux_run.sh -s <PC-USB-IP> -d aaudio` (the server
-prints its USB interface IP on startup; unicast routes on-link via rndis0, no
-root needed).
+to type. The RNDIS link still has a slow ~130 ms transit oscillation, so the
+tethering default jitter buffer is 100 ms (measured on-device: 21 underruns at
+60 ms, 0 at 100 ms over 45 s); pass `-l <ms>` to override. AAudio cannot use
+`--tether` (the pin needs root, and AAudio does not render as root); enable
+tethering in the phone Settings and pass the PC's USB IP instead:
+`./scripts/termux_run.sh -s <PC-USB-IP> -d aaudio` (the server prints its USB
+interface IP on startup; unicast routes on-link via rndis0, no root needed).
 
 #### 2.1.2 adb reverse tunnel (fallback, no tethering)
 
