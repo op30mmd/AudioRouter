@@ -184,12 +184,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // The USB tunnel adds two relay threads and the adb reverse forward, so
-    // delivery stalls (tens to ~150 ms) are larger than on a clean LAN path.
-    // The LAN default (35 ms) would keep draining dry; raise the USB default
-    // jitter target. -l/--latency still overrides.
+    // The USB tunnel adds two relay threads and the adb reverse forward; its
+    // queue depth oscillates slowly (tens to ~200 ms), starving delivery in
+    // slow phases - 35 ms (the LAN default) and even 80 ms dry out and
+    // underrun. Raise the USB default jitter target; -l/--latency overrides.
     if (config.usb_mode && !latency_explicit) {
-        config.target_latency_ms = 80;
+        config.target_latency_ms = 120;
         LOG_INFO("USB mode: default jitter buffer target raised to " << config.target_latency_ms
                  << " ms (override with -l)");
     }
