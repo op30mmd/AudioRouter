@@ -104,6 +104,34 @@ Options: `-p/--port`, `-b/--bind`, `-r/--rate`, `-f/--frames`, `--no-mute`,
 
 ### 2.1 Voice over USB
 
+Two USB transports exist; **USB tethering is the recommended one** (native
+UDP over the cable, ~0.25 ms delivery jitter measured on-device vs ~7 ms
+through the adb relay).
+
+#### 2.1.1 USB tethering (RNDIS — lowest latency)
+
+The phone turns the USB connection into a network link; the client then uses
+the plain UDP protocol over it, exactly like Wi-Fi:
+
+```bash
+# on the PC (normal server, no flags needed):
+bin\audiorouter_server.exe
+# on the phone (root backends; switches USB to RNDIS and back automatically):
+./scripts/termux_run.sh --tether -d agm
+```
+
+`--tether` runs `svc usb setFunctions rndis` (root), waits for `rndis0`,
+launches the client with `--discover -b rndis0` (the interface pin keeps the
+discovery broadcast off a VPN's default route), and restores the adb USB
+function on exit. The server answers discovery on the RNDIS interface — no IPs
+to type. AAudio cannot use `--tether` (the pin needs root, and AAudio does not
+render as root); enable tethering in the phone Settings and pass the PC's USB
+IP instead: `./scripts/termux_run.sh -s <PC-USB-IP> -d aaudio` (the server
+prints its USB interface IP on startup; unicast routes on-link via rndis0, no
+root needed).
+
+#### 2.1.2 adb reverse tunnel (fallback, no tethering)
+
 `--usb` binds the server to loopback (`127.0.0.1`) only and sets up an
 `adb reverse tcp:<port> tcp:<port>` tunnel (best effort; falls back to printed
 instructions if `adb` is missing or no device is connected). adb cannot forward

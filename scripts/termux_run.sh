@@ -8,6 +8,10 @@
 # e.g. ./scripts/termux_run.sh 10.16.211.80 44100 -d agm -b auto
 #      ./scripts/termux_run.sh -s 10.58.30.80 -d aaudio -b auto
 #      ./scripts/termux_run.sh -u -d aaudio     (Voice over USB: no server IP)
+#      ./scripts/termux_run.sh --tether -d agm  (USB tethering: native UDP over
+#                                                the cable, lowest latency - the
+#                                                phone switches to RNDIS and back
+#                                                automatically; needs root)
 #
 # The client is ALWAYS launched through its ABSOLUTE path.
 #   - Root-requiring backends (ALSA/AGM/direct): wrapped in
@@ -25,6 +29,7 @@
 SERVER_IP=""
 PORT="44100"
 USB_MODE=0
+TETHER=0
 declare -a CLIENT_ARGS=()
 
 POS=0
@@ -59,6 +64,10 @@ while [ $# -gt 0 ]; do
         -u|--usb)
             USB_MODE=1
             CLIENT_ARGS+=("$1")
+            shift
+            ;;
+        --tether)
+            TETHER=1
             shift
             ;;
         -*)
@@ -127,7 +136,16 @@ fi
 
 # USB mode streams over the adb reverse tunnel - no server IP involved.
 # --discover lets the client find the server on the LAN - no IP either.
-HAS_DISCOVER=0
+# --tether implies discovery over the RNDIS cable.
+if [ "$TETHER" -eq 1 ]; then
+    if [ "$USB_MODE" -eq 1 ]; then
+        echo "Error: --tether and --usb are mutually exclusive (pick one USB transport)." >&2
+        exit 1
+    fi
+    HAS_DISCOVER=1
+else
+    HAS_DISCOVER=0
+fi
 for a in "${CLIENT_ARGS[@]}"; do
     if [ "$a" = "--discover" ]; then
         HAS_DISCOVER=1
@@ -150,6 +168,9 @@ fi
 
 if [ "$USB_MODE" -eq 1 ] && [ -n "$SERVER_IP" ]; then
     echo "Warning: -s/--server ($SERVER_IP) is ignored in USB mode; the stream goes over the USB cable via adb reverse." >&2
+fi
+if [ "$TETHER" -eq 1 ] && [ -n "$SERVER_IP" ]; then
+    echo "Warning: -s/--server ($SERVER_IP) is ignored in tethering mode; the server is discovered over the USB cable." >&2
 fi
 
 # Resolve the binary to a plain absolute path (su -c needs one).
@@ -178,7 +199,22 @@ for a in "${CLIENT_ARGS[@]}"; do
     FINAL_ARGS+=("$a")
 done
 
-if [ "$USB_MODE" -eq 1 ]; then
+# Tethering mode: pin the socket to the RNDIS interface (root) and discover
+# the server over the cable. Unicast routes on-link via rndis0 by itself, but
+# the DISCOVERY broadcast would follow the default route (a VPN would swallow
+# it), so the interface pin is what makes discovery reliable.
+if [ "$TETHER" -eq 1 ]; then
+    FINAL_ARGS=(-b rndis0 --discover "${FINAL_ARGS[@]}")
+    CMD="$ABS_BIN"
+    for a in "${FINAL_ARGS[@]}"; do
+        CMD="$CMD $(sh_quote "$a")"
+    done
+fi
+
+if [ "$TETHER" -eq 1 ]; then
+    echo "USB tethering mode: native UDP over the cable via RNDIS (no adb, lowest latency)."
+    echo "On the PC just start: bin\\audiorouter_server.exe   (it binds 0.0.0.0 and answers discovery)"
+elif [ "$USB_MODE" -eq 1 ]; then
     echo "USB mode: streaming over the USB cable via adb reverse tcp:$PORT tcp:$PORT"
     echo "On the PC run first: scripts\\usb_setup.bat   (or: adb reverse tcp:$PORT tcp:$PORT)"
 elif [ "$HAS_DISCOVER" -eq 1 ]; then
@@ -187,6 +223,44 @@ else
     echo "Connecting to Windows Server at $SERVER_IP:$PORT..."
 fi
 echo "Running: $CMD"
+
+# Tethering setup: switch the USB connection to RNDIS (the phone becomes a
+# USB network device and the PC gets a link-local lease from it), wait for
+# rndis0 to come up, and restore the adb function when the client exits.
+if [ "$TETHER" -eq 1 ]; then
+    if ! command -v su >/dev/null 2>&1; then
+        echo "Error: --tether needs root (su) to switch the USB function and pin the socket." >&2
+        exit 1
+    fi
+    echo "Switching the USB connection to RNDIS (tethering)..."
+    if ! su -c "svc usb setFunctions rndis" >/dev/null 2>&1; then
+        echo "Error: could not switch the USB function to RNDIS." >&2
+        echo "Enable 'USB tethering' in the phone Settings manually, then re-run." >&2
+        exit 1
+    fi
+    RNDIS_UP=0
+    for i in 1 2 3 4 5 6 7 8; do
+        if su -c "/system/bin/ip link show rndis0" >/dev/null 2>&1; then
+            RNDIS_UP=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$RNDIS_UP" -eq 0 ]; then
+        echo "Error: rndis0 did not come up." >&2
+        echo "Restore the adb connection with: su -c 'svc usb setFunctions adb'" >&2
+        su -c "svc usb setFunctions adb" >/dev/null 2>&1
+        exit 1
+    fi
+    echo "RNDIS link is up; discovering the server over the cable..."
+    restore_usb() {
+        trap - EXIT
+        echo ""
+        echo "Restoring the USB connection (adb)..."
+        su -c "svc usb setFunctions adb" >/dev/null 2>&1
+    }
+    trap restore_usb EXIT
+fi
 
 # AAudio runs in-process like the stream_daemon (which works as root), so:
 #   - aaudio + -b/--bind  -> run via su (root) for SO_BINDTODEVICE.
@@ -199,6 +273,32 @@ for a in "${CLIENT_ARGS[@]}"; do
         -b|--bind) HAS_BIND=1 ;;
     esac
 done
+# Tethering always pins the socket (the -b rndis0 prepended above).
+if [ "$TETHER" -eq 1 ]; then
+    HAS_BIND=1
+fi
+
+# AAudio renders only as a non-root app user, but the rndis0 pin needs root -
+# the two cannot be combined. Point the user at the manual -s flow instead.
+if [ "$TETHER" -eq 1 ] && [ "$IS_AAUDIO" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "Error: --tether pins the socket with -b (root), but AAudio does not render as root." >&2
+    echo "For AAudio over USB tethering: enable 'USB tethering' in the phone Settings," >&2
+    echo "then run:  ./scripts/termux_run.sh -s <PC-USB-IP> -d aaudio" >&2
+    echo "(the server prints its USB interface IP on startup; no root needed)." >&2
+    exit 1
+fi
+
+# Direct launch (no su): in tethering mode the USB function must be restored
+# afterwards, so run as a child instead of exec-ing over the script.
+launch_direct() {
+    if [ "$TETHER" -eq 1 ]; then
+        trap '' INT   # the client (same process group) handles Ctrl+C itself
+        "$ABS_BIN" "${FINAL_ARGS[@]}"
+        exit $?
+    else
+        exec "$ABS_BIN" "${FINAL_ARGS[@]}"
+    fi
+}
 
 # Run the client under 'su -c' with a SIGNAL BRIDGE. Magisk's su can place
 # the command in its own session, so the terminal's Ctrl+C (SIGINT to the
@@ -264,7 +364,7 @@ if [ "$(id -u)" -ne 0 ]; then
         echo "AAudio backend: running as the current user (like: ./stream_daemon)."
         echo "Note: if AAudio does not work on this device, the AGM/ALSA fallbacks need root -"
         echo "re-run with '-b auto' (or '-d agm') via su in that case."
-        exec "$ABS_BIN" "${FINAL_ARGS[@]}"
+        launch_direct
     else
         if ! command -v su >/dev/null 2>&1; then
             echo "Error: not running as root and 'su' is not available. Run 'su' first or install su." >&2
@@ -276,9 +376,9 @@ if [ "$(id -u)" -ne 0 ]; then
 elif [ "$IS_AAUDIO" -eq 1 ]; then
     # Already root (e.g. a root shell) and AAudio requested: launch directly;
     # AAudio runs in-process like the stream_daemon (which works as root).
-    exec "$ABS_BIN" "${FINAL_ARGS[@]}"
+    launch_direct
 else
     # Already root (Android/system shell) with a root-requiring backend:
     # launch the absolute path directly.
-    exec "$ABS_BIN" "${FINAL_ARGS[@]}"
+    launch_direct
 fi
