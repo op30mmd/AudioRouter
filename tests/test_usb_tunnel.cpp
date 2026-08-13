@@ -17,10 +17,11 @@ namespace {
 using namespace audiorouter;
 
 // Pumps read_frame() until a complete frame arrives or the deadline passes.
-bool pump_frame(TcpSocket& sock, std::vector<uint8_t>& out, int timeout_ms) {
+// rx is the caller-owned reassembly buffer (must persist across calls).
+bool pump_frame(TcpSocket& sock, std::vector<uint8_t>& rx, std::vector<uint8_t>& out, int timeout_ms) {
     const uint64_t deadline = get_time_ms() + static_cast<uint64_t>(timeout_ms);
     while (get_time_ms() < deadline) {
-        auto r = tunnel::read_frame(sock, out);
+        auto r = tunnel::read_frame(sock, rx, out);
         if (r == tunnel::RecvResult::Frame) return true;
         if (r == tunnel::RecvResult::Closed || r == tunnel::RecvResult::Error) return false;
         // Timeout: nothing complete yet, keep waiting until the deadline.
@@ -64,18 +65,21 @@ bool run_usb_tunnel_tests() {
     accepted.set_tcp_nodelay(true);
     accepted.set_non_blocking(true);
 
+    // Reassembly buffer owned by the receiving side, cleared on (re)connect.
+    std::vector<uint8_t> rx;
+    rx.clear();
+
     // --- Frame roundtrip over the TCP pair. ---
-    tunnel::reset_frame_buffer();
     const std::vector<uint8_t> payload{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x7F, 0x42, 0xC3, 0x00, 0x99, 0x11};
     TEST_ASSERT(tunnel::write_frame(connector, payload.data(), payload.size()));
 
     std::vector<uint8_t> out;
-    TEST_ASSERT(pump_frame(accepted, out, 2000));
+    TEST_ASSERT(pump_frame(accepted, rx, out, 2000));
     TEST_ASSERT(out == payload);
 
     // --- Empty (zero-length) frame. ---
     TEST_ASSERT(tunnel::write_frame(connector, payload.data(), 0));
-    TEST_ASSERT(pump_frame(accepted, out, 2000));
+    TEST_ASSERT(pump_frame(accepted, rx, out, 2000));
     TEST_ASSERT(out.empty());
 
     // --- Oversized payload is rejected by write_frame. ---
@@ -88,25 +92,25 @@ bool run_usb_tunnel_tests() {
     sleep_ms(50);  // let the 2 header bytes reach the reassembly buffer
     {
         std::vector<uint8_t> scratch;
-        auto r = tunnel::read_frame(accepted, scratch);
+        auto r = tunnel::read_frame(accepted, rx, scratch);
         TEST_ASSERT(r == tunnel::RecvResult::Timeout);  // header incomplete
     }
     TEST_ASSERT(connector.send(frame2.data() + 2, frame2.size() - 2) == static_cast<int>(frame2.size() - 2));
-    TEST_ASSERT(pump_frame(accepted, out, 2000));
+    TEST_ASSERT(pump_frame(accepted, rx, out, 2000));
     TEST_ASSERT(out == payload2);
 
-    // --- reset_frame_buffer() drops stale partial data from a dead session. ---
+    // --- Clearing the buffer (as on reconnect) drops stale partial data. ---
     const std::vector<uint8_t> stale = make_frame({0xAA, 0xBB, 0xCC, 0xDD});
     TEST_ASSERT(connector.send(stale.data(), 2) == 2);
     sleep_ms(50);
     {
         std::vector<uint8_t> scratch;
-        TEST_ASSERT(tunnel::read_frame(accepted, scratch) == tunnel::RecvResult::Timeout);
+        TEST_ASSERT(tunnel::read_frame(accepted, rx, scratch) == tunnel::RecvResult::Timeout);
     }
-    tunnel::reset_frame_buffer();  // new session: forget the 2 stale bytes
+    rx.clear();  // new session: forget the 2 stale bytes
     const std::vector<uint8_t> fresh{0x01, 0x02, 0x03};
     TEST_ASSERT(tunnel::write_frame(connector, fresh.data(), fresh.size()));
-    TEST_ASSERT(pump_frame(accepted, out, 2000));
+    TEST_ASSERT(pump_frame(accepted, rx, out, 2000));
     TEST_ASSERT(out == fresh);
 
     // --- write_frame fails cleanly on a closed socket. ---

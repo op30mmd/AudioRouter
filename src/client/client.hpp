@@ -130,6 +130,7 @@ private:
     UdpSocket usb_relay_udp_;
     SocketAddress usb_engine_peer_;  // the protocol engine's source address
     std::vector<uint8_t> usb_frame_; // only touched by the relay thread
+    std::vector<uint8_t> usb_rx_buf_; // frame reassembly (relay thread only)
     std::atomic<bool> usb_relay_connected_{false};
 
     void usb_relay_thread_fn();

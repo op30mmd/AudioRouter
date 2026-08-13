@@ -65,54 +65,47 @@ inline int select2(TcpSocket* tcp, UdpSocket* udp, int timeout_ms) {
     return mask;
 }
 
-// Per-thread frame reassembly buffer. Shared through this accessor so that
-// reset_frame_buffer() and read_frame() always touch the same buffer (a
-// thread_local declared inside each function would be a DIFFERENT variable).
-inline std::vector<uint8_t>& frame_rx_buffer() {
-    thread_local std::vector<uint8_t> buf;
-    return buf;
-}
-
-// Clears the persistent reassembly buffer read_frame() keeps. Must be called
-// once after (re)establishing a TCP connection so leftover partial frames from
-// a previous session can never be misread as the new session's data.
-inline void reset_frame_buffer() {
-    frame_rx_buffer().clear();
-}
+// The reassembly buffer is caller-owned, NOT thread_local: a thread_local
+// variable would give the executable a TLS segment, and Android's ARM64
+// Bionic refuses to run executables whose TLS segment is aligned below
+// 64 bytes ("executable's TLS segment is underaligned"). Each relay keeps
+// one buffer and clears it when a tunnel (re)connects.
 
 enum class RecvResult { Frame, Closed, Timeout, Error };
 
 // Reads one length-prefixed frame from a non-blocking TCP socket. The socket
 // should be select()-reported readable before the call; partial reads are
-// buffered across calls. Returns Frame (with the payload in out), Closed on
-// orderly EOF, Timeout when no further data arrived within the internal
-// 20 ms wait, Error otherwise.
-inline RecvResult read_frame(TcpSocket& sock, std::vector<uint8_t>& out) {
-    std::vector<uint8_t>& s_rx_buf = frame_rx_buffer();
+// buffered in rx across calls, so rx must persist between calls on the same
+// connection and be cleared whenever a new connection is established (stale
+// bytes from a previous session must never be misread as the new session's
+// data). Returns Frame (with the payload in out), Closed on orderly EOF,
+// Timeout when no further data arrived within the internal 20 ms wait, Error
+// otherwise.
+inline RecvResult read_frame(TcpSocket& sock, std::vector<uint8_t>& rx, std::vector<uint8_t>& out) {
     uint8_t chunk[4096];
 
     for (;;) {
         // Try to extract a complete frame from the reassembly buffer.
-        if (s_rx_buf.size() >= kFrameHeaderSize) {
-            const uint32_t len = static_cast<uint32_t>(s_rx_buf[0])
-                               | (static_cast<uint32_t>(s_rx_buf[1]) << 8)
-                               | (static_cast<uint32_t>(s_rx_buf[2]) << 16)
-                               | (static_cast<uint32_t>(s_rx_buf[3]) << 24);
+        if (rx.size() >= kFrameHeaderSize) {
+            const uint32_t len = static_cast<uint32_t>(rx[0])
+                               | (static_cast<uint32_t>(rx[1]) << 8)
+                               | (static_cast<uint32_t>(rx[2]) << 16)
+                               | (static_cast<uint32_t>(rx[3]) << 24);
             if (len > kMaxFramePayload) {
-                s_rx_buf.clear();
+                rx.clear();
                 return RecvResult::Error;
             }
-            if (s_rx_buf.size() >= kFrameHeaderSize + len) {
-                out.assign(s_rx_buf.begin() + kFrameHeaderSize,
-                           s_rx_buf.begin() + kFrameHeaderSize + len);
-                s_rx_buf.erase(s_rx_buf.begin(), s_rx_buf.begin() + kFrameHeaderSize + len);
+            if (rx.size() >= kFrameHeaderSize + len) {
+                out.assign(rx.begin() + kFrameHeaderSize,
+                           rx.begin() + kFrameHeaderSize + len);
+                rx.erase(rx.begin(), rx.begin() + kFrameHeaderSize + len);
                 return RecvResult::Frame;
             }
         }
 
         int n = sock.recv(chunk, sizeof(chunk));
         if (n > 0) {
-            s_rx_buf.insert(s_rx_buf.end(), chunk, chunk + n);
+            rx.insert(rx.end(), chunk, chunk + n);
             continue;
         }
         if (n == 0) return RecvResult::Closed;

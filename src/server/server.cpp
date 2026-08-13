@@ -414,6 +414,7 @@ void AudioRouterServer::usb_relay_thread() {
 
     uint8_t datagram_buf[tunnel::kMaxFramePayload];
     std::vector<uint8_t> frame;
+    std::vector<uint8_t> rx;  // frame reassembly buffer (this thread only)
 
     while (is_running_) {
         TcpSocket client;
@@ -423,7 +424,7 @@ void AudioRouterServer::usb_relay_thread() {
         }
         client.set_tcp_nodelay(true);
         client.set_non_blocking(true);
-        tunnel::reset_frame_buffer();
+        rx.clear();  // stale partial frame from a previous tunnel session
         // Drop datagrams left over from the previous tunnel (e.g. a
         // DISCONNECT_ACK sent while the old connection was dying) so the new
         // session never receives stale control traffic.
@@ -437,7 +438,7 @@ void AudioRouterServer::usb_relay_thread() {
         while (is_running_ && !tunnel_closed) {
             int m = tunnel::select2(&client, &usb_relay_udp_, 50);
             if (m & 1) {
-                auto r = tunnel::read_frame(client, frame);
+                auto r = tunnel::read_frame(client, rx, frame);
                 if (r == tunnel::RecvResult::Frame) {
                     usb_relay_udp_.send_to(frame.data(), frame.size(), engine_udp);
                 } else if (r == tunnel::RecvResult::Closed || r == tunnel::RecvResult::Error) {

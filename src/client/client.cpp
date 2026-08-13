@@ -897,7 +897,7 @@ void AudioRouterClient::usb_relay_thread_fn() {
             if (usb_tcp_.connect(tunnel_addr, 200)) {
                 usb_tcp_.set_tcp_nodelay(true);
                 usb_tcp_.set_non_blocking(true);
-                tunnel::reset_frame_buffer();
+                usb_rx_buf_.clear();  // stale partial frame from a previous session
                 usb_relay_connected_.store(true);
                 LOG_INFO("USB tunnel: connected to adb reverse at 127.0.0.1:" << config_.server_port);
             } else {
@@ -914,7 +914,7 @@ void AudioRouterClient::usb_relay_thread_fn() {
         // first CONNECT_REQ survives a tunnel that comes up late.
         int m = tunnel::select2(&usb_tcp_, usb_tcp_.is_open() ? &usb_relay_udp_ : nullptr, 50);
         if (m & 1) {
-            auto r = tunnel::read_frame(usb_tcp_, usb_frame_);
+            auto r = tunnel::read_frame(usb_tcp_, usb_rx_buf_, usb_frame_);
             if (r == tunnel::RecvResult::Frame) {
                 if (usb_engine_peer_.is_valid()) {
                     usb_relay_udp_.send_to(usb_frame_.data(), usb_frame_.size(), usb_engine_peer_);
