@@ -160,6 +160,13 @@ public:
 
     bool set_tcp_nodelay(bool enable);
     bool set_non_blocking(bool enable);
+    // Bounds the socket's kernel send/recv buffers (SO_SNDBUF/SO_RCVBUF).
+    // Used by the USB relays so a stalled hop (adb/USB/CPU) cannot pile up
+    // seconds of queued audio: once the bounded buffer fills, the relay's
+    // write fails fast and the tunnel reconnects instead of replaying a
+    // multi-second stale backlog after the stall clears. Also disables
+    // Windows TCP window auto-tuning for the socket.
+    bool set_buffer_sizes(int recv_bytes, int send_bytes);
 
     SocketAddress get_local_address() const;
     socket_t native_handle() const { return handle_; }

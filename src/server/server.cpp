@@ -424,6 +424,12 @@ void AudioRouterServer::usb_relay_thread() {
         }
         client.set_tcp_nodelay(true);
         client.set_non_blocking(true);
+        // Bound the tunnel's kernel buffers (~320 ms of audio each way at
+        // 48 kHz stereo S16). A stalled hop (adb/USB/CPU) then cannot pile up
+        // seconds of queued audio: once the bounded buffer fills, the relay's
+        // write fails fast, the tunnel reconnects, and playback resumes live
+        // instead of replaying a multi-second stale backlog after the stall.
+        client.set_buffer_sizes(64 * 1024, 64 * 1024);
         rx.clear();  // stale partial frame from a previous tunnel session
         // Drop datagrams left over from the previous tunnel (e.g. a
         // DISCONNECT_ACK sent while the old connection was dying) so the new

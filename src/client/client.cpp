@@ -899,6 +899,10 @@ void AudioRouterClient::usb_relay_thread_fn() {
             if (usb_tcp_.connect(tunnel_addr, 200)) {
                 usb_tcp_.set_tcp_nodelay(true);
                 usb_tcp_.set_non_blocking(true);
+                // Bound the tunnel's kernel buffers (~320 ms of audio) so a
+                // stalled hop cannot pile up seconds of stale audio (see the
+                // server relay's matching cap).
+                usb_tcp_.set_buffer_sizes(64 * 1024, 64 * 1024);
                 usb_rx_buf_.clear();  // stale partial frame from a previous session
                 usb_relay_connected_.store(true);
                 LOG_INFO("USB tunnel: connected to adb reverse at 127.0.0.1:" << config_.server_port);

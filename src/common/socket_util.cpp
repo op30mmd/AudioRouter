@@ -662,6 +662,26 @@ bool TcpSocket::set_non_blocking(bool enable) {
 #endif
 }
 
+bool TcpSocket::set_buffer_sizes(int recv_bytes, int send_bytes) {
+    if (!is_open()) return false;
+    bool ok = true;
+    if (recv_bytes > 0) {
+#if defined(_WIN32)
+        ok = setsockopt(handle_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&recv_bytes), sizeof(recv_bytes)) == 0 && ok;
+#else
+        ok = setsockopt(handle_, SOL_SOCKET, SO_RCVBUF, &recv_bytes, sizeof(recv_bytes)) == 0 && ok;
+#endif
+    }
+    if (send_bytes > 0) {
+#if defined(_WIN32)
+        ok = setsockopt(handle_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&send_bytes), sizeof(send_bytes)) == 0 && ok;
+#else
+        ok = setsockopt(handle_, SOL_SOCKET, SO_SNDBUF, &send_bytes, sizeof(send_bytes)) == 0 && ok;
+#endif
+    }
+    return ok;
+}
+
 SocketAddress TcpSocket::get_local_address() const {
     if (!is_open()) return SocketAddress();
     struct sockaddr_in addr;
