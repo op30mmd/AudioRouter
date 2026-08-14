@@ -454,14 +454,15 @@ bool PulsePlayer::open(const AudioConfig& config, const std::string& device_name
     if (!server_available()) {
         LOG_WARN("PulsePlayer: no PulseAudio daemon is reachable (no PULSE_SERVER and no "
                  "usable native socket). Falling through to the next backend.");
-        LOG_WARN("  Start one as the NORMAL Termux user (not under su). A plain "
-                 "'pulseaudio --start' is often not enough: the daemon exits after "
-                 "20 s idle, and on Android it needs an explicit output sink. Use:");
-        LOG_WARN("    pulseaudio --start --exit-idle-time=-1 --load=module-sles-sink");
-        LOG_WARN("  then confirm with 'pactl info'. If that still times out, run the "
-                 "daemon in the foreground to see why it dies:");
-        LOG_WARN("    pulseaudio -n --exit-idle-time=-1 --load=module-sles-sink "
-                 "--log-target=stderr -vvvv");
+        LOG_WARN("  Start one as the NORMAL Termux user (not under su); a plain "
+                 "'pulseaudio --start' lets the daemon exit after 20 s idle:");
+        LOG_WARN("    pulseaudio --start --exit-idle-time=-1");
+        LOG_WARN("  then confirm with 'pactl info'. Do NOT pass --load=module-...-sink "
+                 "unless 'pactl list short sinks' is empty: Termux's default.pa already "
+                 "loads the right sink for this Android version (module-aaudio-sink on "
+                 "recent builds), and forcing a second one starts a competing daemon.");
+        LOG_WARN("  If it still will not answer, check for duplicates and restart cleanly:");
+        LOG_WARN("    pgrep -a pulseaudio ; pulseaudio -k ; pulseaudio --start --exit-idle-time=-1");
         return false;
     }
 

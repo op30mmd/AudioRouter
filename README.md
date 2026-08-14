@@ -530,18 +530,18 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     not know this layout, so letting it search would refuse a daemon that was just
     verified alive. When it drops privileges for `-b/--bind` it also *clears* any
     inherited `XDG_RUNTIME_DIR` rather than guessing one;
-  - the daemon is **per-session**, and on Termux a bare `pulseaudio --start` is
-    usually not enough: it exits after 20 s idle (nothing is connected yet) and it
-    needs an explicit Android output sink. Start it as the normal Termux user with
-    `pulseaudio --start --exit-idle-time=-1 --load=module-sles-sink` (add it to
-    `~/.bashrc` to make it stick). If `pactl info` still reports
-    `Connection failure: Timeout`, the daemon is not staying up — run it in the
-    foreground to see why:
-    `pulseaudio -n --exit-idle-time=-1 --load=module-sles-sink --log-target=stderr -vvvv`.
-    On recent Android releases the SLES/AAudio sink modules are the usual culprit
-    (see termux-packages#27978). Closing Termux or Android reclaiming the app also
-    stops it, after which the client reports `no PulseAudio daemon is reachable` and
-    falls through to AAudio;
+  - the daemon is **per-session**, and a bare `pulseaudio --start` lets it exit
+    after 20 s idle. Start it as the normal Termux user with
+    `pulseaudio --start --exit-idle-time=-1` (add it to `~/.bashrc` to make it
+    stick). **Do not pass `--load=module-sles-sink` / `--load=module-aaudio-sink`
+    unless `pactl list short sinks` comes back empty** — Termux's `default.pa`
+    already loads the sink appropriate to the Android version (`module-aaudio-sink`
+    on recent builds), and forcing a different one starts a *second*, competing
+    daemon; the symptom is `pa_pid_file_create() failed: Daemon already running`
+    from one instance while the other holds the HAL. `pgrep -a pulseaudio` shows
+    duplicates; `pulseaudio -k` then a single clean start fixes it. Closing Termux
+    or Android reclaiming the app also stops the daemon, after which the client
+    reports `no PulseAudio daemon is reachable` and falls through to AAudio;
     `pactl info` says whether one is live. Candidate sockets are detected
     passively (`stat` only) and then offered to `pa_simple_new()` in order, best
     first — the client deliberately does **not** `connect()` to test them, because

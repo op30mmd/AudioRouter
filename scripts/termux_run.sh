@@ -404,7 +404,8 @@ if [ "$(id -u)" -ne 0 ]; then
         if [ "$IS_PULSE" -eq 1 ]; then
             echo "Note: -d pulse with -b: the client binds the socket as root and then drops"
             echo "to the Termux app user, so the per-user PulseAudio daemon is reachable."
-            echo "Start the daemon first (as the Termux user, NOT under su): pulseaudio --start"
+            echo "Start the daemon first (as the Termux user, NOT under su):"
+            echo "  pulseaudio --start --exit-idle-time=-1"
         fi
         echo "Requesting root privileges via su (for -b auto); the backend runs in-process..."
         run_via_su "$CMD"
@@ -416,7 +417,7 @@ if [ "$(id -u)" -ne 0 ]; then
     elif [ "$IS_PULSE" -eq 1 ]; then
         echo "PulseAudio backend: running as the current user (the daemon is a per-user"
         echo "service; root cannot connect to it). Start it first if you have not already:"
-        echo "  pulseaudio --start"
+        echo "  pulseaudio --start --exit-idle-time=-1"
         launch_direct
     elif [ "$IS_AAUDIO" -eq 1 ]; then
         echo "AAudio backend: running as the current user (like: ./stream_daemon)."

@@ -137,16 +137,34 @@ namespace {
             opened = open_fn();
         }
 
+        bool superseded = false;
         if (opened && !open->shutdown.load()) {
             {
                 std::lock_guard<std::mutex> lock(open->mutex);
-                open->player = device;
-                open->result = true;
-                open->pending = false;
+                // A slow attempt that was abandoned can finish AFTER a later
+                // strategy already opened a device. Hot-swapping then would
+                // leave two engines (e.g. this PulseAudio stream and the
+                // AAudio fallback) both feeding the Android HAL. Only take
+                // the slot if it is still free.
+                if (open->player && open->player->is_open()) {
+                    superseded = true;
+                } else {
+                    open->player = device;
+                    open->result = true;
+                    open->pending = false;
+                }
             }
-            open->cv.notify_all();
-        } else {
-            if (opened) device->close();  // shutdown raced the open
+            if (superseded) {
+                LOG_INFO("Audio device: a late open attempt succeeded but another backend "
+                         "is already playing; discarding the duplicate stream.");
+                device->close();
+            } else {
+                open->cv.notify_all();
+                return;
+            }
+        }
+        {
+            if (opened && !superseded) device->close();  // shutdown raced the open
             {
                 std::lock_guard<std::mutex> lock(open->mutex);
                 open->result = false;
@@ -192,7 +210,13 @@ namespace {
         // daemon (stock Android/Termux) this is skipped entirely and the
         // behaviour is unchanged.
         if (pulse_worth_trying()) {
-            return {OpenStrategy::PULSE, OpenStrategy::LEGACY};
+            // Keep the rootless backends in the chain behind PulseAudio. The
+            // daemon socket is only detected passively (a dead daemon leaves
+            // its socket file behind), so PULSE can still fail here - and
+            // dropping straight to LEGACY would skip AAudio/Termux:API, which
+            // usually work when PulseAudio does not.
+            return {OpenStrategy::PULSE, OpenStrategy::AAUDIO, OpenStrategy::TERMUXAPI,
+                    OpenStrategy::LEGACY};
         }
         return {OpenStrategy::LEGACY};
     }
