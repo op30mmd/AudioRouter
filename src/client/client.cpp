@@ -489,28 +489,53 @@ bool AudioRouterClient::start() {
     // user so the backend runs in-process with working sandbox access.
     // AAudio also renders as that user; the root backends (AGM/ALSA/direct)
     // are given up by the drop.
-    if (is_termux_device(config_.device_name) && AndroidHelpers::is_running_as_root()) {
+    // The PulseAudio daemon is a per-user service: its socket lives in the
+    // Termux user's runtime dir and is owned by that uid, so a root client
+    // cannot connect to it (pa_simple_new -> "Connection refused", preceded by
+    // libpulse trying to create //.config/pulse because root's HOME is "/").
+    // The same privilege drop the Termux:API backend uses fixes it: bind the
+    // socket as root for -b/--bind, then become the Termux app user before the
+    // backend opens.
+    const bool pulse_needs_drop =
+        is_pulse_device(config_.device_name) && AndroidHelpers::is_running_as_root();
+    if (pulse_needs_drop) {
+        LOG_INFO("PulseAudio backend: running as root, but the daemon is a per-user "
+                 "service; dropping to the Termux app user after the socket binding.");
+    }
+
+    if ((is_termux_device(config_.device_name) || pulse_needs_drop) &&
+        AndroidHelpers::is_running_as_root()) {
         // Pre-create the segment cache — including the SELinux labels the
         // Termux:API app needs to read it — while we still have root: after
         // setuid() the process cannot relabel files, and the player only
         // recycles these pre-labeled pool inodes.
-        TermuxApiPlayer::prepare_cache_as_root();
+        if (is_termux_device(config_.device_name)) {
+            TermuxApiPlayer::prepare_cache_as_root();
+        }
         uid_t termux_uid = 0;
         gid_t termux_gid = 0;
         std::string termux_home;
+        const char* backend_label = pulse_needs_drop ? "PulseAudio backend" : "Termux:API backend";
         if (!AndroidHelpers::termux_user(&termux_uid, &termux_gid, &termux_home)) {
-            LOG_WARN("Termux:API backend: Termux app user not found; continuing as root "
-                     "(plain am broadcast path)");
+            LOG_WARN(backend_label << ": Termux app user not found; continuing as root "
+                     "(the PulseAudio daemon will likely refuse the connection)");
         } else if (::setgroups(0, nullptr) != 0 || ::setgid(termux_gid) != 0 ||
                    ::setuid(termux_uid) != 0) {
-            LOG_WARN("Termux:API backend: could not drop to the Termux app user ("
-                     << std::strerror(errno) << "); continuing as root (plain am broadcast "
-                     "path)");
+            LOG_WARN(backend_label << ": could not drop to the Termux app user ("
+                     << std::strerror(errno) << "); continuing as root");
         } else {
             ::setenv("HOME", termux_home.c_str(), 1);
-            LOG_INFO("Termux:API backend: socket bound as root; dropped privileges to the "
+            // libpulse locates the daemon through XDG_RUNTIME_DIR / HOME; both
+            // still point at root's view until they are rewritten here.
+            if (pulse_needs_drop) {
+                const char* prefix = std::getenv("PREFIX");
+                if (prefix != nullptr && prefix[0] != '\0') {
+                    ::setenv("XDG_RUNTIME_DIR", (std::string(prefix) + "/var/run").c_str(), 1);
+                }
+            }
+            LOG_INFO(backend_label << ": socket bound as root; dropped privileges to the "
                      "Termux app user (uid " << termux_uid << ", gid " << termux_gid
-                     << ") so the Termux:API sandbox and socket protocol work");
+                     << ") so the per-user audio service is reachable");
         }
     }
 

@@ -288,11 +288,13 @@ fi
 #   - aaudio/termux without -b   -> run directly as the current user.
 IS_AAUDIO=0
 IS_TERMUX=0
+IS_PULSE=0
 HAS_BIND=0
 for a in "${CLIENT_ARGS[@]}"; do
     case "$a" in
         aaudio|aaudio:*) IS_AAUDIO=1 ;;
         termux|termux-api|termux:*) IS_TERMUX=1 ;;
+        pulse|pulseaudio|pa|pulse:*|pulse@*|pulseaudio:*|pulseaudio@*|pa:*|pa@*) IS_PULSE=1 ;;
         -b|--bind) HAS_BIND=1 ;;
     esac
 done
@@ -386,7 +388,7 @@ run_via_su() {
 }
 
 if [ "$(id -u)" -ne 0 ]; then
-    if { [ "$IS_AAUDIO" -eq 1 ] || [ "$IS_TERMUX" -eq 1 ]; } && [ "$HAS_BIND" -eq 1 ]; then
+    if { [ "$IS_AAUDIO" -eq 1 ] || [ "$IS_TERMUX" -eq 1 ] || [ "$IS_PULSE" -eq 1 ]; } && [ "$HAS_BIND" -eq 1 ]; then
         # Root for the socket binding; AAudio runs in-process like the
         # stream_daemon (which works as root). Termux:API binds the socket as
         # root and then drops to the Termux app user inside the client, so
@@ -399,12 +401,22 @@ if [ "$(id -u)" -ne 0 ]; then
             echo "Note: -d termux with -b: the client binds the socket as root and then drops"
             echo "to the Termux app user, so the Termux:API sandbox still works."
         fi
+        if [ "$IS_PULSE" -eq 1 ]; then
+            echo "Note: -d pulse with -b: the client binds the socket as root and then drops"
+            echo "to the Termux app user, so the per-user PulseAudio daemon is reachable."
+            echo "Start the daemon first (as the Termux user, NOT under su): pulseaudio --start"
+        fi
         echo "Requesting root privileges via su (for -b auto); the backend runs in-process..."
         run_via_su "$CMD"
     elif [ "$IS_TERMUX" -eq 1 ]; then
         echo "Termux:API backend: running as the current user (requires the Termux:API app)."
         echo "Note: if the Termux:API media player is unavailable, the client falls back to"
         echo "AAudio (no root) and then the root backends (AGM/ALSA)."
+        launch_direct
+    elif [ "$IS_PULSE" -eq 1 ]; then
+        echo "PulseAudio backend: running as the current user (the daemon is a per-user"
+        echo "service; root cannot connect to it). Start it first if you have not already:"
+        echo "  pulseaudio --start"
         launch_direct
     elif [ "$IS_AAUDIO" -eq 1 ]; then
         echo "AAudio backend: running as the current user (like: ./stream_daemon)."

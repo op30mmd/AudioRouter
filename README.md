@@ -511,7 +511,17 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     log shows `PulsePlayer: Reconnected to the PulseAudio daemon.`;
   - on Android, a Termux PulseAudio daemon renders through the normal Android audio
     HAL, so it is an alternative to `-d aaudio` when the AAudio path does not start
-    on a given vendor HAL.
+    on a given vendor HAL;
+  - **start the daemon as the Termux user, never under `su`**. PulseAudio is a
+    per-user service that authenticates by uid, so a root client cannot connect to a
+    daemon owned by the Termux user — libpulse reports `Connection refused` (usually
+    preceded by `Failed to create secure directory (//.config/pulse)`, root's `HOME`
+    being `/`). The client handles this: with `-b/--bind` it binds the socket as root
+    and then drops to the Termux app user (the same drop the Termux:API backend uses,
+    fixing up `HOME`/`XDG_RUNTIME_DIR`); and when it is root with no drop available it
+    detects the foreign-owned socket and falls through to the next backend
+    immediately instead of spending its retry budget. `termux_run.sh -d pulse` runs
+    the client as the Termux user unless `-b` is given.
 - **AAudio does not render on some vendor HALs**: the stream opens but never starts
   consuming (watchdog logs `AAudioStream_write wrote X of Y frames (state=..., read=...)`).
   The client falls back to the Termux:API player and then AGM/ALSA automatically; use

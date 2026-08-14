@@ -244,7 +244,24 @@ bool PulsePlayer::server_available() {
     }
 
     for (const auto& c : candidates) {
-        if (path_exists(c)) return true;
+        if (!path_exists(c)) continue;
+        // A socket owned by another user cannot be connected to (PulseAudio is
+        // a per-user service and authenticates by uid). Running the client as
+        // root against the Termux user's daemon is the common case on Android:
+        // report "unavailable" so the client falls straight through to the
+        // next backend instead of spending its retry budget on a connection
+        // the daemon will refuse.
+        struct stat st{};
+        if (::stat(c.c_str(), &st) == 0) {
+            const uid_t me = ::getuid();
+            if (st.st_uid != me && me == 0) {
+                LOG_DEBUG("PulsePlayer: found a PulseAudio socket at " << c
+                          << " owned by uid " << st.st_uid
+                          << ", but this process is root; a per-user daemon will refuse it.");
+                continue;
+            }
+        }
+        return true;
     }
     return false;
 #endif

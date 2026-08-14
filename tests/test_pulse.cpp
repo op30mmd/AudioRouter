@@ -1,8 +1,12 @@
 #include "../src/client/pulse_player.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define TEST_ASSERT(cond) do { \
     if (!(cond)) { \
@@ -149,6 +153,60 @@ bool run_pulse_tests() {
         TEST_ASSERT(player.get_device_name() == "pulse");
     }
 
-    std::cout << "  [pulse] device parsing, buffer sizing and closed-player contract OK\n";
+    // ---- server_available(): a socket owned by another uid is not usable ----
+    // Regression test for the on-device failure where the client ran as root
+    // (via su, for -b/--bind) while the PulseAudio daemon ran as the Termux
+    // app user: libpulse reported "Connection refused" and the client burned
+    // its whole retry budget before falling through to AAudio.
+    {
+        // A path that does not exist must never be reported as available.
+        // (Point every lookup at an empty dir so the host's real daemon, if
+        // any, cannot influence the result.)
+        char tmpl[] = "/tmp/ar_pulse_test_XXXXXX";
+        const char* dir = ::mkdtemp(tmpl);
+        TEST_ASSERT(dir != nullptr);
+
+        const std::string saved_server = std::getenv("PULSE_SERVER") ? std::getenv("PULSE_SERVER") : "";
+        const std::string saved_xdg = std::getenv("XDG_RUNTIME_DIR") ? std::getenv("XDG_RUNTIME_DIR") : "";
+        const std::string saved_prefix = std::getenv("PREFIX") ? std::getenv("PREFIX") : "";
+        const std::string saved_home = std::getenv("HOME") ? std::getenv("HOME") : "";
+
+        ::unsetenv("PULSE_SERVER");
+        ::setenv("XDG_RUNTIME_DIR", dir, 1);
+        ::setenv("PREFIX", dir, 1);
+        ::setenv("HOME", dir, 1);
+
+        // No socket anywhere -> unavailable.
+        TEST_ASSERT(!audiorouter::PulsePlayer::server_available());
+
+        // An explicit PULSE_SERVER always wins (it may be a TCP endpoint).
+        ::setenv("PULSE_SERVER", "127.0.0.1:4713", 1);
+        TEST_ASSERT(audiorouter::PulsePlayer::server_available());
+        ::unsetenv("PULSE_SERVER");
+
+        // A socket owned by THIS user counts as available.
+        const std::string sock_dir = std::string(dir) + "/pulse";
+        ::mkdir(sock_dir.c_str(), 0755);
+        const std::string sock = sock_dir + "/native";
+        FILE* f = std::fopen(sock.c_str(), "w");
+        TEST_ASSERT(f != nullptr);
+        std::fclose(f);
+        // Only meaningful when not running the suite as root: as a normal user
+        // the socket is ours, so it must be reported as available.
+        if (::getuid() != 0) {
+            TEST_ASSERT(audiorouter::PulsePlayer::server_available());
+        }
+
+        ::unlink(sock.c_str());
+        ::rmdir(sock_dir.c_str());
+        ::rmdir(dir);
+
+        if (!saved_server.empty()) ::setenv("PULSE_SERVER", saved_server.c_str(), 1);
+        if (!saved_xdg.empty()) ::setenv("XDG_RUNTIME_DIR", saved_xdg.c_str(), 1); else ::unsetenv("XDG_RUNTIME_DIR");
+        if (!saved_prefix.empty()) ::setenv("PREFIX", saved_prefix.c_str(), 1); else ::unsetenv("PREFIX");
+        if (!saved_home.empty()) ::setenv("HOME", saved_home.c_str(), 1);
+    }
+
+    std::cout << "  [pulse] device parsing, buffer sizing, daemon probe and closed-player contract OK\n";
     return true;
 }
