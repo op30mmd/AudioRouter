@@ -268,9 +268,31 @@ std::string PulsePlayer::resolve_server_address() {
 #if defined(_WIN32)
     return env_or_empty("PULSE_SERVER");
 #else
-    // An explicit server address wins: it may be a TCP endpoint with no local
-    // socket at all (a common Termux setup points at 127.0.0.1:4713).
-    if (std::strlen(env_or_empty("PULSE_SERVER")) > 0) return env_or_empty("PULSE_SERVER");
+    // An explicit server address normally wins: it may be a TCP endpoint with
+    // no local socket at all (a common Termux setup points at 127.0.0.1:4713),
+    // which we cannot validate here, so it is taken at face value.
+    //
+    // The one case we CAN check is a unix: path: if the environment names a
+    // socket that no daemon is listening on (a stale export left over from an
+    // earlier session), honouring it blindly would mask the daemon that is
+    // actually running. Fall through to discovery in that case.
+    {
+        const std::string env_server = env_or_empty("PULSE_SERVER");
+        if (!env_server.empty()) {
+            std::string unix_path;
+            if (env_server.rfind("unix:", 0) == 0) {
+                unix_path = env_server.substr(5);
+            } else if (env_server[0] == '/') {
+                unix_path = env_server;
+            }
+            if (unix_path.empty() || unix_socket_is_live(unix_path)) {
+                return env_server;
+            }
+            LOG_WARN("PulsePlayer: PULSE_SERVER points at '" << env_server
+                     << "' but no daemon is listening there; ignoring it and looking for "
+                     "the running daemon instead.");
+        }
+    }
 
     std::vector<std::string> candidates;
     const std::string xdg = env_or_empty("XDG_RUNTIME_DIR");
@@ -376,11 +398,18 @@ std::string PulsePlayer::resolve_server_address() {
                       "(stale socket from a stopped daemon).");
             continue;
         }
+        LOG_DEBUG("PulsePlayer: live daemon socket found at " << c);
         // Hand libpulse this exact socket rather than letting it search: its
         // own lookup does not know about Termux's
         // $HOME/.config/pulse/<machine-id>-runtime layout, so it would refuse
         // a daemon we just verified is alive.
         return "unix:" + c;
+    }
+    LOG_DEBUG("PulsePlayer: no live daemon socket among " << candidates.size()
+              << " candidate path(s):");
+    for (const auto& c : candidates) {
+        LOG_DEBUG("PulsePlayer:   tried " << c
+                  << (path_exists(c) ? " (exists, not listening)" : " (absent)"));
     }
     return std::string();
 #endif
@@ -492,8 +521,10 @@ bool PulsePlayer::connect_locked() {
     // nullptr here lets libpulse redo its own discovery, which on Termux
     // misses the daemon's runtime directory entirely.
     const std::string server = resolve_server_address();
-    LOG_DEBUG("PulsePlayer: connecting to server '"
-              << (server.empty() ? "(libpulse default)" : server) << "'");
+    const bool from_env = !server.empty() && server == env_or_empty("PULSE_SERVER");
+    LOG_INFO("PulsePlayer: connecting to server '"
+             << (server.empty() ? "(libpulse default)" : server) << "'"
+             << (from_env ? " (from PULSE_SERVER)" : ""));
     // pa_simple_new() sets PA_STREAM_ADJUST_LATENCY internally, so `tlength`
     // is interpreted as the end-to-end latency we want the daemon to keep.
     pa_simple* s = pa_simple_new(
@@ -510,7 +541,13 @@ bool PulsePlayer::connect_locked() {
     if (!s) {
         LOG_WARN("PulsePlayer: pa_simple_new failed for sink '"
                  << (spec_.sink.empty() ? "(default)" : spec_.sink)
+                 << "' on server '" << (server.empty() ? "(libpulse default)" : server)
                  << "': " << pa_strerror(error));
+        if (from_env) {
+            LOG_WARN("  That address came from the PULSE_SERVER environment variable. "
+                     "If it is stale, unset it (and re-run) so the daemon's own socket "
+                     "is discovered instead: unset PULSE_SERVER");
+        }
         return false;
     }
 
