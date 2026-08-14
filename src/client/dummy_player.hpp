@@ -21,6 +21,9 @@ public:
     void flush() override;
     std::string get_device_name() const override;
 
+    // The dummy sink is only ever a stand-in for a real device.
+    bool is_placeholder() const override { return true; }
+
 private:
     bool is_open_;
     AudioConfig config_;

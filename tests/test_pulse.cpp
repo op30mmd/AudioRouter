@@ -1,4 +1,6 @@
 #include "../src/client/pulse_player.hpp"
+#include "../src/client/aaudio_player.hpp"
+#include "../src/client/dummy_player.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -405,7 +407,30 @@ bool run_pulse_tests() {
                     audiorouter::pulse::kOpenAttemptTimeoutMs);
     }
 
+    // ---- the dummy sink must never block a real backend ----
+    // Regression test for the worst bug in this series: the "don't hot-swap
+    // over an active backend" guard counted the DummyPlayer placeholder as an
+    // active backend, so every real device that finished opening afterwards
+    // was discarded and the client streamed silence for the whole session
+    // (Audio: 0 ms, DummyPlayer writing millions of frames).
+    {
+        audiorouter::DummyPlayer dummy;
+        audiorouter::AudioConfig cfg;
+        TEST_ASSERT(dummy.open(cfg, "dummy_fallback"));
+        TEST_ASSERT(dummy.is_open());
+        // The placeholder must identify itself so the swap logic can displace it.
+        TEST_ASSERT(dummy.is_placeholder());
+        dummy.close();
+
+        // A real backend must NOT claim to be a placeholder, or a genuine
+        // second engine could be hot-swapped in on top of it.
+        audiorouter::PulsePlayer real;
+        TEST_ASSERT(!real.is_placeholder());
+        audiorouter::AaudioFifoPlayer aaudio;
+        TEST_ASSERT(!aaudio.is_placeholder());
+    }
+
     std::cout << "  [pulse] device parsing, buffer sizing, daemon probe, fail-fast open,"
-              << " open budget and closed-player contract OK\n";
+              << " open budget, placeholder swap and closed-player contract OK\n";
     return true;
 }

@@ -34,6 +34,12 @@ public:
     // after a fallback the name still refers to the backend the user asked
     // for, not the one that actually opened.
     virtual bool needs_playback_pacing() const { return false; }
+
+    // True for the silent stand-in installed while a real device is still
+    // being opened. It must never be treated as "a backend is already
+    // playing": a real backend that finishes opening later has to be allowed
+    // to replace it, or the client streams silence forever.
+    virtual bool is_placeholder() const { return false; }
 };
 
 } // namespace audiorouter

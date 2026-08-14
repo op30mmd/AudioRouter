@@ -17,6 +17,8 @@ set(TEST_SOURCES
     ../src/client/jitter_buffer.cpp
     ../src/client/termux_api_player.cpp
     ../src/client/pulse_player.cpp
+    ../src/client/dummy_player.cpp
+    ../src/client/aaudio_player.cpp
     ../src/client/android_helpers.cpp
     ../src/common/socket_util.cpp
 )

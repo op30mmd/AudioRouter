@@ -151,6 +151,7 @@ namespace {
         }
 
         bool superseded = false;
+        std::shared_ptr<IAudioPlayer> displaced;
         if (opened && !open->shutdown.load()) {
             {
                 std::lock_guard<std::mutex> lock(open->mutex);
@@ -159,9 +160,17 @@ namespace {
                 // leave two engines (e.g. this PulseAudio stream and the
                 // AAudio fallback) both feeding the Android HAL. Only take
                 // the slot if it is still free.
-                if (open->player && open->player->is_open()) {
+                //
+                // The dummy sink does NOT count as occupied: it is the silent
+                // placeholder installed while the open is still in flight.
+                // Treating it as a live backend made every real device that
+                // opened afterwards get discarded, so the client played
+                // silence for the whole session.
+                if (open->player && open->player->is_open() &&
+                    !open->player->is_placeholder()) {
                     superseded = true;
                 } else {
+                    displaced = open->player;   // dummy placeholder, if any
                     open->player = device;
                     open->result = true;
                     open->pending = false;
@@ -172,6 +181,10 @@ namespace {
                          "is already playing; discarding the duplicate stream.");
                 device->close();
             } else {
+                if (displaced) {
+                    LOG_INFO("Audio device: real backend took over from the dummy sink.");
+                    displaced->close();
+                }
                 open->cv.notify_all();
                 return;
             }
@@ -283,6 +296,21 @@ namespace {
 
             size_t attempts_in_strategy = 0;
             while (!open->shutdown.load() && attempts_in_strategy < max_attempts) {
+                // An earlier, abandoned attempt may have hot-swapped a real
+                // device in while we were waiting. Stop churning through the
+                // remaining strategies in that case - otherwise the client
+                // keeps opening and discarding backends behind a device that
+                // is already playing.
+                {
+                    std::lock_guard<std::mutex> lock(open->mutex);
+                    if (open->player && open->player->is_open() &&
+                        !open->player->is_placeholder()) {
+                        LOG_INFO("Audio device: already playing on "
+                                 << open->player->get_device_name()
+                                 << "; stopping the open supervisor.");
+                        return;
+                    }
+                }
                 ++attempts_in_strategy;
 
                 std::string candidate;

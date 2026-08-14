@@ -227,7 +227,7 @@ $(CLIENT_TARGET): $(CLIENT_OBJS) $(COMMON_OBJS)
 	@echo "Built: $(CLIENT_TARGET)"
 
 # Link Tests
-$(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(BUILD_DIR)/client_termux_api_player.o $(BUILD_DIR)/client_pulse_player.o $(BUILD_DIR)/client_android_helpers.o $(COMMON_OBJS)
+$(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(BUILD_DIR)/client_termux_api_player.o $(BUILD_DIR)/client_pulse_player.o $(BUILD_DIR)/client_dummy_player.o $(BUILD_DIR)/client_aaudio_player.o $(BUILD_DIR)/client_android_helpers.o $(COMMON_OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXTRA) $^ -o $@ $(CLIENT_LIBS)
 	@echo "Built: $(TEST_TARGET)"
 
