@@ -108,6 +108,17 @@ public:
     // connection attempt.
     static bool server_available();
 
+    // The server address of the daemon this client will actually talk to, in
+    // libpulse's "unix:/path/to/native" form (or the raw PULSE_SERVER value).
+    // Empty when no live daemon was found.
+    //
+    // server_available() is just `!resolve_server_address().empty()`. The
+    // resolved address is passed EXPLICITLY to pa_simple_new(): letting
+    // libpulse rediscover the server itself made it connect somewhere other
+    // than the socket that was probed (on Termux it missed the daemon's
+    // $HOME/.config/pulse/<machine-id>-runtime socket and got ECONNREFUSED).
+    static std::string resolve_server_address();
+
     // Sink names reported by `pactl list short sinks`, best effort (empty when
     // pactl is missing or no daemon answers). Used by --list-devices only.
     static std::vector<std::string> get_available_sinks();

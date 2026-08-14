@@ -276,6 +276,13 @@ bool run_pulse_tests() {
         if (::getuid() != 0) {
             TEST_ASSERT(audiorouter::PulsePlayer::server_available());
 
+            // ...and the resolved address must name THAT socket explicitly.
+            // Passing nullptr to pa_simple_new() instead let libpulse redo its
+            // own discovery, which does not know this layout and refused a
+            // daemon that had just been verified alive.
+            const std::string addr = audiorouter::PulsePlayer::resolve_server_address();
+            TEST_ASSERT(addr == "unix:" + sock);
+
             FILE* mf = std::fopen((pulse_dir + "/machine-id").c_str(), "w");
             TEST_ASSERT(mf != nullptr);
             std::fputs((machine_id + "\n").c_str(), mf);

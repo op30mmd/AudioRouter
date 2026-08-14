@@ -261,12 +261,16 @@ bool PulsePlayer::is_supported() {
 }
 
 bool PulsePlayer::server_available() {
+    return !resolve_server_address().empty();
+}
+
+std::string PulsePlayer::resolve_server_address() {
 #if defined(_WIN32)
-    return std::strlen(env_or_empty("PULSE_SERVER")) > 0;
+    return env_or_empty("PULSE_SERVER");
 #else
     // An explicit server address wins: it may be a TCP endpoint with no local
     // socket at all (a common Termux setup points at 127.0.0.1:4713).
-    if (std::strlen(env_or_empty("PULSE_SERVER")) > 0) return true;
+    if (std::strlen(env_or_empty("PULSE_SERVER")) > 0) return env_or_empty("PULSE_SERVER");
 
     std::vector<std::string> candidates;
     const std::string xdg = env_or_empty("XDG_RUNTIME_DIR");
@@ -313,14 +317,34 @@ bool PulsePlayer::server_available() {
                 candidates.push_back(base + "/" + machine_id + "-runtime/native");
             }
             if (DIR* d = ::opendir(base.c_str())) {
+                std::vector<std::string> runtime_dirs;
                 while (const dirent* e = ::readdir(d)) {
                     const std::string name = e->d_name;
                     if (name.size() > 8 &&
                         name.compare(name.size() - 8, 8, "-runtime") == 0) {
-                        candidates.push_back(base + "/" + name + "/native");
+                        runtime_dirs.push_back(base + "/" + name);
                     }
                 }
                 ::closedir(d);
+                for (const auto& rt : runtime_dirs) {
+                    candidates.push_back(rt + "/native");
+                    // Don't hard-code the socket name: list the runtime dir and
+                    // take whatever AF_UNIX sockets are in it. Some builds use a
+                    // name other than "native", and the liveness check below
+                    // discards anything that is not a live daemon anyway.
+                    if (DIR* rd = ::opendir(rt.c_str())) {
+                        while (const dirent* re = ::readdir(rd)) {
+                            const std::string rn = re->d_name;
+                            if (rn == "." || rn == ".." || rn == "native") continue;
+                            const std::string full = rt + "/" + rn;
+                            struct stat rst{};
+                            if (::stat(full.c_str(), &rst) == 0 && S_ISSOCK(rst.st_mode)) {
+                                candidates.push_back(full);
+                            }
+                        }
+                        ::closedir(rd);
+                    }
+                }
             }
         }
     }
@@ -352,9 +376,13 @@ bool PulsePlayer::server_available() {
                       "(stale socket from a stopped daemon).");
             continue;
         }
-        return true;
+        // Hand libpulse this exact socket rather than letting it search: its
+        // own lookup does not know about Termux's
+        // $HOME/.config/pulse/<machine-id>-runtime layout, so it would refuse
+        // a daemon we just verified is alive.
+        return "unix:" + c;
     }
-    return false;
+    return std::string();
 #endif
 }
 
@@ -460,10 +488,16 @@ bool PulsePlayer::connect_locked() {
         : 0;
 
     int error = 0;
+    // Connect to the exact daemon resolve_server_address() validated. Passing
+    // nullptr here lets libpulse redo its own discovery, which on Termux
+    // misses the daemon's runtime directory entirely.
+    const std::string server = resolve_server_address();
+    LOG_DEBUG("PulsePlayer: connecting to server '"
+              << (server.empty() ? "(libpulse default)" : server) << "'");
     // pa_simple_new() sets PA_STREAM_ADJUST_LATENCY internally, so `tlength`
     // is interpreted as the end-to-end latency we want the daemon to keep.
     pa_simple* s = pa_simple_new(
-        nullptr,                                    // server: PULSE_SERVER / default
+        server.empty() ? nullptr : server.c_str(),  // explicit server address
         "AudioRouter",                              // application name
         PA_STREAM_PLAYBACK,
         spec_.sink.empty() ? nullptr : spec_.sink.c_str(),
