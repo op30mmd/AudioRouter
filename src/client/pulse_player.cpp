@@ -528,6 +528,7 @@ bool PulsePlayer::connect_locked() {
     pa_simple* s = nullptr;
     int error = 0;
     std::string server;
+    bool timeout_reported = false;
     for (size_t i = 0; i < servers.size(); ++i) {
         server = servers[i];
         const bool from_env = !server.empty() && server == env_server;
@@ -558,6 +559,20 @@ bool PulsePlayer::connect_locked() {
             LOG_WARN("  That address came from the PULSE_SERVER environment variable. "
                      "If it is stale, unset it (and re-run) so the daemon's own socket "
                      "is discovered instead: unset PULSE_SERVER");
+        }
+        // Distinguish the two very different failures. ECONNREFUSED means
+        // nothing is listening (daemon stopped, stale socket file). A TIMEOUT
+        // means the socket accepted the connection but the daemon never
+        // completed the handshake - its main loop is wedged, which no amount
+        // of retrying from this side can clear. `pactl info` times out too, so
+        // it is not specific to this client.
+        if (!timeout_reported && std::strstr(pa_strerror(error), "imeout") != nullptr) {
+            timeout_reported = true;
+            LOG_WARN("  The socket accepted the connection but the daemon never answered: "
+                     "the PulseAudio daemon is wedged, not absent ('pactl info' will time "
+                     "out too). Restart it as the Termux user:");
+            LOG_WARN("    pulseaudio -k || pkill -9 pulseaudio");
+            LOG_WARN("    pulseaudio --start --exit-idle-time=-1");
         }
     }
 

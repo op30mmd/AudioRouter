@@ -570,6 +570,14 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     delayed, lower it (`-d pulse@15`, floor 10 ms). The status line's `Audio: <ms>`
     is the daemon's own `pa_simple_get_latency()` reading, so the effect is visible
     immediately;
+  - **`Timeout` vs `Connection refused` in the client's warning tells you which
+    problem you have.** `Connection refused` means nothing is listening (the daemon
+    stopped; its socket file can survive it). `Timeout` means the socket accepted
+    the connection but the daemon never completed the handshake — its main loop is
+    **wedged**, and no amount of retrying helps; `pactl info` hangs the same way.
+    Restart it as the Termux user: `pulseaudio -k || pkill -9 pulseaudio`, then
+    `pulseaudio --start --exit-idle-time=-1`. A wedged daemon has been seen after
+    repeated suspend/resume cycles of the AAudio sink on Android 13+;
   - a daemon restart or a sink being unplugged is recovered automatically: writes
     fail, the stream is torn down and rebuilt (at most one attempt per 2 s), and the
     log shows `PulsePlayer: Reconnected to the PulseAudio daemon.`;
