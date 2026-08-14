@@ -62,97 +62,88 @@ bool run_termux_api_tests() {
         TEST_ASSERT(le32(h, 40) == 176400u);
     }
 
-    // ---- Segment issue gate ----
-    // 48 kHz; segment 2000 ms, latency estimate 300 ms, lead 100 ms
-    // -> target = 1600 ms = 76800 frames.
+    // ---- Segment issue gate (file ring buffer) ----
+    // The segment is handed over once it holds the prefill of real audio AND
+    // the wall clock has advanced that far. The rest of the file is already
+    // readable as silence, so the end-to-end delay is prefill + command
+    // latency — the segment length does not enter the gate at all.
     {
         constexpr uint32_t kRate = 48000;
-        constexpr uint32_t kSegMs = 2000;
-        constexpr double kLat = 300.0;
-        constexpr uint32_t kLead = 100;
-        constexpr size_t kTargetFrames = 76800;  // 1600 ms @ 48 kHz
+        constexpr uint32_t kPrefillMs = 600;
+        constexpr size_t kPrefillFrames = static_cast<size_t>(kRate) * kPrefillMs / 1000;
 
-        // Content below target: never ready, even with plenty of wall time.
-        SegmentClock clock{1000, kTargetFrames - 480, kRate};
-        TEST_ASSERT(!segment_ready(clock, 1000 + 10000, kSegMs, kLat, kLead));
+        // Content below the prefill: never ready, even with plenty of wall time.
+        SegmentClock clock{1000, kPrefillFrames - 240, kRate};
+        TEST_ASSERT(!segment_ready(clock, 1000 + 10000, kPrefillMs));
 
         // Content met but the wall clock has not (jitter prefill burst):
         // the gate must hold so audio is not skipped ahead of real time.
-        SegmentClock early{1000, kTargetFrames + 4800, kRate};
-        TEST_ASSERT(!segment_ready(early, 1000 + 1200, kSegMs, kLat, kLead));
+        SegmentClock early{1000, kPrefillFrames + 4800, kRate};
+        TEST_ASSERT(!segment_ready(early, 1000 + 300, kPrefillMs));
 
         // Wall met but content not (network stall): hold.
-        SegmentClock stalled{1000, kTargetFrames - 1, kRate};
-        TEST_ASSERT(!segment_ready(stalled, 1000 + 2000, kSegMs, kLat, kLead));
+        SegmentClock stalled{1000, kPrefillFrames - 1, kRate};
+        TEST_ASSERT(!segment_ready(stalled, 1000 + 2000, kPrefillMs));
 
-        // Both met: ready exactly at the target.
-        SegmentClock ready{1000, kTargetFrames, kRate};
-        TEST_ASSERT(segment_ready(ready, 1000 + 1600, kSegMs, kLat, kLead));
-
-        // A larger latency estimate shortens the content target.
-        SegmentClock bigger_lat{1000, kTargetFrames - 10 * 480, kRate};  // 400 ms less
-        TEST_ASSERT(segment_ready(bigger_lat, 1000 + 1600, kSegMs, kLat + 400.0, kLead));
-
-        // The target never drops below the 200 ms floor (tiny segments /
-        // zero latency must not produce unplayable 0-byte segments), but it
-        // also never fires below that floor.
-        SegmentClock floor_met{1000, 200 * kRate / 1000, kRate};
-        TEST_ASSERT(segment_ready(floor_met, 1000 + 200, 300, 0.0, kLead));
-        SegmentClock floor_miss{1000, 199 * kRate / 1000, kRate};
-        TEST_ASSERT(!segment_ready(floor_miss, 1000 + 100000, 300, 0.0, kLead));
-
-        // Sustain term: when the command latency is large (am broadcast to a
-        // frozen app), the target becomes L + margin so the single issuer
-        // thread keeps up and playback stays continuous. With L = 5000 ms
-        // the target is 5200 ms regardless of the segment length.
-        SegmentClock sustain_met{1000, 5200 * kRate / 1000, kRate};
-        TEST_ASSERT(segment_ready(sustain_met, 1000 + 5200, 2000, 5000.0, kLead));
-        SegmentClock sustain_miss{1000, 5199 * kRate / 1000, kRate};
-        TEST_ASSERT(!segment_ready(sustain_miss, 1000 + 100000, 2000, 5000.0, kLead));
-        // The wall gate still applies on the sustain path.
-        SegmentClock sustain_wall_miss{1000, 5200 * kRate / 1000, kRate};
-        TEST_ASSERT(!segment_ready(sustain_wall_miss, 1000 + 100, 2000, 5000.0, kLead));
+        // Both met: ready exactly at the prefill.
+        SegmentClock ready{1000, kPrefillFrames, kRate};
+        TEST_ASSERT(segment_ready(ready, 1000 + 600, kPrefillMs));
     }
 
     // ---- Steady-state chaining simulation ----
-    // Feed audio in real time (240 frames per 5 ms) and issue segments via
-    // the gate. Consecutive issues must land ~(S - L - lead) apart and every
-    // issued segment must hold ~the target amount of audio, which is what
-    // makes the chaining gapless (constant ~S end-to-end delay).
+    // Feed audio in real time (240 frames per 5 ms). Each file records its
+    // full segment window; it is issued ONCE, when its content crosses the
+    // prefill, and the next file starts only when the current one is full
+    // (the rotation). The issue cadence is therefore the segment length, and
+    // every issued file holds ~the prefill of content - the delay is
+    // prefill + command latency, not the segment length.
     {
         constexpr uint32_t kRate = 48000;
+        constexpr uint32_t kPrefillMs = 600;
         constexpr uint32_t kSegMs = 2000;
-        constexpr double kLat = 300.0;
-        constexpr uint32_t kLead = 100;
-        constexpr double kTargetMs = kSegMs - kLat - kLead;  // 1600 ms
+        constexpr size_t kSegFrames = static_cast<size_t>(kRate) * kSegMs / 1000;
 
         uint64_t wall = 0;
         uint64_t seg_start = 0;
         size_t frames = 0;
-        std::vector<uint64_t> issue_times;
-        std::vector<size_t> issue_frames;
+        bool issued = false;
+        std::vector<uint64_t> issue_times;   // segment-local wall time
+        std::vector<size_t> issue_frames;    // content at issue
+        std::vector<uint64_t> rotate_times;
 
-        for (uint64_t step = 0; step < 2000; ++step) {  // 10 s of audio
+        for (uint64_t step = 0; step < 2400; ++step) {  // 12 s of audio
             frames += 240;  // 5 ms of 48 kHz
             wall += 5;
-            if (segment_ready(SegmentClock{seg_start, frames, kRate}, wall, kSegMs, kLat,
-                              kLead)) {
+            if (!issued &&
+                segment_ready(SegmentClock{seg_start, frames, kRate}, wall, kPrefillMs)) {
                 issue_times.push_back(wall - seg_start);
                 issue_frames.push_back(frames);
-                // Rotate: the new segment starts recording at the issue instant.
+                issued = true;
+            }
+            if (frames >= kSegFrames) {
+                // Rotation: the file's window is complete; the next file
+                // starts recording now.
+                rotate_times.push_back(wall - seg_start);
                 frames = 0;
                 seg_start = wall;
+                issued = false;
             }
         }
         TEST_ASSERT(issue_times.size() >= 5);
-        const double target_frames = kTargetMs * kRate / 1000.0;
+        TEST_ASSERT(rotate_times.size() >= 5);
+
+        // Every issue lands right at the prefill of its file's window.
+        const size_t prefill_frames = static_cast<size_t>(kRate) * kPrefillMs / 1000;
         for (size_t i = 0; i < issue_times.size(); ++i) {
-            // Wall spacing and content length both sit at the target
-            // (+ one 5 ms arrival step of slack).
-            TEST_ASSERT(issue_times[i] >= static_cast<uint64_t>(kTargetMs));
-            TEST_ASSERT(issue_times[i] <= static_cast<uint64_t>(kTargetMs) + 5);
-            TEST_ASSERT(issue_frames[i] >= static_cast<size_t>(target_frames));
-            TEST_ASSERT(issue_frames[i] <= static_cast<size_t>(target_frames) + 240);
+            TEST_ASSERT(issue_times[i] >= kPrefillMs);
+            TEST_ASSERT(issue_times[i] <= kPrefillMs + 5);
+            TEST_ASSERT(issue_frames[i] >= prefill_frames);
+            TEST_ASSERT(issue_frames[i] <= prefill_frames + 240);
+        }
+        // Rotations land exactly one segment length apart.
+        for (uint64_t r : rotate_times) {
+            TEST_ASSERT(r >= kSegMs);
+            TEST_ASSERT(r <= kSegMs + 5);
         }
     }
 

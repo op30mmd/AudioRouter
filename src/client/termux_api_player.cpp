@@ -25,15 +25,13 @@
 #endif
 
 namespace {
-
-// Floor for the issue target (S - L - lead); a too-short segment can make
-// MediaPlayer's prepare() fail. Also used by the host-compiled pure helpers.
-constexpr double kMinSegmentContentMs = 200.0;
-// The issue cadence must stay this far above the command latency so the
-// single issuer thread finishes each play before the next one is due (this
-// is what keeps playback continuous when commands are slow).
-constexpr double kIssueMarginMs = 200.0;
-
+// Audio recorded into a segment before its play command is issued. The
+// player starts ~command-latency after the issue and the rest of the
+// segment is already on disk (sparse zeros), so the end-to-end delay is
+// this prefill + the command latency. Sized to also cover MediaPlayer's
+// internal read-ahead (~a few hundred ms for local files). Also used by
+// host-compiled methods (get_buffer_delay_frames is live on host builds).
+constexpr uint32_t kPrefillMs = 600;
 } // namespace
 
 // The private helpers below exist only on Android builds; on host builds the
@@ -43,26 +41,22 @@ constexpr double kIssueMarginMs = 200.0;
 
 namespace {
 
-// Default segment length: the backend's inherent end-to-end delay.
-constexpr uint32_t kDefaultSegmentMs = 2000;
-// User-overridable segment range (termux:<ms>).
-constexpr uint32_t kMinSegmentMs = 400;
-constexpr uint32_t kMaxSegmentMs = 10000;
-// The play for the next segment is issued this far before the outgoing
-// segment ends: the media player's reset+start latency then hides inside the
-// tail of the outgoing segment (a tiny forward skip) instead of opening a
-// silence gap on every boundary.
-constexpr uint32_t kIssueLeadMs = 100;
+// Default segment length. This is NOT the end-to-end delay (which is
+// prefill + command latency): it only sets how often the media player
+// switches files (a ~prepare-time glitch per boundary).
+constexpr uint32_t kDefaultSegmentMs = 6000;
+// User-overridable segment range (termux:<ms>). The segment must comfortably
+// exceed prefill + command latency so the file ring never collides.
+constexpr uint32_t kMinSegmentMs = 2000;
+constexpr uint32_t kMaxSegmentMs = 30000;
+// Blind mode (no result channel): per-play latency estimate = am command
+// time + the app's unobservable prepare/start handling.
+constexpr double kBlindPrepareBiasMs = 250.0;
 // Startup-latency EMA state. The upper bound must comfortably exceed the
-// am-broadcast latency on a frozen app, otherwise the issuer cannot keep up.
+// am-broadcast latency on a frozen app.
 constexpr double kInitialLatencyMs = 300.0;
 constexpr double kMinLatencyMs = 60.0;
 constexpr double kMaxLatencyMs = 4000.0;
-// Blind mode only (no result channel at all): the am round trip cannot
-// observe prepare()+start(), so the fixed estimate gets a small bias on top
-// of the measured am duration.
-constexpr double kBlindSeedBiasMs = 150.0;
-
 // Segment file pool: a small fixed set of inodes created (and, as root,
 // SELinux-labeled) before streaming starts, then recycled with O_TRUNC so
 // the labels survive the privilege drop and the app can always read them.
@@ -636,13 +630,6 @@ void convert_to_s16le(const uint8_t* src, size_t frames, uint16_t channels,
     }
 }
 
-void store_le32(uint8_t* dst, uint32_t v) {
-    dst[0] = static_cast<uint8_t>(v);
-    dst[1] = static_cast<uint8_t>(v >> 8);
-    dst[2] = static_cast<uint8_t>(v >> 16);
-    dst[3] = static_cast<uint8_t>(v >> 24);
-}
-
 } // namespace
 
 #endif // __ANDROID__
@@ -685,25 +672,16 @@ std::vector<uint8_t> build_wav_header(uint32_t sample_rate, uint16_t channels,
     return h;
 }
 
-bool segment_ready(const SegmentClock& clock, uint64_t now_ms, uint32_t segment_ms,
-                   double latency_est_ms, uint32_t issue_lead_ms) {
+bool segment_ready(const SegmentClock& clock, uint64_t now_ms, uint32_t prefill_ms) {
     const uint32_t rate = clock.sample_rate > 0 ? clock.sample_rate : 48000;
-    double target_ms = static_cast<double>(segment_ms) - latency_est_ms -
-                       static_cast<double>(issue_lead_ms);
-    // The issue cadence must be slower than the command latency so the
-    // single issuer thread keeps up (continuous playback); see the header.
-    const double sustain_ms = latency_est_ms + kIssueMarginMs;
-    if (sustain_ms > target_ms) target_ms = sustain_ms;
-    if (target_ms < kMinSegmentContentMs) target_ms = kMinSegmentContentMs;
-
     const double content_ms =
         static_cast<double>(clock.frames_written) * 1000.0 / static_cast<double>(rate);
-    if (content_ms < target_ms) return false;
+    if (content_ms < static_cast<double>(prefill_ms)) return false;
 
     const double wall_ms = (now_ms >= clock.seg_start_wall_ms)
                                ? static_cast<double>(now_ms - clock.seg_start_wall_ms)
                                : 0.0;
-    return wall_ms >= target_ms;
+    return wall_ms >= static_cast<double>(prefill_ms);
 }
 
 std::string build_command_line(const std::string& action, const std::string& file,
@@ -735,12 +713,10 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
     if (config_.channels == 0) config_.channels = 2;
 
     segment_ms_ = kDefaultSegmentMs;
-    segment_explicit_ = false;
     device_name_ = device_name.empty() ? "termux" : device_name;
     if (device_name_.rfind("termux:", 0) == 0) {
         const std::string rest = device_name_.substr(7);
         if (!rest.empty()) {
-            segment_explicit_ = true;
             try {
                 const long ms = std::stol(rest);
                 const long clamped = std::clamp(ms, static_cast<long>(kMinSegmentMs),
@@ -749,7 +725,9 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
                 if (clamped != ms) {
                     LOG_WARN("TermuxApiPlayer: segment length " << ms << " ms out of range ["
                              << kMinSegmentMs << ", " << kMaxSegmentMs << "]; clamped to "
-                             << segment_ms_ << " ms");
+                             << segment_ms_ << " ms. The segment length only sets how often "
+                             "the player switches files - the delay is ~prefill + command "
+                             "latency either way");
                 }
             } catch (const std::exception&) {
                 LOG_WARN("TermuxApiPlayer: invalid segment length '" << rest
@@ -810,7 +788,7 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
         // includes prepare()+start(), so the EMA converges quickly.
         latency_est_ms_.store(socket_path_ ? kInitialLatencyMs
                                            : std::clamp(static_cast<double>(probe.duration_ms) +
-                                                            kBlindSeedBiasMs,
+                                                            kBlindPrepareBiasMs,
                                                         kMinLatencyMs, kMaxLatencyMs));
         LOG_INFO("TermuxApiPlayer: app result channel: "
                  << (socket_path_ ? "listen socket" : "am broadcast + result sockets")
@@ -820,15 +798,16 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
         // to the client's result socket. This is the signature of the client
         // running in a root-shell SELinux domain the confined app may not
         // connect to (setuid does not change the domain). Blind mode:
-        // delivery only, fixed latency estimate, no watchdog.
+        // delivery only; the latency EMA tracks the am time plus a prepare
+        // bias (no watchdog).
         latency_est_ms_.store(std::clamp(static_cast<double>(probe.duration_ms) +
-                                             kBlindSeedBiasMs,
+                                             kBlindPrepareBiasMs,
                                          kMinLatencyMs, kMaxLatencyMs));
         LOG_WARN("TermuxApiPlayer: the app received the probe but returned no result "
                  "over the result socket - usually the client runs in a root-shell "
                  "context the app cannot connect to (SELinux). Playing blind via am "
-                 "broadcast, fixed ~" << static_cast<uint32_t>(latency_est_ms_.load())
-                 << " ms command estimate.");
+                 "broadcast, estimated command latency ~"
+                 << static_cast<uint32_t>(latency_est_ms_.load()) << " ms.");
         LOG_INFO("TermuxApiPlayer: to test the app side manually, run in a second Termux "
                  "session: termux-media-player info   (expect: No track currently!)");
         LOG_INFO("TermuxApiPlayer: while streaming, check whether the app is actually "
@@ -861,7 +840,8 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
              << (result_channel_.load() ? (socket_path_ ? "socket protocol"
                                                         : "am + result sockets")
                                         : "blind am broadcast")
-             << ", cache " << cache_dir_ << ")");
+             << ", ~" << static_cast<uint32_t>(kPrefillMs + latency_est_ms_.load())
+             << " ms end-to-end delay, cache " << cache_dir_ << ")");
     return true;
 #else
     (void)config;
@@ -1011,13 +991,26 @@ bool TermuxApiPlayer::open_next_segment_locked() {
     }
     ::fchmod(seg_fd_, 0666);
 
+    // The file ring: create the segment at its FULL length right away. The
+    // header carries the exact sizes and the data region is a sparse hole
+    // that reads back as silence, so the player can never read past the
+    // recording head - the stream is overwritten into the file sequentially
+    // after the prefill, and the end-to-end delay is prefill + command
+    // latency, not the segment length.
     const bool is_float = config_.format == AudioSampleFormat::PCM_FLOAT32LE;
     const uint32_t rate = config_.sample_rate;
+    const size_t bytes_per_frame =
+        (is_float) ? config_.bytes_per_frame()
+                   : 2 * static_cast<size_t>(config_.channels);
+    seg_total_frames_ = static_cast<size_t>(segment_ms_) * rate / 1000;
+    const uint64_t data_bytes = seg_total_frames_ * bytes_per_frame;
     const auto header = termux_api::build_wav_header(rate, config_.channels, is_float,
-                                                     0xFFFFFFFFu, 0xFFFFFFFFu);
+                                                     static_cast<uint32_t>(36u + data_bytes),
+                                                     static_cast<uint32_t>(data_bytes));
     if (::write(seg_fd_, header.data(), header.size()) !=
-        static_cast<ssize_t>(header.size())) {
-        LOG_ERROR("TermuxApiPlayer: failed to write WAV header to " << seg_path_ << ": "
+            static_cast<ssize_t>(header.size()) ||
+        ::ftruncate(seg_fd_, static_cast<off_t>(header.size() + data_bytes)) != 0) {
+        LOG_ERROR("TermuxApiPlayer: failed to size " << seg_path_ << ": "
                   << std::strerror(errno));
         ::close(seg_fd_);
         seg_fd_ = -1;
@@ -1025,6 +1018,7 @@ bool TermuxApiPlayer::open_next_segment_locked() {
         return false;
     }
     seg_frames_ = 0;
+    seg_issued_ = false;
     seg_start_wall_ms_ = get_time_ms();
     return true;
 #else
@@ -1033,39 +1027,33 @@ bool TermuxApiPlayer::open_next_segment_locked() {
 }
 
 void TermuxApiPlayer::discard_segment_locked() {
+    // Restart the recording at live audio. The open file is closed and the
+    // next write opens a fresh pool file; a file already handed to the media
+    // player is never truncated (the app may still be reading it) - its pool
+    // slot is only recycled when the pool comes around again.
     if (seg_fd_ >= 0) {
         ::close(seg_fd_);
         seg_fd_ = -1;
     }
     seg_path_.clear();
     seg_frames_ = 0;
+    seg_issued_ = false;
     seg_start_wall_ms_ = get_time_ms();  // re-anchor at live audio
 }
 
 void TermuxApiPlayer::finalize_segment_locked() {
 #if defined(__ANDROID__)
-    if (seg_fd_ < 0) return;
-    // Patch exact sizes: MediaPlayer's duration comes from the header, and
-    // the track then ends exactly at the segment's EOF.
-    const size_t bytes_per_frame =
-        (config_.format == AudioSampleFormat::PCM_FLOAT32LE)
-            ? config_.bytes_per_frame()
-            : 2 * static_cast<size_t>(config_.channels);
-    const uint32_t data_bytes = static_cast<uint32_t>(seg_frames_ * bytes_per_frame);
-    uint8_t le[4];
-    store_le32(le, 36u + data_bytes);
-    (void)::pwrite(seg_fd_, le, sizeof(le), 4);   // riff size
-    store_le32(le, data_bytes);
-    (void)::pwrite(seg_fd_, le, sizeof(le), 40);  // data chunk size
-
+    if (seg_fd_ < 0 || seg_issued_) return;
+    // Hand the file to the issuer thread without closing it: the recorder
+    // keeps filling the same file until its window is complete (the player
+    // reads it at 1x, staying ~prefill + latency behind the write head).
+    // Never inline the play command here: a slow `am` must not stall the
+    // jitter-buffer pops on this thread.
     const std::string path = seg_path_;
     const size_t frames = seg_frames_;
     const uint64_t idx = seg_index_;
-    ::close(seg_fd_);
-    seg_fd_ = -1;
+    seg_issued_ = true;
 
-    // Hand off to the issuer thread (never inline: a slow play command must
-    // not stall the jitter-buffer pops on this thread).
     bool replaced = false;
     {
         std::lock_guard<std::mutex> hlock(handoff_mutex_);
@@ -1087,7 +1075,6 @@ void TermuxApiPlayer::finalize_segment_locked() {
                      << " dropped so far; -d termux:<larger ms> avoids this)");
         }
     }
-    open_next_segment_locked();
 #endif
 }
 
@@ -1123,6 +1110,15 @@ void TermuxApiPlayer::issuer_loop() {
                 LOG_INFO("TermuxApiPlayer: media player: " << trim(out.result) << " (command "
                          << out.duration_ms << " ms)");
             } else {
+                // Blind mode (no result channel): the am duration is still
+                // measurable per play - track the real command cost plus the
+                // app's unobservable prepare/start bias so the reported
+                // delay stays honest.
+                const double sample = static_cast<double>(out.duration_ms) +
+                                      kBlindPrepareBiasMs;
+                const double prev = latency_est_ms_.load();
+                latency_est_ms_.store(std::clamp(prev * 0.65 + sample * 0.35, kMinLatencyMs,
+                                                 kMaxLatencyMs));
                 ++consecutive_no_result_;
                 if (consecutive_no_result_ >= 2 && result_channel_.exchange(false)) {
                     LOG_WARN("TermuxApiPlayer: the app returned no result twice; switching "
@@ -1136,15 +1132,19 @@ void TermuxApiPlayer::issuer_loop() {
                              << (out.result.empty() ? std::string() : "; am: " + trim(out.result))
                              << "; check: su -c 'logcat -d -s ResultReturner TermuxApiReceiver'");
                 } else {
-                    LOG_DEBUG("TermuxApiPlayer: play delivered (blind mode)");
+                    LOG_DEBUG("TermuxApiPlayer: play delivered (blind mode, am "
+                              << out.duration_ms << " ms)");
                 }
             }
         } else {
             LOG_WARN("TermuxApiPlayer: play command failed"
                      << (out.result.empty() ? std::string() : ": " + trim(out.result)));
-            // Keep the issued bookkeeping as-is: a previously playing
-            // segment runs to its EOF, and the next ready segment restarts
-            // playback at live audio.
+            // Restart at live audio: discard the partial recording segment;
+            // the gate re-issues after the prefill, so the stream resumes
+            // within ~prefill + latency instead of waiting for the next
+            // segment boundary.
+            std::lock_guard<std::mutex> lock(io_mutex_);
+            if (is_open_.load() && seg_frames_ > 0) discard_segment_locked();
         }
     }
 #endif
@@ -1160,13 +1160,29 @@ void TermuxApiPlayer::watchdog_loop() {
 
         MediaCommandOutcome info = media_command(&result_channel_, "info", "", kInfoTimeoutMs);
         if (!info.delivered || !info.result_received) continue;
-        if (info.result.find("Paused") == std::string::npos) continue;
-        LOG_WARN("TermuxApiPlayer: media player paused (audio focus?); resuming");
-        MediaCommandOutcome resume =
-            media_command(&result_channel_, "resume", "", kInfoTimeoutMs);
-        if (!resume.delivered) {
-            LOG_WARN("TermuxApiPlayer: resume command did not reach the app");
+
+        if (info.result.find("Paused") != std::string::npos) {
+            LOG_WARN("TermuxApiPlayer: media player paused (audio focus?); resuming");
+            MediaCommandOutcome resume =
+                media_command(&result_channel_, "resume", "", kInfoTimeoutMs);
+            if (!resume.delivered) {
+                LOG_WARN("TermuxApiPlayer: resume command did not reach the app");
+            }
+            continue;
         }
+        if (info.result.find("No track") == std::string::npos) continue;
+
+        // The chain is broken (failed play, app killed, ...). Restart at
+        // live audio: discard the partial recording segment; the gate
+        // re-issues after the prefill, so the stream resumes within
+        // ~prefill + latency. Rate-limited.
+        const uint64_t now_ms = get_time_ms();
+        if (now_ms - last_recover_ms_ < 3000) continue;
+        last_recover_ms_ = now_ms;
+        LOG_WARN("TermuxApiPlayer: media player has no track; restarting playback at live "
+                 "audio");
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        if (is_open_.load() && seg_frames_ > 0) discard_segment_locked();
     }
 #endif
 }
@@ -1277,12 +1293,21 @@ size_t TermuxApiPlayer::write_frames(const void* pcm_data, size_t num_frames) {
     const uint64_t duration_us = (static_cast<uint64_t>(num_frames) * 1000000ULL) / rate;
     if (duration_us > 0) sleep_us(static_cast<uint32_t>(duration_us));
 
-    // Hand the segment to the issuer once it holds enough audio AND the wall
-    // clock agrees (gapless chaining; see termux_api::segment_ready).
-    termux_api::SegmentClock clock{seg_start_wall_ms_, seg_frames_, rate};
-    if (termux_api::segment_ready(clock, get_time_ms(), segment_ms_, latency_est_ms_.load(),
-                                  kIssueLeadMs)) {
-        finalize_segment_locked();
+    // Hand the file to the issuer ONCE, when it holds the prefill of real
+    // audio AND the wall clock agrees (see termux_api::segment_ready). The
+    // rest of the file is already readable as silence, so the player starts
+    // ~command-latency later and can never outrun the recording head.
+    if (!seg_issued_) {
+        termux_api::SegmentClock clock{seg_start_wall_ms_, seg_frames_, rate};
+        if (termux_api::segment_ready(clock, get_time_ms(), kPrefillMs)) {
+            finalize_segment_locked();
+        }
+    }
+    // Rotate to the next pool file only when this one's window is COMPLETE
+    // (the issue cadence is the segment length - the player hears the whole
+    // window while the next file is already recording).
+    if (seg_total_frames_ > 0 && seg_frames_ >= seg_total_frames_) {
+        open_next_segment_locked();
     }
     return num_frames;
 #else
@@ -1297,36 +1322,27 @@ size_t TermuxApiPlayer::get_buffer_delay_frames() const {
     std::lock_guard<std::mutex> lock(io_mutex_);
     const uint32_t rate = config_.sample_rate > 0 ? config_.sample_rate : 48000;
 
-    // Frames recorded into the open (not yet finalized) segment.
-    const size_t unissued = seg_frames_;
-    // A finalized segment still waiting for its play command.
-    size_t pending_frames = 0;
-    {
-        std::lock_guard<std::mutex> hlock(handoff_mutex_);
-        if (pending_.valid) pending_frames = pending_.frames;
-    }
-
-    // Remainder of the issued segment that has not been heard yet, estimated
-    // from the wall clock (MediaPlayer plays at real time from issue+start).
+    // With the file ring buffer, the audio being recorded right now will be
+    // heard prefill + command-latency later (the player starts ~latency
+    // after the issue and plays 1x while the recorder overwrites just
+    // ahead). Before anything was issued the backlog is simply the recorded
+    // content; after a play the chain is healthy only while the issued
+    // segment is still within its window — past it, the player is likely
+    // dead (failed play / app killed) and the stall is added.
     const double lat = latency_est_ms_.load();
-    const size_t issued = issued_frames_.load();
+    double delay_ms = static_cast<double>(kPrefillMs) + lat;
     const uint64_t issue_wall = issue_wall_ms_.load();
-    size_t issued_remaining = 0;
-    if (issued > 0 && issue_wall > 0) {
-        const uint64_t now_ms = get_time_ms();
-        if (now_ms > issue_wall) {
-            const double played_ms = static_cast<double>(now_ms - issue_wall) - lat;
-            if (played_ms > 0) {
-                const size_t played = static_cast<size_t>(played_ms * rate / 1000.0);
-                issued_remaining = played < issued ? issued - played : 0;
-            } else {
-                issued_remaining = issued;
-            }
+    const uint64_t now_ms = get_time_ms();
+    if (issue_wall == 0) {
+        delay_ms = std::max(delay_ms, static_cast<double>(seg_frames_) * 1000.0 / rate);
+    } else {
+        const double started_ms = static_cast<double>(issue_wall) + lat;
+        const double age_ms = static_cast<double>(now_ms) - started_ms;
+        if (age_ms > static_cast<double>(segment_ms_)) {
+            delay_ms += age_ms - static_cast<double>(segment_ms_);
         }
     }
-    // MediaPlayer's own buffered lookahead (~ its startup latency).
-    const size_t in_player = static_cast<size_t>(lat * rate / 1000.0);
-    return unissued + pending_frames + issued_remaining + in_player;
+    return static_cast<size_t>(delay_ms * rate / 1000.0);
 }
 
 void TermuxApiPlayer::flush() {
