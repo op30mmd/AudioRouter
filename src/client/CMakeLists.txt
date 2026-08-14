@@ -5,6 +5,7 @@ set(CLIENT_SOURCES
     direct_alsa.cpp
     agm_fifo_player.cpp
     aaudio_player.cpp
+    termux_api_player.cpp
     dummy_player.cpp
     jitter_buffer.cpp
     android_helpers.cpp
@@ -18,6 +19,7 @@ set(CLIENT_HEADERS
     direct_alsa.hpp
     agm_fifo_player.hpp
     aaudio_player.hpp
+    termux_api_player.hpp
     dummy_player.hpp
     jitter_buffer.hpp
     android_helpers.hpp
