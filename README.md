@@ -235,8 +235,9 @@ requirement no longer sets the delay:
   length**;
 - `write_frames()` paces itself at real time (like `DummyPlayer`), records a
   file until its window is complete, and only then rotates to the next pool
-  file — the issue cadence IS the file length (`-d termux:<ms>`, default
-  600000 ms = **10 minutes**). The file length therefore only sets how often
+  file — the issue cadence IS the file length (`-T/--termux-segment <ms>`,
+  or the `-d termux:<ms>` device suffix; default 600000 ms = **10 minutes**).
+  The file length therefore only sets how often
   the player switches files: each switch makes the app stop/reset/prepare/
   start the new track, an unavoidable **~0.3-1 s pause per boundary** (the
   app's MediaPlayer has no gapless transition). Long files make that pause
@@ -401,6 +402,7 @@ su
 ./scripts/termux_run.sh -s 192.168.43.45 -d termux
 #   one ~prepare-time switch pause per file (10 min default); the delay is
 #   the same (~0.6 s + command latency) no matter the file length:
+./scripts/termux_run.sh -s 192.168.43.45 -d termux -T 300000   # pause every 5 min
 # with interface binding (root; bypasses VPN):
 ./scripts/termux_run.sh -s 192.168.43.45 -d agm -b auto
 ```
@@ -433,6 +435,11 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
 -s, --server <ip>     server IP
 -p, --port <port>     server port (default 44100)
 -d, --device <dev>    backend/device (see table above; default 'default')
+-T, --termux-segment <ms>
+                      Termux:API file length in ms (default 600000 = one
+                      ~prepare-time switch pause per 10 min; 2000..3600000).
+                      The end-to-end delay is unaffected by it; overrides
+                      -d termux:<ms>. Ignored for other backends.
 -l, --latency <ms>    target jitter-buffer latency (default 35 ms)
 -b, --bind <iface>    pin UDP socket to an interface ('auto' = physical NIC)
 -u, --usb             Voice over USB: stream over the USB cable via adb reverse
@@ -482,8 +489,8 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   - on **Android 14+** the app's listen socket freezes, so commands go through
     `am broadcast` with the client's result sockets — still fully confirmed by the
     app, just slower (the startup log prints the estimated end-to-end delay, which is
-    `~0.6 s + command latency` either way; raise `-d termux:<ms>` only to make the
-    per-switch pause rarer);
+    `~0.6 s + command latency` either way; raise `-T <ms>` / `-d termux:<ms>` only
+    to make the per-switch pause rarer);
   - **not a real-time transport**: the pipeline delay is ~0.7-1.6 s and every file
     switch costs the app a stop/reset/prepare/start cycle (~0.3-1 s pause; once per
     10 min at the default). For true real-time playback use `-d aaudio` (no root,

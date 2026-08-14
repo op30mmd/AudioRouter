@@ -9,7 +9,10 @@
 #      ./scripts/termux_run.sh -s 10.58.30.80 -d aaudio -b auto
 #      ./scripts/termux_run.sh -s 10.58.30.80 -d termux   (Termux:API media
 #                                                player, no root - needs the
-#                                                Termux:API app installed)
+#                                                Termux:API app installed;
+#                                                -T <ms> sets the file length,
+#                                                e.g. -T 300000 = switch
+#                                                pause every 5 min)
 #      ./scripts/termux_run.sh -u -d aaudio     (Voice over USB: no server IP)
 #      ./scripts/termux_run.sh --tether -d agm  (USB tethering: native UDP over
 #                                                the cable, lowest latency - the
@@ -57,7 +60,7 @@ while [ $# -gt 0 ]; do
             POS=2
             shift 2
             ;;
-        -d|--device|-b|--bind|-l|--latency)
+        -d|--device|-b|--bind|-l|--latency|-T|--termux-segment)
             if [ $# -lt 2 ]; then
                 echo "Error: $1 requires an argument." >&2
                 exit 1

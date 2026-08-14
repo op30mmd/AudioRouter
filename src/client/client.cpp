@@ -319,6 +319,22 @@ bool AudioRouterClient::start() {
     LOG_INFO(" Starting AudioRouter Android ALSA Client Engine");
     LOG_INFO("=================================================");
 
+    // -T/--termux-segment overrides the file length of the Termux:API
+    // backend (how often the media player switches files; the end-to-end
+    // delay is unaffected). It rewrites the device name to the equivalent
+    // termux:<ms> form so every code path sees one source of truth.
+    if (config_.termux_segment_ms != 0) {
+        if (is_termux_device(config_.device_name)) {
+            config_.device_name = "termux:" + std::to_string(config_.termux_segment_ms);
+            LOG_INFO("-T/--termux-segment: Termux:API file length set to "
+                     << config_.termux_segment_ms << " ms (one ~prepare-time switch pause per "
+                     << config_.termux_segment_ms / 1000 << " s)");
+        } else {
+            LOG_WARN("-T/--termux-segment is ignored for device '" << config_.device_name
+                     << "' (Termux:API backend only)");
+        }
+    }
+
     // Check Android root permissions
     if (AndroidHelpers::is_running_as_root()) {
         LOG_INFO("Running with root privileges (UID 0). Direct ALSA access enabled.");
