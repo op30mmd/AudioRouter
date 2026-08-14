@@ -458,6 +458,30 @@ pulseaudio --start
 ./scripts/termux_run.sh -s 192.168.43.45 -d agm -b auto
 ```
 
+#### Recovering a wedged daemon: `--restart-pulse`
+
+```bash
+./scripts/termux_run.sh --restart-pulse 192.168.43.45 -d pulse -b auto
+```
+
+Stops the daemon, clears its leftovers, starts a fresh one, and unloads
+`module-suspend-on-idle` so the sink never needs a slow resume.
+
+It is **opt-in on purpose, and not part of a normal run**. PulseAudio is a shared
+per-user service: restarting it unconditionally would cut off every other Termux
+app using it, and a daemon that is answering is exactly what you want to keep —
+reconnecting to a live one takes ~200 ms. It is also gentler than
+`killall -9 pulseaudio`:
+
+- `pulseaudio -k` (SIGTERM via the daemon's own pid file) first, so it unlinks
+  its runtime directory itself; `SIGKILL` is only the fallback, and killing `-9`
+  is what *creates* the stale state rather than clearing it;
+- leftovers are deleted only once nothing is listening, and only after `$HOME` is
+  checked — under `su` `$HOME` is `/`, so an unmatched `~/.config/pulse/*-runtime`
+  glob would otherwise be handed to `rm -rf` verbatim, pointing at the wrong tree;
+- it refuses to run as root for the same reason the backend drops privileges: the
+  daemon belongs to the Termux app user.
+
 ### Voice over USB (no Wi-Fi)
 Phone plugged into the PC with USB debugging enabled; server and client speak
 over the USB cable only:
@@ -585,7 +609,8 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     **wedged**, and no amount of retrying helps; `pactl info` hangs the same way.
     Restart it as the Termux user: `pulseaudio -k || pkill -9 pulseaudio`, then
     `pulseaudio --start --exit-idle-time=-1`. A wedged daemon has been seen after
-    repeated suspend/resume cycles of the AAudio sink on Android 13+;
+    repeated suspend/resume cycles of the AAudio sink on Android 13+.
+    `./scripts/termux_run.sh --restart-pulse ...` does this for you (see below);
   - a daemon restart or a sink being unplugged is recovered automatically: writes
     fail, the stream is torn down and rebuilt (at most one attempt per 2 s), and the
     log shows `PulsePlayer: Reconnected to the PulseAudio daemon.`;

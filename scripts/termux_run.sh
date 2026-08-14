@@ -36,6 +36,7 @@ SERVER_IP=""
 PORT="44100"
 USB_MODE=0
 TETHER=0
+RESTART_PULSE=0
 LATENCY_EXPLICIT=0
 declare -a CLIENT_ARGS=()
 
@@ -78,6 +79,10 @@ while [ $# -gt 0 ]; do
             ;;
         --tether)
             TETHER=1
+            shift
+            ;;
+        --restart-pulse)
+            RESTART_PULSE=1
             shift
             ;;
         -*)
@@ -323,6 +328,73 @@ if [ "$TETHER" -eq 1 ] && [ "$IS_TERMUX" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
     echo "  ./scripts/termux_run.sh -s <PC-USB-IP> -d termux" >&2
     echo "(the server prints its USB interface IP on startup; no root needed)." >&2
     exit 1
+fi
+
+# Opt-in recovery for a wedged PulseAudio daemon (--restart-pulse).
+#
+# Deliberately NOT automatic. PulseAudio is a shared per-user service: killing
+# it on every run would also cut off any other Termux app using it, and a
+# healthy daemon is exactly what we want to keep - reconnecting to a live one
+# takes ~200 ms. This only runs when the user asks, and it is far gentler than
+# `killall -9`:
+#   * `pulseaudio -k` first (SIGTERM via the daemon's own pid file) so it can
+#     unlink its runtime directory itself; SIGKILL is the fallback, and it is
+#     what *creates* stale state rather than clearing it;
+#   * stale files are removed only after nothing is listening any more, and
+#     only with $HOME verified - an unmatched glob under su (where HOME is "/")
+#     would otherwise hand `rm -rf` a path in the wrong tree.
+restart_pulse_daemon() {
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "--restart-pulse: refusing to run as root - PulseAudio is a per-user" >&2
+        echo "  service. Run it as the Termux user (without su), then start the client." >&2
+        return 1
+    fi
+    if ! command -v pulseaudio >/dev/null 2>&1; then
+        echo "--restart-pulse: 'pulseaudio' not installed (pkg install pulseaudio); skipping." >&2
+        return 1
+    fi
+
+    echo "--restart-pulse: stopping any running PulseAudio daemon..."
+    pulseaudio -k 2>/dev/null || true
+    # Give it a moment to exit cleanly and remove its own runtime dir.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -x pulseaudio >/dev/null 2>&1 || break
+        sleep 0.3
+    done
+    if pgrep -x pulseaudio >/dev/null 2>&1; then
+        echo "--restart-pulse: it did not exit; forcing."
+        pkill -9 -x pulseaudio 2>/dev/null || true
+        sleep 0.5
+    fi
+
+    # Only now clear leftovers, and only inside a sane $HOME.
+    case "$HOME" in
+        /|"") echo "--restart-pulse: \$HOME is '$HOME'; not removing anything." >&2 ;;
+        *)
+            if [ -d "$HOME/.config/pulse" ] && ! pgrep -x pulseaudio >/dev/null 2>&1; then
+                find "$HOME/.config/pulse" -maxdepth 1 -name '*-runtime' -type d \
+                    -exec rm -rf {} + 2>/dev/null || true
+                rm -f "$HOME/.config/pulse/pid" 2>/dev/null || true
+            fi
+            ;;
+    esac
+
+    echo "--restart-pulse: starting a fresh daemon..."
+    pulseaudio --start --exit-idle-time=-1 2>/dev/null || true
+    sleep 0.5
+    if pactl info >/dev/null 2>&1; then
+        echo "--restart-pulse: daemon is up and answering."
+        # A suspended sink costs seconds to resume; keep it awake.
+        pactl unload-module module-suspend-on-idle >/dev/null 2>&1 || true
+    else
+        echo "--restart-pulse: the daemon is still not answering ('pactl info' failed)." >&2
+        echo "  The client will fall back to AAudio. Run this to see why it dies:" >&2
+        echo "    pulseaudio -n --exit-idle-time=-1 --log-target=stderr -vvvv" >&2
+    fi
+}
+
+if [ "$RESTART_PULSE" -eq 1 ]; then
+    restart_pulse_daemon || true
 fi
 
 # Direct launch (no su): in tethering mode the USB function must be restored
