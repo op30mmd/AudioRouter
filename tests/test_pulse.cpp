@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <algorithm>
 #include <cstring>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -282,6 +283,41 @@ bool run_pulse_tests() {
             // daemon that had just been verified alive.
             const std::string addr = audiorouter::PulsePlayer::resolve_server_address();
             TEST_ASSERT(addr == "unix:" + sock);
+
+            // A $PREFIX/var/run/pulse/native socket exists on Termux even when
+            // the real daemon lives in the machine-id runtime dir, and it can
+            // accept connect() while refusing the PulseAudio handshake. It must
+            // therefore rank BELOW the runtime dir, and must not be the only
+            // candidate offered. (Committing to it is what produced
+            // "pa_simple_new failed ... on server unix:$PREFIX/var/run/pulse/native".)
+            const std::string prefix_dir = std::string(dir) + "/prefix";
+            const std::string decoy_dir = prefix_dir + "/var/run/pulse";
+            ::mkdir(prefix_dir.c_str(), 0755);
+            ::mkdir((prefix_dir + "/var").c_str(), 0755);
+            ::mkdir((prefix_dir + "/var/run").c_str(), 0755);
+            ::mkdir(decoy_dir.c_str(), 0755);
+            const std::string decoy = decoy_dir + "/native";
+            int dfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+            TEST_ASSERT(dfd >= 0);
+            sockaddr_un da{};
+            da.sun_family = AF_UNIX;
+            std::memcpy(da.sun_path, decoy.c_str(), decoy.size() + 1);
+            TEST_ASSERT(::bind(dfd, reinterpret_cast<sockaddr*>(&da), sizeof(da)) == 0);
+            TEST_ASSERT(::listen(dfd, 1) == 0);
+            ::setenv("PREFIX", prefix_dir.c_str(), 1);
+
+            const auto all = audiorouter::PulsePlayer::resolve_server_addresses();
+            TEST_ASSERT(all.size() >= 2);
+            TEST_ASSERT(all.front() == "unix:" + sock);          // real daemon first
+            TEST_ASSERT(std::find(all.begin(), all.end(), "unix:" + decoy) != all.end());
+
+            ::close(dfd);
+            ::unlink(decoy.c_str());
+            ::rmdir(decoy_dir.c_str());
+            ::rmdir((prefix_dir + "/var/run").c_str());
+            ::rmdir((prefix_dir + "/var").c_str());
+            ::rmdir(prefix_dir.c_str());
+            ::setenv("PREFIX", dir, 1);
 
             FILE* mf = std::fopen((pulse_dir + "/machine-id").c_str(), "w");
             TEST_ASSERT(mf != nullptr);

@@ -265,8 +265,14 @@ bool PulsePlayer::server_available() {
 }
 
 std::string PulsePlayer::resolve_server_address() {
+    const auto all = resolve_server_addresses();
+    return all.empty() ? std::string() : all.front();
+}
+
+std::vector<std::string> PulsePlayer::resolve_server_addresses() {
 #if defined(_WIN32)
-    return env_or_empty("PULSE_SERVER");
+    const std::string env = env_or_empty("PULSE_SERVER");
+    return env.empty() ? std::vector<std::string>{} : std::vector<std::string>{env};
 #else
     // An explicit server address normally wins: it may be a TCP endpoint with
     // no local socket at all (a common Termux setup points at 127.0.0.1:4713),
@@ -286,7 +292,7 @@ std::string PulsePlayer::resolve_server_address() {
                 unix_path = env_server;
             }
             if (unix_path.empty() || unix_socket_is_live(unix_path)) {
-                return env_server;
+                return {env_server};
             }
             LOG_WARN("PulsePlayer: PULSE_SERVER points at '" << env_server
                      << "' but no daemon is listening there; ignoring it and looking for "
@@ -298,19 +304,14 @@ std::string PulsePlayer::resolve_server_address() {
     const std::string xdg = env_or_empty("XDG_RUNTIME_DIR");
     if (!xdg.empty()) candidates.push_back(xdg + "/pulse/native");
 
-    candidates.push_back("/run/user/" + std::to_string(static_cast<unsigned>(::getuid())) + "/pulse/native");
-
-    // Termux installs the daemon under $PREFIX and runs it without a
-    // /run/user tree.
-    const std::string prefix = env_or_empty("PREFIX");
-    if (!prefix.empty()) {
-        candidates.push_back(prefix + "/var/run/pulse/native");
-        candidates.push_back(prefix + "/var/run/pulse/pid");
-    }
+    // The machine-id runtime directory goes FIRST (below): it is the path the
+    // Termux daemon actually prints in its own log
+    //   "Using runtime directory $HOME/.config/pulse/<machine-id>-runtime"
+    // whereas $PREFIX/var/run/pulse/native is a packaging leftover that can
+    // accept a bare connect() and then refuse the PulseAudio handshake.
+    // Ordering therefore decides which daemon we reach.
     const std::string home = env_or_empty("HOME");
     if (!home.empty()) {
-        candidates.push_back(home + "/.pulse/native");
-        candidates.push_back(home + "/.config/pulse/native");
         // Termux's PulseAudio has no /run/user tree, so it puts its runtime
         // directory under the state directory, keyed by machine ID:
         //   $HOME/.config/pulse/<machine-id>-runtime/native
@@ -371,6 +372,19 @@ std::string PulsePlayer::resolve_server_address() {
         }
     }
 
+        candidates.push_back("/run/user/" + std::to_string(static_cast<unsigned>(::getuid())) + "/pulse/native");
+    if (!home.empty()) {
+        candidates.push_back(home + "/.pulse/native");
+        candidates.push_back(home + "/.config/pulse/native");
+    }
+    // Packaging leftover, lowest priority: present on Termux even when the
+    // real daemon lives in the machine-id runtime dir.
+    const std::string prefix = env_or_empty("PREFIX");
+    if (!prefix.empty()) {
+        candidates.push_back(prefix + "/var/run/pulse/native");
+    }
+
+std::vector<std::string> live;
     for (const auto& c : candidates) {
         if (!path_exists(c)) continue;
         // A socket owned by another user cannot be connected to (PulseAudio is
@@ -403,15 +417,19 @@ std::string PulsePlayer::resolve_server_address() {
         // own lookup does not know about Termux's
         // $HOME/.config/pulse/<machine-id>-runtime layout, so it would refuse
         // a daemon we just verified is alive.
-        return "unix:" + c;
+        const std::string addr = "unix:" + c;
+        if (std::find(live.begin(), live.end(), addr) == live.end()) {
+            live.push_back(addr);
+        }
     }
+    if (!live.empty()) return live;
     LOG_DEBUG("PulsePlayer: no live daemon socket among " << candidates.size()
               << " candidate path(s):");
     for (const auto& c : candidates) {
         LOG_DEBUG("PulsePlayer:   tried " << c
                   << (path_exists(c) ? " (exists, not listening)" : " (absent)"));
     }
-    return std::string();
+    return {};
 #endif
 }
 
@@ -516,29 +534,38 @@ bool PulsePlayer::connect_locked() {
                                 (static_cast<uint64_t>(config_.sample_rate) * bpf))
         : 0;
 
-    int error = 0;
-    // Connect to the exact daemon resolve_server_address() validated. Passing
-    // nullptr here lets libpulse redo its own discovery, which on Termux
-    // misses the daemon's runtime directory entirely.
-    const std::string server = resolve_server_address();
-    const bool from_env = !server.empty() && server == env_or_empty("PULSE_SERVER");
-    LOG_INFO("PulsePlayer: connecting to server '"
-             << (server.empty() ? "(libpulse default)" : server) << "'"
-             << (from_env ? " (from PULSE_SERVER)" : ""));
-    // pa_simple_new() sets PA_STREAM_ADJUST_LATENCY internally, so `tlength`
-    // is interpreted as the end-to-end latency we want the daemon to keep.
-    pa_simple* s = pa_simple_new(
-        server.empty() ? nullptr : server.c_str(),  // explicit server address
-        "AudioRouter",                              // application name
-        PA_STREAM_PLAYBACK,
-        spec_.sink.empty() ? nullptr : spec_.sink.c_str(),
-        "Remote PC audio",                          // stream description
-        &ss,
-        nullptr,                                    // default channel map
-        &attr,
-        &error);
+    // Try every endpoint that looked live, best first. A socket can accept a
+    // bare connect() and still refuse the PulseAudio protocol handshake, so
+    // "it connected" is not proof it is the daemon - only pa_simple_new() is.
+    std::vector<std::string> servers = resolve_server_addresses();
+    if (servers.empty()) servers.push_back(std::string());   // libpulse default
+    const std::string env_server = env_or_empty("PULSE_SERVER");
 
-    if (!s) {
+    pa_simple* s = nullptr;
+    int error = 0;
+    std::string server;
+    for (size_t i = 0; i < servers.size(); ++i) {
+        server = servers[i];
+        const bool from_env = !server.empty() && server == env_server;
+        LOG_INFO("PulsePlayer: connecting to server '"
+                 << (server.empty() ? "(libpulse default)" : server) << "'"
+                 << (from_env ? " (from PULSE_SERVER)" : "")
+                 << " [" << (i + 1) << " of " << servers.size() << "]");
+        // pa_simple_new() sets PA_STREAM_ADJUST_LATENCY internally, so `tlength`
+        // is interpreted as the end-to-end latency we want the daemon to keep.
+        error = 0;
+        s = pa_simple_new(
+            server.empty() ? nullptr : server.c_str(),  // explicit server address
+            "AudioRouter",                              // application name
+            PA_STREAM_PLAYBACK,
+            spec_.sink.empty() ? nullptr : spec_.sink.c_str(),
+            "Remote PC audio",                          // stream description
+            &ss,
+            nullptr,                                    // default channel map
+            &attr,
+            &error);
+        if (s) break;
+
         LOG_WARN("PulsePlayer: pa_simple_new failed for sink '"
                  << (spec_.sink.empty() ? "(default)" : spec_.sink)
                  << "' on server '" << (server.empty() ? "(libpulse default)" : server)
@@ -548,6 +575,9 @@ bool PulsePlayer::connect_locked() {
                      "If it is stale, unset it (and re-run) so the daemon's own socket "
                      "is discovered instead: unset PULSE_SERVER");
         }
+    }
+
+    if (!s) {
         return false;
     }
 

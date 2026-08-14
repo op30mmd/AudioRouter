@@ -119,6 +119,13 @@ public:
     // $HOME/.config/pulse/<machine-id>-runtime socket and got ECONNREFUSED).
     static std::string resolve_server_address();
 
+    // Every live-looking daemon endpoint, best first. resolve_server_address()
+    // returns the first entry. open() tries them in order, because a socket
+    // that answers a bare connect() can still refuse the PulseAudio protocol
+    // handshake (Termux ships a $PREFIX/var/run/pulse/native socket that does
+    // exactly that), and committing to the first match hid the real daemon.
+    static std::vector<std::string> resolve_server_addresses();
+
     // Sink names reported by `pactl list short sinks`, best effort (empty when
     // pactl is missing or no daemon answers). Used by --list-devices only.
     static std::vector<std::string> get_available_sinks();
