@@ -560,6 +560,12 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   - pick a specific output with `-d pulse:<sink>` using a name from `pactl list short
     sinks`; omitting it (or `pulse:default`) follows the daemon's default sink, so it
     keeps working across headphone/HDMI switches;
+  - PulseAudio's `module-suspend-on-idle` suspends a sink after ~5 s of silence,
+    and resuming it re-opens the Android HAL stream — the first connect after an
+    idle gap can take seconds, where a back-to-back reconnect takes ~200 ms. The
+    client allows up to 8 s for a PulseAudio connect for that reason. To avoid the
+    pause entirely, unload the module (`pactl unload-module module-suspend-on-idle`)
+    or start the daemon with `--exit-idle-time=-1` and that module disabled;
   - if the audio is choppy, raise the buffer target (`-d pulse@60`); if it is
     delayed, lower it (`-d pulse@15`, floor 10 ms). The status line's `Audio: <ms>`
     is the daemon's own `pa_simple_get_latency()` reading, so the effect is visible
