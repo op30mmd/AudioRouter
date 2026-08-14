@@ -520,6 +520,15 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     "not compiled in this build" means the library was missing when the binary was
     built; "no PulseAudio daemon found" means nothing is listening (`pulseaudio
     --start`, or point `PULSE_SERVER` at a remote/TCP daemon);
+  - the daemon is **per-session**: closing Termux, or Android reclaiming the app,
+    stops it, and the next run then reports `no PulseAudio daemon is reachable` and
+    falls through to AAudio. Re-run `pulseaudio --start` (or add it to `~/.bashrc`);
+    `pactl info` says whether one is live. `open()` is gated on that check because
+    `pa_simple_new()` does not reliably return an error when there is no daemon — it
+    can block instead, which would otherwise burn the client's 3 s open budget and
+    strand playback on the dummy sink with no error logged at all. The PulseAudio
+    open attempt is additionally capped at 1.5 s (vs the 20 s default) so a wedged
+    libpulse can never hold up the fallback chain;
   - **PipeWire** users need nothing special — its `pipewire-pulse` shim answers on the
     same socket and behaves identically;
   - pick a specific output with `-d pulse:<sink>` using a name from `pactl list short

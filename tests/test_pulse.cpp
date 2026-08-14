@@ -207,6 +207,46 @@ bool run_pulse_tests() {
         if (!saved_home.empty()) ::setenv("HOME", saved_home.c_str(), 1);
     }
 
-    std::cout << "  [pulse] device parsing, buffer sizing, daemon probe and closed-player contract OK\n";
+    // ---- open() must fail fast when no daemon is reachable ----
+    // Regression test for the on-device report where `-d pulse` with a dead
+    // daemon produced NO error at all: open() went straight into
+    // pa_simple_new(), which blocked instead of returning an error, so the
+    // client's 3 s watchdog fired and playback was stranded on the dummy sink
+    // without the fallback chain ever advancing. open() is now gated on the
+    // same reachability probe the `default`-name path uses.
+    {
+        char tmpl[] = "/tmp/ar_pulse_open_XXXXXX";
+        const char* dir = ::mkdtemp(tmpl);
+        TEST_ASSERT(dir != nullptr);
+
+        const std::string saved_server = std::getenv("PULSE_SERVER") ? std::getenv("PULSE_SERVER") : "";
+        const std::string saved_xdg = std::getenv("XDG_RUNTIME_DIR") ? std::getenv("XDG_RUNTIME_DIR") : "";
+        const std::string saved_prefix = std::getenv("PREFIX") ? std::getenv("PREFIX") : "";
+        const std::string saved_home = std::getenv("HOME") ? std::getenv("HOME") : "";
+
+        ::unsetenv("PULSE_SERVER");
+        ::setenv("XDG_RUNTIME_DIR", dir, 1);
+        ::setenv("PREFIX", dir, 1);
+        ::setenv("HOME", dir, 1);
+
+        audiorouter::AudioConfig cfg;
+        audiorouter::PulsePlayer player;
+        // No daemon anywhere -> must return false immediately and stay closed,
+        // so the caller's strategy chain moves on to the next backend.
+        TEST_ASSERT(!player.open(cfg, "pulse"));
+        TEST_ASSERT(!player.is_open());
+        // Explicit sink and latency suffix take the same path.
+        TEST_ASSERT(!player.open(cfg, "pulse:some_sink@40"));
+        TEST_ASSERT(!player.is_open());
+
+        ::rmdir(dir);
+        if (!saved_server.empty()) ::setenv("PULSE_SERVER", saved_server.c_str(), 1);
+        if (!saved_xdg.empty()) ::setenv("XDG_RUNTIME_DIR", saved_xdg.c_str(), 1); else ::unsetenv("XDG_RUNTIME_DIR");
+        if (!saved_prefix.empty()) ::setenv("PREFIX", saved_prefix.c_str(), 1); else ::unsetenv("PREFIX");
+        if (!saved_home.empty()) ::setenv("HOME", saved_home.c_str(), 1);
+    }
+
+    std::cout << "  [pulse] device parsing, buffer sizing, daemon probe, fail-fast open"
+              << " and closed-player contract OK\n";
     return true;
 }

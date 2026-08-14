@@ -54,6 +54,14 @@ namespace {
     // PulseAudio opens are a socket connect to the local daemon: fast, and
     // either it answers or it does not.
     constexpr size_t kMaxPulseOpenAttempts = 2;
+    // ...but libpulse does not always honour that. With no daemon running,
+    // pa_simple_new() can BLOCK (name resolution, autospawn) instead of
+    // returning an error, which used to hold this strategy for the full
+    // kDeviceAttemptTimeoutMs (20 s) - far past the caller's 3 s open budget,
+    // so playback was stranded on the dummy sink and the chain never reached
+    // AAudio. Bound the PulseAudio attempt tightly: a local daemon that has
+    // not answered in this long is not going to.
+    constexpr uint32_t kPulseAttemptTimeoutMs = 1500;
 
     // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
     // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
@@ -270,8 +278,10 @@ namespace {
                     finished->store(true);
                 });
 
+                const uint32_t attempt_timeout_ms = strategy == OpenStrategy::PULSE
+                    ? kPulseAttemptTimeoutMs : kDeviceAttemptTimeoutMs;
                 uint32_t waited = 0;
-                for (; waited < kDeviceAttemptTimeoutMs && !open->shutdown.load() && !finished->load();
+                for (; waited < attempt_timeout_ms && !open->shutdown.load() && !finished->load();
                      waited += kDeviceAttemptPollMs) {
                     sleep_ms(kDeviceAttemptPollMs);
                 }
@@ -298,7 +308,7 @@ namespace {
                 if (!finished->load()) {
                     LOG_WARN("Audio device open attempt " << attempt
                              << (candidate.empty() ? "" : " on '" + candidate + "'")
-                             << " hung in a kernel call (" << kDeviceAttemptTimeoutMs << "ms). Abandoning it and trying "
+                             << " hung in a kernel call (" << attempt_timeout_ms << "ms). Abandoning it and trying "
                              << (node_based ? "the next PCM node" : "again with a fresh player") << "; if the abandoned "
                              << "attempt later succeeds the real device is hot-swapped in automatically.");
                     attempt_thread.detach();

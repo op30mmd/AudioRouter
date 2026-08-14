@@ -295,6 +295,20 @@ bool PulsePlayer::open(const AudioConfig& config, const std::string& device_name
     consecutive_write_failures_ = 0;
 
 #if defined(PULSEAUDIO_ENABLED)
+    // Fail fast when no daemon is reachable. Without this an explicit
+    // "-d pulse" went straight into pa_simple_new(), which does NOT reliably
+    // return an error when there is nothing to talk to: it can block (name
+    // lookup, autospawn) until the client's 3 s open watchdog fires, which
+    // strands playback on the dummy sink instead of falling through to the
+    // next backend. The `default`-name path was already gated by this probe
+    // in build_open_strategies(); the explicit device name bypassed it.
+    if (!server_available()) {
+        LOG_WARN("PulsePlayer: no PulseAudio daemon is reachable (no PULSE_SERVER and no "
+                 "usable native socket). Start one as the normal user with 'pulseaudio "
+                 "--start'; falling through to the next backend.");
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (!connect_locked()) {
         return false;
