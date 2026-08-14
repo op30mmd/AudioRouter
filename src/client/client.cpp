@@ -978,12 +978,17 @@ void AudioRouterClient::audio_playback_thread() {
                     // full backlog (the jitter prefill burst + stalls), which
                     // shows up as a constant multi-hundred-ms audio delay.
                     // Sleep so the backend drains back toward ~40 ms. Direct
-                    // backends (ALSA) pace themselves on blocking writes and
-                    // report ~0 buffered delay, so they are unaffected.
-                    const std::string dev_name = player->get_device_name();
-                    if (backend_ms > 60 &&
-                        (dev_name.rfind("aaudio", 0) == 0 ||
-                         dev_name.rfind("agm", 0) == 0)) {
+                    // backends (ALSA, PulseAudio) pace themselves on blocking
+                    // writes and report their true buffered delay, so they are
+                    // unaffected.
+                    //
+                    // The gate is the backend's own reported delay, NOT the
+                    // requested device name: after a fallback (e.g. -d pulse
+                    // failing over to AAudio) get_device_name() still returns
+                    // the name the user asked for, so a name-based check
+                    // silently disabled pacing for the backend that actually
+                    // ran - the AAudio pipe then sat at a constant ~358 ms.
+                    if (backend_ms > 60 && player->needs_playback_pacing()) {
                         sleep_ms(backend_ms - 40);
                     }
                 } else {

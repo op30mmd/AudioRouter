@@ -287,7 +287,7 @@ End-to-end audio delay = jitter buffer + backend delay:
 | Component | Typical | Worst case | Bound by |
 |-----------|---------|------------|----------|
 | Jitter buffer | target `-l` (default 35 ms); excess drained back to ~target+25 ms after bursts | startup prefill 120–500 ms (one-time, protected by a 3 s grace) | prefill / stability gate + drain-to-target |
-| FIFO (AAudio pipe) | ~40 ms (playback thread self-paced against the backend; stale backlog discarded on stall recovery / rebuild) | **341 ms** transient (64 KB @ 192 KB/s, only while a stall is active) | `kFifoSizeBytes` + playback pacing + pump drain-on-recovery |
+| FIFO (AAudio pipe) | ~40 ms (playback thread self-paced against the backend via `IAudioPlayer::needs_playback_pacing()`; stale backlog discarded on stall recovery / rebuild) | **341 ms** transient (64 KB @ 192 KB/s, only while a stall is active) | `kFifoSizeBytes` + playback pacing + pump drain-on-recovery |
 | PulseAudio | requested buffer target (`pulse@<ms>`, default ≈ 20 ms); reported live via `pa_simple_get_latency()` | the daemon's own scheduling (typically the sink's period) | `pa_buffer_attr` (`tlength`/`minreq`/`prebuf`, `maxlength` capped at 2× target) + `ADJUST_LATENCY` |
 | AAudio in-stream | ≤ 40 ms (capacity capped at 1920 frames on LOW_LATENCY); deep mode uses the HAL default | 40 ms | `setBufferCapacityInFrames` |
 | Termux:API ring buffer | `prefill (600 ms) + command latency` (~0.7 s socket protocol, ~1.6 s am broadcast) — the file ring pre-sizes each segment, so the player only needs the prefill before starting | + segment length after a player death until the next switch | prefill gate + issuer thread + latency EMA (§3.3.1) |
@@ -523,7 +523,9 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   - the daemon is **per-session**: closing Termux, or Android reclaiming the app,
     stops it, and the next run then reports `no PulseAudio daemon is reachable` and
     falls through to AAudio. Re-run `pulseaudio --start` (or add it to `~/.bashrc`);
-    `pactl info` says whether one is live. `open()` is gated on that check because
+    `pactl info` says whether one is live. A daemon killed by Android leaves its
+    socket file behind, so the client does not trust the inode: it makes a real
+    non-blocking `connect()` to it and treats a refused/stale socket as "no daemon". `open()` is gated on that check because
     `pa_simple_new()` does not reliably return an error when there is no daemon — it
     can block instead, which would otherwise burn the client's 3 s open budget and
     strand playback on the dummy sink with no error logged at all. The PulseAudio

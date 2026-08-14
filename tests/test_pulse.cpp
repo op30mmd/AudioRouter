@@ -5,7 +5,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <cstring>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #define TEST_ASSERT(cond) do { \
@@ -184,18 +187,38 @@ bool run_pulse_tests() {
         TEST_ASSERT(audiorouter::PulsePlayer::server_available());
         ::unsetenv("PULSE_SERVER");
 
-        // A socket owned by THIS user counts as available.
         const std::string sock_dir = std::string(dir) + "/pulse";
         ::mkdir(sock_dir.c_str(), 0755);
         const std::string sock = sock_dir + "/native";
+
+        // A plain FILE at the socket path must NOT count: only an actual
+        // AF_UNIX socket with something listening does.
         FILE* f = std::fopen(sock.c_str(), "w");
         TEST_ASSERT(f != nullptr);
         std::fclose(f);
-        // Only meaningful when not running the suite as root: as a normal user
-        // the socket is ours, so it must be reported as available.
+        TEST_ASSERT(!audiorouter::PulsePlayer::server_available());
+        ::unlink(sock.c_str());
+
+        // A real socket that is bound but has NO listener is what a daemon
+        // killed by Android leaves behind: connect() gets ECONNREFUSED, so it
+        // must not count as available either. (This is the case that made the
+        // client report "reachable" and then block in pa_simple_new().)
+        int sfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        TEST_ASSERT(sfd >= 0);
+        sockaddr_un sa{};
+        sa.sun_family = AF_UNIX;
+        std::memcpy(sa.sun_path, sock.c_str(), sock.size() + 1);
+        TEST_ASSERT(::bind(sfd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0);
+        if (::getuid() != 0) {
+            TEST_ASSERT(!audiorouter::PulsePlayer::server_available());
+        }
+
+        // Now actually listen: this is a live daemon and must be reported.
+        TEST_ASSERT(::listen(sfd, 1) == 0);
         if (::getuid() != 0) {
             TEST_ASSERT(audiorouter::PulsePlayer::server_available());
         }
+        ::close(sfd);
 
         ::unlink(sock.c_str());
         ::rmdir(sock_dir.c_str());

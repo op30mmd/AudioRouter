@@ -18,7 +18,11 @@
 #endif
 
 #if !defined(_WIN32)
+    #include <cerrno>
+    #include <poll.h>
+    #include <sys/socket.h>
     #include <sys/stat.h>
+    #include <sys/un.h>
     #include <unistd.h>
 #endif
 
@@ -185,6 +189,45 @@ bool path_exists(const std::string& path) {
     struct stat st{};
     return !path.empty() && ::stat(path.c_str(), &st) == 0;
 }
+
+// Is a PulseAudio daemon actually LISTENING on this AF_UNIX path?
+//
+// The mere existence of the socket inode proves nothing: a daemon that died
+// (or was killed by Android) leaves the file behind, and connecting to it
+// gets ECONNREFUSED. Worse, a half-alive daemon can accept the connection and
+// then never answer, which is what makes pa_simple_new() block. A real
+// non-blocking connect() answers both questions in microseconds.
+bool unix_socket_is_live(const std::string& path) {
+    if (path.empty() || path.size() >= sizeof(sockaddr_un::sun_path)) return false;
+
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) return false;
+    if (!S_ISSOCK(st.st_mode)) return false;   // pid files etc. are not sockets
+
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) return false;
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+
+    bool live = false;
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+        live = true;                    // connected straight away
+    } else if (errno == EINPROGRESS || errno == EAGAIN) {
+        // Non-blocking connect in flight: give it a brief, bounded moment.
+        struct pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        if (::poll(&pfd, 1, 200) > 0) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            live = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0;
+        }
+    }
+    ::close(fd);
+    return live;
+}
 #endif
 
 const char* env_or_empty(const char* name) {
@@ -260,6 +303,15 @@ bool PulsePlayer::server_available() {
                           << ", but this process is root; a per-user daemon will refuse it.");
                 continue;
             }
+        }
+        // The inode exists and is ours - but is anything actually listening?
+        // A daemon killed by Android leaves the socket file behind, and that
+        // stale inode is what made the client report "reachable" and then sit
+        // in a blocking pa_simple_new().
+        if (!unix_socket_is_live(c)) {
+            LOG_DEBUG("PulsePlayer: " << c << " exists but no daemon is listening on it "
+                      "(stale socket from a stopped daemon).");
+            continue;
         }
         return true;
     }
