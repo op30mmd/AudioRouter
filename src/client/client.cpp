@@ -26,6 +26,10 @@ namespace {
     // How long to wait for the ALSA/direct audio device to open before giving
     // up and falling back to the dummy sink.
     constexpr uint32_t kPlayerOpenTimeoutMs = 3000;
+    // Termux:API device opens probe the app via `am` (cold app processes can
+    // take seconds); its budget is deliberately larger so the dummy sink
+    // doesn't flash before the hot-swap.
+    constexpr uint32_t kTermuxPlayerOpenTimeoutMs = 8000;
     // A single open attempt that exceeds this is considered hung in a kernel
     // call and is abandoned (a new attempt is started on a fresh player).
     constexpr uint32_t kDeviceAttemptTimeoutMs = 20000;
@@ -502,7 +506,13 @@ bool AudioRouterClient::start() {
 
     // Open the audio player on a bounded, cancellable path: a hung ALSA /
     // kernel driver must never block the main thread or stall shutdown.
-    open_player_with_timeout(config_.device_name, kPlayerOpenTimeoutMs);
+    // The Termux:API backend needs a larger budget: its open() probes the
+    // app over `am broadcast`, which takes ~2-4 s when the app process is
+    // cold (the 3 s ALSA budget made it flash the dummy sink on device).
+    open_player_with_timeout(config_.device_name,
+                             is_termux_device(config_.device_name)
+                                 ? kTermuxPlayerOpenTimeoutMs
+                                 : kPlayerOpenTimeoutMs);
 
     LOG_INFO("AudioRouter Client connected and streaming directly to Android speakers!");
     return true;

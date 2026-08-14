@@ -494,6 +494,12 @@ MediaCommandOutcome send_am_socket_broadcast(const std::string& action,
         " broadcast --user 0 -n com.termux.api/.TermuxApiReceiver " +
         audiorouter::termux_api::build_command_line(action, file, in_name, out_name) +
         " 2>&1";
+    {
+        static std::once_flag once;
+        std::call_once(once, [&shell] {
+            LOG_DEBUG("TermuxApiPlayer: am command: " << shell);
+        });
+    }
 
     std::string am_stdout;
     int rc = -1;
@@ -532,6 +538,10 @@ MediaCommandOutcome send_am_socket_broadcast(const std::string& action,
     if (out.result_received) {
         out.result = result;
         out.duration_ms = audiorouter::get_time_ms() - t0;
+    } else if (!trim(am_stdout).empty()) {
+        // Keep am's chatter for diagnostics: the result socket stayed silent
+        // but am itself reported something (delivery info, or an error).
+        out.result = trim(am_stdout);
     }
     return out;
 #else
@@ -818,9 +828,11 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
                  "over the result socket - usually the client runs in a root-shell "
                  "context the app cannot connect to (SELinux). Playing blind via am "
                  "broadcast, fixed ~" << static_cast<uint32_t>(latency_est_ms_.load())
-                 << " ms command estimate. Diagnostics: su -c 'logcat -d -s "
-                 "ResultReturner TermuxApiReceiver'; running without -b (no su) avoids "
-                 "this entirely.");
+                 << " ms command estimate.");
+        LOG_INFO("TermuxApiPlayer: to test the app side manually, run in a second Termux "
+                 "session: termux-media-player info   (expect: No track currently!)");
+        LOG_INFO("TermuxApiPlayer: while streaming, check whether the app is actually "
+                 "playing:  su -c \"dumpsys media_session | grep -i -B2 -A8 termux\"");
     }
 
     issue_wall_ms_.store(0);
@@ -1114,14 +1126,15 @@ void TermuxApiPlayer::issuer_loop() {
                 ++consecutive_no_result_;
                 if (consecutive_no_result_ >= 2 && result_channel_.exchange(false)) {
                     LOG_WARN("TermuxApiPlayer: the app returned no result twice; switching "
-                             "to blind am broadcast. The app received the broadcasts but "
+                             "to blind am broadcast. The app receives the broadcasts but "
                              "cannot reach the client's result socket - usually a root-shell "
                              "SELinux context; run without -b (no su), or check: su -c "
                              "'logcat -d -s ResultReturner TermuxApiReceiver'");
                 } else if (result_channel_.load()) {
                     LOG_WARN("TermuxApiPlayer: play delivered but the app returned no "
-                             "result (" << consecutive_no_result_ << "); check: su -c "
-                             "'logcat -d -s ResultReturner TermuxApiReceiver'");
+                             "result (" << consecutive_no_result_ << ")"
+                             << (out.result.empty() ? std::string() : "; am: " + trim(out.result))
+                             << "; check: su -c 'logcat -d -s ResultReturner TermuxApiReceiver'");
                 } else {
                     LOG_DEBUG("TermuxApiPlayer: play delivered (blind mode)");
                 }
