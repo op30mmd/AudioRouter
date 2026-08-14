@@ -20,8 +20,6 @@
 #if !defined(_WIN32)
     #include <cerrno>
     #include <dirent.h>
-    #include <poll.h>
-    #include <sys/socket.h>
     #include <sys/stat.h>
     #include <sys/un.h>
     #include <unistd.h>
@@ -191,43 +189,27 @@ bool path_exists(const std::string& path) {
     return !path.empty() && ::stat(path.c_str(), &st) == 0;
 }
 
-// Is a PulseAudio daemon actually LISTENING on this AF_UNIX path?
+// Is this path plausibly a PulseAudio daemon socket?
 //
-// The mere existence of the socket inode proves nothing: a daemon that died
-// (or was killed by Android) leaves the file behind, and connecting to it
-// gets ECONNREFUSED. Worse, a half-alive daemon can accept the connection and
-// then never answer, which is what makes pa_simple_new() block. A real
-// non-blocking connect() answers both questions in microseconds.
+// Deliberately PASSIVE: stat() only, no connect().
+//
+// An earlier version connect()ed here to prove a daemon was listening. That
+// was actively harmful: every probe occupies a slot in the listening socket's
+// accept queue, and the slot is only released when the server accept()s it.
+// Closing our end does not return it. Once the queue is full, further
+// connect() attempts to an AF_UNIX socket fail with ECONNREFUSED - so the
+// probe poisoned the very connection it was meant to validate, and libpulse
+// was refused on a daemon that was running fine. (Observed on device: both
+// candidate sockets "live" per the probe, both then refused by
+// pa_simple_new(), repeatedly.)
+//
+// pa_simple_new() is the only honest test - it completes the protocol
+// handshake - so candidates are now offered to it in order and it decides.
 bool unix_socket_is_live(const std::string& path) {
     if (path.empty() || path.size() >= sizeof(sockaddr_un::sun_path)) return false;
-
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0) return false;
-    if (!S_ISSOCK(st.st_mode)) return false;   // pid files etc. are not sockets
-
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-    if (fd < 0) return false;
-
-    sockaddr_un addr{};
-    addr.sun_family = AF_UNIX;
-    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
-
-    bool live = false;
-    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
-        live = true;                    // connected straight away
-    } else if (errno == EINPROGRESS || errno == EAGAIN) {
-        // Non-blocking connect in flight: give it a brief, bounded moment.
-        struct pollfd pfd{};
-        pfd.fd = fd;
-        pfd.events = POLLOUT;
-        if (::poll(&pfd, 1, 200) > 0) {
-            int err = 0;
-            socklen_t len = sizeof(err);
-            live = ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0;
-        }
-    }
-    ::close(fd);
-    return live;
+    return S_ISSOCK(st.st_mode);
 }
 #endif
 
@@ -279,9 +261,11 @@ std::vector<std::string> PulsePlayer::resolve_server_addresses() {
     // which we cannot validate here, so it is taken at face value.
     //
     // The one case we CAN check is a unix: path: if the environment names a
-    // socket that no daemon is listening on (a stale export left over from an
-    // earlier session), honouring it blindly would mask the daemon that is
-    // actually running. Fall through to discovery in that case.
+    // path that is not even a socket (a stale export left over from an earlier
+    // session), honouring it blindly would mask the daemon that is actually
+    // running. Fall through to discovery in that case. Note we cannot tell
+    // whether a real socket has a live daemon behind it without completing the
+    // protocol handshake - that is pa_simple_new()'s job, not ours.
     {
         const std::string env_server = env_or_empty("PULSE_SERVER");
         if (!env_server.empty()) {
@@ -295,7 +279,7 @@ std::vector<std::string> PulsePlayer::resolve_server_addresses() {
                 return {env_server};
             }
             LOG_WARN("PulsePlayer: PULSE_SERVER points at '" << env_server
-                     << "' but no daemon is listening there; ignoring it and looking for "
+                     << "' but that path is not a socket; ignoring it and looking for "
                      "the running daemon instead.");
         }
     }
@@ -408,11 +392,10 @@ std::vector<std::string> live;
         // stale inode is what made the client report "reachable" and then sit
         // in a blocking pa_simple_new().
         if (!unix_socket_is_live(c)) {
-            LOG_DEBUG("PulsePlayer: " << c << " exists but no daemon is listening on it "
-                      "(stale socket from a stopped daemon).");
+            LOG_DEBUG("PulsePlayer: " << c << " exists but is not a socket; skipping.");
             continue;
         }
-        LOG_DEBUG("PulsePlayer: live daemon socket found at " << c);
+        LOG_DEBUG("PulsePlayer: candidate daemon socket at " << c);
         // Hand libpulse this exact socket rather than letting it search: its
         // own lookup does not know about Termux's
         // $HOME/.config/pulse/<machine-id>-runtime layout, so it would refuse
@@ -423,11 +406,11 @@ std::vector<std::string> live;
         }
     }
     if (!live.empty()) return live;
-    LOG_DEBUG("PulsePlayer: no live daemon socket among " << candidates.size()
+    LOG_DEBUG("PulsePlayer: no daemon socket among " << candidates.size()
               << " candidate path(s):");
     for (const auto& c : candidates) {
         LOG_DEBUG("PulsePlayer:   tried " << c
-                  << (path_exists(c) ? " (exists, not listening)" : " (absent)"));
+                  << (path_exists(c) ? " (exists, not a socket)" : " (absent)"));
     }
     return {};
 #endif

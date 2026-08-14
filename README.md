@@ -542,9 +542,14 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     (see termux-packages#27978). Closing Termux or Android reclaiming the app also
     stops it, after which the client reports `no PulseAudio daemon is reachable` and
     falls through to AAudio;
-    `pactl info` says whether one is live. A daemon killed by Android leaves its
-    socket file behind, so the client does not trust the inode: it makes a real
-    non-blocking `connect()` to it and treats a refused/stale socket as "no daemon". `open()` is gated on that check because
+    `pactl info` says whether one is live. Candidate sockets are detected
+    passively (`stat` only) and then offered to `pa_simple_new()` in order, best
+    first — the client deliberately does **not** `connect()` to test them, because
+    a probe connection occupies a slot in the daemon's accept queue until the
+    daemon accepts it. Against a wedged daemon (listening but never accepting)
+    that filled the queue after a couple of probes and made every subsequent
+    connection fail with `Connection refused` — the probe breaking the very
+    connection it was checking. `open()` is gated on that check because
     `pa_simple_new()` does not reliably return an error when there is no daemon — it
     can block instead, which would otherwise burn the client's 3 s open budget and
     strand playback on the dummy sink with no error logged at all. The PulseAudio

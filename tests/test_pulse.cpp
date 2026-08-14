@@ -200,10 +200,18 @@ bool run_pulse_tests() {
         TEST_ASSERT(!audiorouter::PulsePlayer::server_available());
         ::unlink(sock.c_str());
 
-        // A real socket that is bound but has NO listener is what a daemon
-        // killed by Android leaves behind: connect() gets ECONNREFUSED, so it
-        // must not count as available either. (This is the case that made the
-        // client report "reachable" and then block in pa_simple_new().)
+        // A real AF_UNIX socket is offered as a candidate whether or not a
+        // daemon is currently listening on it.
+        //
+        // The probe is deliberately PASSIVE (stat only). An earlier version
+        // connect()ed here to prove liveness, which was actively harmful: each
+        // probe consumes a slot in the listening socket's accept queue, and the
+        // slot is only freed when the server accept()s it. Against a daemon
+        // that is wedged (listening, never accepting - what Android leaves
+        // behind) the queue filled after a couple of probes and every later
+        // connect got ECONNREFUSED, so the probe broke the connection it was
+        // validating. Only pa_simple_new() can honestly test a daemon, so
+        // candidates are offered to it in order and it decides.
         int sfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         TEST_ASSERT(sfd >= 0);
         sockaddr_un sa{};
@@ -211,13 +219,17 @@ bool run_pulse_tests() {
         std::memcpy(sa.sun_path, sock.c_str(), sock.size() + 1);
         TEST_ASSERT(::bind(sfd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0);
         if (::getuid() != 0) {
-            TEST_ASSERT(!audiorouter::PulsePlayer::server_available());
+            TEST_ASSERT(audiorouter::PulsePlayer::server_available());
         }
 
-        // Now actually listen: this is a live daemon and must be reported.
         TEST_ASSERT(::listen(sfd, 1) == 0);
         if (::getuid() != 0) {
             TEST_ASSERT(audiorouter::PulsePlayer::server_available());
+            // Repeated probing must not degrade: this is the regression guard
+            // for "worked once, then every later run failed".
+            for (int i = 0; i < 8; ++i) {
+                TEST_ASSERT(audiorouter::PulsePlayer::server_available());
+            }
         }
         ::close(sfd);
 
