@@ -16,6 +16,9 @@
 #include <chrono>
 #include <algorithm>
 #include <limits>
+#include <cerrno>
+#include <cstdlib>
+#include <grp.h>
 
 namespace audiorouter {
 
@@ -321,12 +324,6 @@ bool AudioRouterClient::start() {
                      "in-process, exactly like the standalone stream_daemon (which runs as "
                      "root and works). No privilege games needed.");
         }
-        if (is_termux_device(config_.device_name)) {
-            LOG_WARN("Termux:API requested while running as root: the API app reads the "
-                     "segment files from the Termux home and its socket protocol only accepts "
-                     "the Termux app user. Run without su for best results (termux_run.sh "
-                     "already launches -d termux as the current user).");
-        }
     } else {
         LOG_WARN("Not running as root. If ALSA device fails to open, run 'su' or 'sudo' in Termux.");
     }
@@ -430,6 +427,33 @@ bool AudioRouterClient::start() {
     }
 
     LOG_INFO("Target Server: " << server_addr_.to_string());
+
+    // Termux:API playback must run as the Termux app user: its listen-socket
+    // protocol only accepts that uid and com.termux.api reads the segment
+    // files from the Termux sandbox. The interface binding above (-b/--bind)
+    // needed root; now that the socket is pinned, drop to the Termux app
+    // user so the backend runs in-process with working sandbox access.
+    // AAudio also renders as that user; the root backends (AGM/ALSA/direct)
+    // are given up by the drop.
+    if (is_termux_device(config_.device_name) && AndroidHelpers::is_running_as_root()) {
+        uid_t termux_uid = 0;
+        gid_t termux_gid = 0;
+        std::string termux_home;
+        if (!AndroidHelpers::termux_user(&termux_uid, &termux_gid, &termux_home)) {
+            LOG_WARN("Termux:API backend: Termux app user not found; continuing as root "
+                     "(plain am broadcast path)");
+        } else if (::setgroups(0, nullptr) != 0 || ::setgid(termux_gid) != 0 ||
+                   ::setuid(termux_uid) != 0) {
+            LOG_WARN("Termux:API backend: could not drop to the Termux app user ("
+                     << std::strerror(errno) << "); continuing as root (plain am broadcast "
+                     "path)");
+        } else {
+            ::setenv("HOME", termux_home.c_str(), 1);
+            LOG_INFO("Termux:API backend: socket bound as root; dropped privileges to the "
+                     "Termux app user (uid " << termux_uid << ", gid " << termux_gid
+                     << ") so the Termux:API sandbox and socket protocol work");
+        }
+    }
 
     // Create Audio Player (ALSA or Dummy)
     {

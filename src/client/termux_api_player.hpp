@@ -51,7 +51,9 @@ std::string build_command_line(const std::string& action, const std::string& fil
 
 // Termux:API backend: plays the stream through Android's MediaPlayer via the
 // Termux:API app (the `termux-media-player` API). Needs NO root — just the
-// Termux:API app installed alongside Termux.
+// Termux:API app installed alongside Termux. When the client runs as root
+// (e.g. via su for -b/--bind), the client drops to the Termux app user after
+// the socket binding, so this player always runs with sandbox access.
 //
 // MediaPlayer cannot play a pipe or a growing file (it sizes its source at
 // prepare() time), so the stream is cut into short self-contained WAV

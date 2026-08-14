@@ -913,6 +913,16 @@ size_t TermuxApiPlayer::write_frames(const void* pcm_data, size_t num_frames) {
     }
     seg_frames_ += num_frames;
 
+    // Pace at real time: the segment file absorbs writes instantly, so
+    // without pacing the playback thread would drain the jitter buffer in a
+    // tight loop - PLC would stuff the segment with minutes of silence, the
+    // wall-clock gate would never fire, and get_buffer_delay_frames() would
+    // report an ever-growing backlog (the 'Audio:' status ran away to
+    // hundreds of seconds on-device). Sleeping the chunk duration records at
+    // exactly real-time rate, like DummyPlayer.
+    const uint64_t duration_us = (static_cast<uint64_t>(num_frames) * 1000000ULL) / rate;
+    if (duration_us > 0) sleep_us(static_cast<uint32_t>(duration_us));
+
     // Hand the segment to the media player once it holds enough audio AND
     // the wall clock agrees (gapless chaining; see termux_api::segment_ready).
     termux_api::SegmentClock clock{seg_start_wall_ms_, seg_frames_, rate};

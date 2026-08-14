@@ -223,7 +223,10 @@ gapless:
 - segment *N* is recorded from wall time `Rₙ` into `seg_<n>.wav` under the
   Termux home (readable by `com.termux.api`, which shares Termux's sandbox via
   `android:sharedUserId`); the header carries streaming sizes that are patched
-  to exact values before the file is handed over;
+  to exact values before the file is handed over. `write_frames()` paces
+  itself at real time (like `DummyPlayer`): the segment file absorbs writes
+  instantly, and without pacing the playback loop would drain the jitter
+  buffer through PLC and stuff the segment with minutes of silence;
 - its `play` command is issued once the segment holds
   `S − L − lead` of audio **and** the wall clock has advanced that far
   (`S` = segment length, `L` = measured player startup, `lead` = 100 ms). The
@@ -451,10 +454,11 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   - needs the **Termux:API app** (`com.termux.api`) installed — F-Droid → Termux:API.
     `--list-devices` probes it; `open()` fails fast into the fallback chain when the
     app does not answer;
-  - must run **as the Termux app user** (no `su`): the listen-socket protocol only
-    accepts the Termux uid and `com.termux.api` reads the segment files from the Termux
-    home. `termux_run.sh` already launches `-d termux` without su; as root the backend
-    degrades to plain `am broadcast` and logs a hint;
+  - must run **as the Termux app user**: the listen-socket protocol only accepts the
+    Termux uid and `com.termux.api` reads the segment files from the Termux home.
+    `termux_run.sh` launches `-d termux` as the current user; with `-b/--bind` (which
+    needs root) the client binds the socket as root and then drops to the Termux app
+    user in-process, so the sandbox and socket protocol keep working;
   - playback is ~the segment length behind the PC (`-d termux:1000` lowers it) and the
     volume is Android's media volume, not the call volume.
 - **`/dev/snd` nodes hang**: Android's `audioserver` usually holds them.

@@ -385,16 +385,16 @@ run_via_su() {
 if [ "$(id -u)" -ne 0 ]; then
     if { [ "$IS_AAUDIO" -eq 1 ] || [ "$IS_TERMUX" -eq 1 ]; } && [ "$HAS_BIND" -eq 1 ]; then
         # Root for the socket binding; AAudio runs in-process like the
-        # stream_daemon (which works as root). Termux:API via su is best
-        # effort: the API app still has to read the segment files and receive
-        # the broadcast (the socket protocol degrades to plain am broadcast).
+        # stream_daemon (which works as root). Termux:API binds the socket as
+        # root and then drops to the Termux app user inside the client, so
+        # the API sandbox and socket protocol keep working.
         if ! command -v su >/dev/null 2>&1; then
             echo "Error: '-b' needs root but 'su' is not available. Run 'su' first or install su." >&2
             exit 1
         fi
         if [ "$IS_TERMUX" -eq 1 ]; then
-            echo "Note: -d termux with -b runs via su; running as the current user (no -b)"
-            echo "is recommended for this backend."
+            echo "Note: -d termux with -b: the client binds the socket as root and then drops"
+            echo "to the Termux app user, so the Termux:API sandbox still works."
         fi
         echo "Requesting root privileges via su (for -b auto); the backend runs in-process..."
         run_via_su "$CMD"
