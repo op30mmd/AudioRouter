@@ -34,7 +34,19 @@ endif()
 # -DAUDIOROUTER_ENABLE_PULSEAUDIO=OFF.
 option(AUDIOROUTER_ENABLE_PULSEAUDIO "Build the PulseAudio playback backend (needs libpulse-simple)" ON)
 set(AUDIOROUTER_PULSE_FOUND OFF)
-if (AUDIOROUTER_ENABLE_PULSEAUDIO AND NOT WIN32)
+# Never probe when cross-compiling unless the caller points pkg-config at a
+# matching sysroot: a host x86_64 libpulse-simple.pc would otherwise be found
+# for an Android/aarch64 build and linked into a foreign-architecture binary.
+# (CI installs libpulse-dev for the host job, then cross-builds the Android
+# client in the same workspace.) Callers with a real cross sysroot can set
+# PKG_CONFIG_SYSROOT_DIR / PKG_CONFIG_LIBDIR and re-enable this explicitly
+# with -DAUDIOROUTER_PULSE_ALLOW_CROSS=ON.
+option(AUDIOROUTER_PULSE_ALLOW_CROSS "Probe for libpulse-simple even when cross-compiling" OFF)
+set(_audiorouter_pulse_cross_blocked OFF)
+if (CMAKE_CROSSCOMPILING AND NOT AUDIOROUTER_PULSE_ALLOW_CROSS)
+    set(_audiorouter_pulse_cross_blocked ON)
+endif()
+if (AUDIOROUTER_ENABLE_PULSEAUDIO AND NOT WIN32 AND NOT _audiorouter_pulse_cross_blocked)
     find_package(PkgConfig QUIET)
     if (PkgConfig_FOUND)
         pkg_check_modules(PULSE_SIMPLE QUIET libpulse-simple)
@@ -45,6 +57,9 @@ if (AUDIOROUTER_ENABLE_PULSEAUDIO AND NOT WIN32)
     else()
         message(STATUS "PulseAudio backend: disabled (libpulse-simple not found; install libpulse-dev)")
     endif()
+elseif (_audiorouter_pulse_cross_blocked)
+    message(STATUS "PulseAudio backend: disabled (cross-compiling; the host libpulse cannot be "
+                   "linked into a ${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR} binary)")
 endif()
 
 # Applies the detected PulseAudio flags to a target (no-op when not found).

@@ -87,9 +87,21 @@ ifeq ($(PULSEAUDIO),1)
     PULSE_CFLAGS := $(shell pkg-config --cflags libpulse-simple 2>/dev/null)
     PULSE_LIBS := $(shell pkg-config --libs libpulse-simple 2>/dev/null)
     ifneq ($(PULSE_LIBS),)
-        HAVE_PULSEAUDIO = 1
-        CXXFLAGS += -DPULSEAUDIO_ENABLED=1 $(PULSE_CFLAGS)
-        CLIENT_LIBS += $(PULSE_LIBS)
+        # pkg-config reports the HOST library. When $(CXX) is a cross compiler
+        # (aarch64/Android) that libpulse is the wrong architecture, so confirm
+        # it actually compiles AND links with this very compiler before
+        # enabling the backend - same approach as the libaaudio probe above.
+        # '#' cannot appear literally inside $(shell ...) (make treats it as a
+        # comment), so build it from its octal escape via printf.
+        PULSE_LINKABLE := $(shell printf '\043include <pulse/simple.h>\nint main(){ pa_simple_free(0); return 0; }\n' \
+            > /tmp/.ar_pulse_probe.cpp; \
+            $(CXX) /tmp/.ar_pulse_probe.cpp $(PULSE_CFLAGS) $(PULSE_LIBS) -o /dev/null 2>/dev/null \
+            && echo 1; rm -f /tmp/.ar_pulse_probe.cpp)
+        ifeq ($(PULSE_LINKABLE),1)
+            HAVE_PULSEAUDIO = 1
+            CXXFLAGS += -DPULSEAUDIO_ENABLED=1 $(PULSE_CFLAGS)
+            CLIENT_LIBS += $(PULSE_LIBS)
+        endif
     endif
 endif
 
