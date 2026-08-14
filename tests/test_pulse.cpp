@@ -230,6 +230,73 @@ bool run_pulse_tests() {
         if (!saved_home.empty()) ::setenv("HOME", saved_home.c_str(), 1);
     }
 
+    // ---- Termux runtime layout: $HOME/.config/pulse/<machine-id>-runtime ----
+    // Regression test for the on-device case where PulseAudio logged
+    // "Daemon already running" and used
+    //   $HOME/.config/pulse/<machine-id>-runtime/
+    // while the client reported "Connection refused": the probe only looked at
+    // $XDG_RUNTIME_DIR, /run/user/<uid>, $PREFIX/var/run and $HOME/.pulse, so a
+    // perfectly healthy Termux daemon was invisible.
+    {
+        char tmpl[] = "/tmp/ar_pulse_termux_XXXXXX";
+        const char* dir = ::mkdtemp(tmpl);
+        TEST_ASSERT(dir != nullptr);
+
+        const std::string saved_server = std::getenv("PULSE_SERVER") ? std::getenv("PULSE_SERVER") : "";
+        const std::string saved_xdg = std::getenv("XDG_RUNTIME_DIR") ? std::getenv("XDG_RUNTIME_DIR") : "";
+        const std::string saved_prefix = std::getenv("PREFIX") ? std::getenv("PREFIX") : "";
+        const std::string saved_home = std::getenv("HOME") ? std::getenv("HOME") : "";
+
+        ::unsetenv("PULSE_SERVER");
+        ::unsetenv("XDG_RUNTIME_DIR");
+        ::setenv("PREFIX", dir, 1);          // deliberately empty: not where it lives
+        ::setenv("HOME", dir, 1);
+
+        const std::string machine_id = "4f375f94d8461d71272adacf6a2426d5";
+        const std::string pulse_dir = std::string(dir) + "/.config/pulse";
+        const std::string rt_dir = pulse_dir + "/" + machine_id + "-runtime";
+        ::mkdir((std::string(dir) + "/.config").c_str(), 0755);
+        ::mkdir(pulse_dir.c_str(), 0755);
+        ::mkdir(rt_dir.c_str(), 0755);
+
+        // Nothing listening yet -> not available.
+        TEST_ASSERT(!audiorouter::PulsePlayer::server_available());
+
+        const std::string sock = rt_dir + "/native";
+        int sfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        TEST_ASSERT(sfd >= 0);
+        sockaddr_un sa{};
+        sa.sun_family = AF_UNIX;
+        std::memcpy(sa.sun_path, sock.c_str(), sock.size() + 1);
+        TEST_ASSERT(::bind(sfd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0);
+        TEST_ASSERT(::listen(sfd, 1) == 0);
+
+        // A live daemon in the Termux runtime dir must be found, both by
+        // globbing for *-runtime and via the machine-id file.
+        if (::getuid() != 0) {
+            TEST_ASSERT(audiorouter::PulsePlayer::server_available());
+
+            FILE* mf = std::fopen((pulse_dir + "/machine-id").c_str(), "w");
+            TEST_ASSERT(mf != nullptr);
+            std::fputs((machine_id + "\n").c_str(), mf);
+            std::fclose(mf);
+            TEST_ASSERT(audiorouter::PulsePlayer::server_available());
+            ::unlink((pulse_dir + "/machine-id").c_str());
+        }
+
+        ::close(sfd);
+        ::unlink(sock.c_str());
+        ::rmdir(rt_dir.c_str());
+        ::rmdir(pulse_dir.c_str());
+        ::rmdir((std::string(dir) + "/.config").c_str());
+        ::rmdir(dir);
+
+        if (!saved_server.empty()) ::setenv("PULSE_SERVER", saved_server.c_str(), 1);
+        if (!saved_xdg.empty()) ::setenv("XDG_RUNTIME_DIR", saved_xdg.c_str(), 1);
+        if (!saved_prefix.empty()) ::setenv("PREFIX", saved_prefix.c_str(), 1); else ::unsetenv("PREFIX");
+        if (!saved_home.empty()) ::setenv("HOME", saved_home.c_str(), 1);
+    }
+
     // ---- open() must fail fast when no daemon is reachable ----
     // Regression test for the on-device report where `-d pulse` with a dead
     // daemon produced NO error at all: open() went straight into

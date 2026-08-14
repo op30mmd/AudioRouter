@@ -535,13 +535,17 @@ bool AudioRouterClient::start() {
                      << std::strerror(errno) << "); continuing as root");
         } else {
             ::setenv("HOME", termux_home.c_str(), 1);
-            // libpulse locates the daemon through XDG_RUNTIME_DIR / HOME; both
-            // still point at root's view until they are rewritten here.
+            // libpulse locates the daemon through XDG_RUNTIME_DIR / HOME, which
+            // still describe root's view until rewritten here.
+            //
+            // Do NOT invent an XDG_RUNTIME_DIR: Termux's PulseAudio keeps its
+            // runtime dir under $HOME/.config/pulse/<machine-id>-runtime, not
+            // in $PREFIX/var/run. Pointing XDG_RUNTIME_DIR at the latter made
+            // libpulse look in an empty directory and miss a daemon that was
+            // running perfectly well. Clearing it lets libpulse fall back to
+            // its HOME-based lookup, which is what the Termux daemon uses.
             if (pulse_needs_drop) {
-                const char* prefix = std::getenv("PREFIX");
-                if (prefix != nullptr && prefix[0] != '\0') {
-                    ::setenv("XDG_RUNTIME_DIR", (std::string(prefix) + "/var/run").c_str(), 1);
-                }
+                ::unsetenv("XDG_RUNTIME_DIR");
             }
             LOG_INFO(backend_label << ": socket bound as root; dropped privileges to the "
                      "Termux app user (uid " << termux_uid << ", gid " << termux_gid

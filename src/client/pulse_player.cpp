@@ -19,6 +19,7 @@
 
 #if !defined(_WIN32)
     #include <cerrno>
+    #include <dirent.h>
     #include <poll.h>
     #include <sys/socket.h>
     #include <sys/stat.h>
@@ -284,6 +285,44 @@ bool PulsePlayer::server_available() {
     if (!home.empty()) {
         candidates.push_back(home + "/.pulse/native");
         candidates.push_back(home + "/.config/pulse/native");
+        // Termux's PulseAudio has no /run/user tree, so it puts its runtime
+        // directory under the state directory, keyed by machine ID:
+        //   $HOME/.config/pulse/<machine-id>-runtime/native
+        // The machine ID is not knowable up front, so read it when available
+        // and also glob for any *-runtime directory (a stale ID can linger
+        // after a reinstall; the liveness check below sorts out which is real).
+        for (const std::string& base : {home + "/.config/pulse", home + "/.pulse"}) {
+            std::string machine_id;
+            for (const std::string& id_file : {base + "/machine-id",
+                                               std::string("/etc/machine-id")}) {
+                if (FILE* f = std::fopen(id_file.c_str(), "r")) {
+                    char buf[64] = {0};
+                    if (std::fgets(buf, sizeof(buf), f) != nullptr) {
+                        machine_id = buf;
+                        while (!machine_id.empty() &&
+                               (machine_id.back() == '\n' || machine_id.back() == '\r' ||
+                                machine_id.back() == ' ')) {
+                            machine_id.pop_back();
+                        }
+                    }
+                    std::fclose(f);
+                    if (!machine_id.empty()) break;
+                }
+            }
+            if (!machine_id.empty()) {
+                candidates.push_back(base + "/" + machine_id + "-runtime/native");
+            }
+            if (DIR* d = ::opendir(base.c_str())) {
+                while (const dirent* e = ::readdir(d)) {
+                    const std::string name = e->d_name;
+                    if (name.size() > 8 &&
+                        name.compare(name.size() - 8, 8, "-runtime") == 0) {
+                        candidates.push_back(base + "/" + name + "/native");
+                    }
+                }
+                ::closedir(d);
+            }
+        }
     }
 
     for (const auto& c : candidates) {

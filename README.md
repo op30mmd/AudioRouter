@@ -520,6 +520,13 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     "not compiled in this build" means the library was missing when the binary was
     built; "no PulseAudio daemon found" means nothing is listening (`pulseaudio
     --start`, or point `PULSE_SERVER` at a remote/TCP daemon);
+  - Termux's daemon does not use `/run/user`: its runtime directory is
+    `$HOME/.config/pulse/<machine-id>-runtime/native`. The client discovers that
+    (via the `machine-id` file and by globbing `*-runtime`) in addition to
+    `PULSE_SERVER`, `$XDG_RUNTIME_DIR`, `/run/user/<uid>`, `$PREFIX/var/run` and
+    `$HOME/.pulse`. When it drops privileges for `-b/--bind` it also *clears* any
+    inherited `XDG_RUNTIME_DIR` rather than guessing one, so libpulse falls back to
+    that HOME-based lookup;
   - the daemon is **per-session**, and on Termux a bare `pulseaudio --start` is
     usually not enough: it exits after 20 s idle (nothing is connected yet) and it
     needs an explicit Android output sink. Start it as the normal Termux user with
