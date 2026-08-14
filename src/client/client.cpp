@@ -31,6 +31,12 @@ namespace {
     // take seconds); its budget is deliberately larger so the dummy sink
     // doesn't flash before the hot-swap.
     constexpr uint32_t kTermuxPlayerOpenTimeoutMs = 8000;
+    // PulseAudio gets the same generous budget: resuming a suspended sink
+    // re-opens the Android HAL stream and can take seconds. With the 3 s
+    // default the client flashed the dummy sink (and the ALSA troubleshooting
+    // wall) on every run that started more than 5 s after the previous one,
+    // even though the connect then succeeded moments later.
+    constexpr uint32_t kPulsePlayerOpenTimeoutMs = pulse::kPlayerOpenTimeoutMs;
     // A single open attempt that exceeds this is considered hung in a kernel
     // call and is abandoned (a new attempt is started on a fresh player).
     constexpr uint32_t kDeviceAttemptTimeoutMs = 20000;
@@ -57,11 +63,18 @@ namespace {
     // ...but libpulse does not always honour that. With no daemon running,
     // pa_simple_new() can BLOCK (name resolution, autospawn) instead of
     // returning an error, which used to hold this strategy for the full
-    // kDeviceAttemptTimeoutMs (20 s) - far past the caller's 3 s open budget,
-    // so playback was stranded on the dummy sink and the chain never reached
-    // AAudio. Bound the PulseAudio attempt tightly: a local daemon that has
-    // not answered in this long is not going to.
-    constexpr uint32_t kPulseAttemptTimeoutMs = 1500;
+    // kDeviceAttemptTimeoutMs (20 s) - far past the caller's open budget, so
+    // playback was stranded on the dummy sink and the chain never reached
+    // AAudio.
+    //
+    // The cap must still be generous enough for a legitimate slow connect.
+    // PulseAudio's module-suspend-on-idle suspends a sink after 5 s of
+    // silence, and resuming it re-opens the Android HAL stream - measured at
+    // ~2.5 s on device. A 1500 ms cap turned that into a spurious "hung in a
+    // kernel call", so any run starting more than 5 s after the previous one
+    // fell back to AAudio while the PulseAudio connect completed moments
+    // later and had to be discarded.
+    constexpr uint32_t kPulseAttemptTimeoutMs = pulse::kOpenAttemptTimeoutMs;
 
     // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
     // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
@@ -625,6 +638,8 @@ bool AudioRouterClient::start() {
     open_player_with_timeout(config_.device_name,
                              is_termux_device(config_.device_name)
                                  ? kTermuxPlayerOpenTimeoutMs
+                             : is_pulse_device(config_.device_name)
+                                 ? kPulsePlayerOpenTimeoutMs
                                  : kPlayerOpenTimeoutMs);
 
     LOG_INFO("AudioRouter Client connected and streaming directly to Android speakers!");

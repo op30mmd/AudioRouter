@@ -59,6 +59,14 @@ BufferAttr compute_buffer_attr(uint32_t sample_rate, size_t bytes_per_frame,
 inline constexpr uint32_t kMinLatencyMs = 10;
 inline constexpr uint32_t kMaxLatencyMs = 500;
 
+// How long a single pa_simple_new() attempt may take before the client
+// abandons it, and how long the caller waits before falling back to the dummy
+// sink. Both must comfortably exceed an Android HAL resume (~2.5 s measured
+// when module-suspend-on-idle has suspended the sink), and the caller's budget
+// must be >= the attempt cap. See tests/test_pulse.cpp.
+inline constexpr uint32_t kOpenAttemptTimeoutMs = 8000;
+inline constexpr uint32_t kPlayerOpenTimeoutMs = 9000;
+
 } // namespace pulse
 
 // PulseAudio playback backend.

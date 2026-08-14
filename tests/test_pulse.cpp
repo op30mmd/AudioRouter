@@ -391,7 +391,21 @@ bool run_pulse_tests() {
         if (!saved_home.empty()) ::setenv("HOME", saved_home.c_str(), 1);
     }
 
-    std::cout << "  [pulse] device parsing, buffer sizing, daemon probe, fail-fast open"
-              << " and closed-player contract OK\n";
+    // ---- the PulseAudio open budget must survive a suspended-sink resume ----
+    // Regression guard for a fix that was written but never actually committed:
+    // the constants stayed at their old values while the commit message claimed
+    // otherwise, so the device kept failing. PulseAudio's
+    // module-suspend-on-idle sleeps a sink after ~5 s, and resuming it re-opens
+    // the Android HAL stream (~2.5 s measured). Both the per-attempt cap and the
+    // caller's budget must exceed that with margin, and the caller's budget must
+    // be the larger of the two or it gives up while an attempt is still running.
+    {
+        TEST_ASSERT(audiorouter::pulse::kOpenAttemptTimeoutMs >= 4000);
+        TEST_ASSERT(audiorouter::pulse::kPlayerOpenTimeoutMs >=
+                    audiorouter::pulse::kOpenAttemptTimeoutMs);
+    }
+
+    std::cout << "  [pulse] device parsing, buffer sizing, daemon probe, fail-fast open,"
+              << " open budget and closed-player contract OK\n";
     return true;
 }
