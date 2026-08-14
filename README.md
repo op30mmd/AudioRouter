@@ -472,12 +472,15 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   - needs the **Termux:API app** (`com.termux.api`) installed — F-Droid → Termux:API.
     `--list-devices` probes it; `open()` fails fast into the fallback chain when the
     app does not answer;
-  - must run **as the Termux app user**: the listen-socket protocol only accepts the
-    Termux uid and `com.termux.api` reads the segment files from the Termux home.
-    `termux_run.sh` launches `-d termux` as the current user; with `-b/--bind` (which
-    needs root) the client binds the socket as root, pre-labels the segment pool, and
-    then drops to the Termux app user in-process, so the sandbox and socket protocol
-    keep working;
+  - runs **as the Termux app user**: the app only accepts its own uid and reads the
+    segment files from the Termux home. `termux_run.sh` launches `-d termux` without
+    su by default — this is the recommended mode;
+  - with `-b/--bind` (which needs root) the client binds the socket as root,
+    pre-labels the segment pool and captures the app's SELinux context, then drops
+    to the Termux app user in-process — its result sockets carry the app's own
+    context so the confined app can reply. If the log still reports `the app
+    returned no result`, the root domain is being denied anyway: run without
+    `-b` (no su), or check `su -c 'logcat -d -s ResultReturner TermuxApiReceiver'`;
   - on **Android 14+** the app's listen socket freezes, so commands go through
     `am broadcast` with the client's result sockets — still fully confirmed by the
     app, just slower (the startup log prints the measured command latency; playback

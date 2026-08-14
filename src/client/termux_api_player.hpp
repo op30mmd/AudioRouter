@@ -90,11 +90,15 @@ std::string build_command_line(const std::string& action, const std::string& fil
 // `am broadcast` carrying the client's own result-socket extras — the app
 // then writes its result (after prepare()+start()) to the client's socket,
 // which is exactly how the official termux-api binary works on Android 14+
-// where the app's own listen socket freezes. A lightweight watchdog resumes
-// a paused player; every scheduled segment boundary re-issues `play`
+// where the app's own listen socket freezes. When the client runs in a
+// root-shell SELinux domain (su + setuid), its result sockets are labeled
+// with the Termux app's own context (captured as root before the privilege
+// drop) so the confined app can connect to them. A lightweight watchdog
+// resumes a paused player; every scheduled segment boundary re-issues `play`
 // regardless, so the stream self-heals from a dead player at the next
-// boundary. Apps too old to answer over the result sockets run in a blind
-// fallback mode (delivery only, fixed latency estimate, logcat advised).
+// boundary. Only when the app still cannot answer over the result sockets
+// does the player run in a blind fallback mode (delivery only, fixed
+// latency estimate, logcat advised).
 //
 // Device naming (select with -d):
 //   termux            -> 2 s segments (default: ~2 s delay, no root)

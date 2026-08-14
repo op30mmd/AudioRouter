@@ -12,6 +12,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -158,9 +159,101 @@ socklen_t abstract_addr(struct sockaddr_un* addr, const std::string& name) {
     return static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + 1 + name.size());
 }
 
+// The Termux app's SELinux context, captured (as root) by
+// prepare_cache_as_root() and loaded by the player at open(). When this
+// client runs in a root-shell domain (su), the confined app cannot connect
+// to sockets created there; labeling our listener sockets with the app's own
+// context fixes that. Empty = no labeling (plain app-user run: our sockets
+// already carry the right domain).
+std::string g_sockcreate_context;
+
+// Creates a unix socket, optionally labeled with g_sockcreate_context via
+// setsockcreatecon_raw (libselinux). Falls back to a plain socket when the
+// labeling is unavailable or the current domain may not create such sockets.
+int create_listener_socket() {
+    static int (*setsockcreatecon_raw)(const char*) = []() -> int (*)(const char*) {
+        void* h = ::dlopen("libselinux.so", RTLD_NOW);
+        if (h == nullptr) h = ::dlopen("/system/lib64/libselinux.so", RTLD_NOW);
+        if (h == nullptr) return nullptr;
+        auto* fn = reinterpret_cast<int (*)(const char*)>(
+            ::dlsym(h, "setsockcreatecon_raw"));
+        if (fn == nullptr) {
+            fn = reinterpret_cast<int (*)(const char*)>(::dlsym(h, "setsockcreatecon"));
+        }
+        return fn;
+    }();
+
+    if (!g_sockcreate_context.empty() && setsockcreatecon_raw != nullptr &&
+        setsockcreatecon_raw(g_sockcreate_context.c_str()) == 0) {
+        const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        setsockcreatecon_raw(nullptr);
+        if (fd >= 0) return fd;
+        // The domain may not be allowed to create sockets with that context
+        // (EACCES); fall through to a plain socket.
+    }
+    return ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+}
+
+// Reads the context file written by prepare_cache_as_root().
+std::string load_app_context(const std::string& dir) {
+    const std::string path = dir + "/app_context";
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return "";
+    char buf[256];
+    const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    if (n <= 0) return "";
+    buf[n] = '\0';
+    std::string ctx(buf);
+    while (!ctx.empty() && (ctx.back() == '\n' || ctx.back() == '\r')) ctx.pop_back();
+    return ctx;
+}
+
+// Finds the runtime SELinux context of a process running as app_uid (the
+// Termux app user), e.g. u:r:untrusted_app:s0:c512,c768. Requires root to
+// read /proc/<pid>/attr/current of another domain.
+std::string find_app_context(uid_t app_uid) {
+    DIR* dir = ::opendir("/proc");
+    if (dir == nullptr) return "";
+    std::string ctx;
+    struct dirent* e;
+    while ((e = ::readdir(dir)) != nullptr) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        const std::string base = std::string("/proc/") + e->d_name;
+        bool uid_match = false;
+        if (FILE* f = ::fopen((base + "/status").c_str(), "r")) {
+            char line[256];
+            while (::fgets(line, sizeof(line), f) != nullptr) {
+                if (std::strncmp(line, "Uid:", 4) == 0) {
+                    uid_match = (static_cast<unsigned long>(app_uid) ==
+                                 std::strtoul(line + 4, nullptr, 10));
+                    break;
+                }
+            }
+            ::fclose(f);
+        }
+        if (!uid_match) continue;
+        const int fd = ::open((base + "/attr/current").c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        char buf[256];
+        const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+        ::close(fd);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+        std::string c(buf);
+        while (!c.empty() && (c.back() == '\n' || c.back() == '\r')) c.pop_back();
+        if (!c.empty()) {
+            ctx = c;
+            break;
+        }
+    }
+    ::closedir(dir);
+    return ctx;
+}
+
 int make_abstract_listener(const std::string& name) {
     if (name.empty() || name.size() + 1 >= sizeof(sockaddr_un::sun_path)) return -1;
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const int fd = create_listener_socket();
     if (fd < 0) return -1;
     struct sockaddr_un addr;
     const socklen_t len = abstract_addr(&addr, name);
@@ -664,16 +757,28 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
     cleanup_stale_segments();
     if (!ensure_pool()) return false;
 
+    // Result sockets must carry the app's SELinux context when this client
+    // runs in a root-shell domain (captured by prepare_cache_as_root()
+    // before the privilege drop). Plain app-user runs have it naturally.
+    g_sockcreate_context = load_app_context(cache_dir_);
+    if (!g_sockcreate_context.empty()) {
+        LOG_DEBUG("TermuxApiPlayer: result sockets will be labeled with the app's "
+                  "SELinux context (" << g_sockcreate_context << ")");
+    }
+
     // Warm the API app process (and start its socket listener) before the
-    // probe: a cold com.termux.api takes hundreds of ms to come up, which
-    // would otherwise cost us the first segment. Skipped as root — the app's
+    // probe: a cold com.termux.api takes hundreds of ms to come up. Runs
+    // detached - its `am startservice` can take seconds and must not blow
+    // the client's 3 s device-open budget. Skipped as root — the app's
     // broadcast permission only accepts the Termux uid, so a root client
     // will fail the probe and the open supervisor falls back anyway.
     if (geteuid() != 0) {
-        std::lock_guard<std::mutex> lock(AndroidHelpers::subprocess_mutex());
-        (void)::system((find_am() +
-                        " startservice -n com.termux.api/.KeepAliveService 2>/dev/null")
-                           .c_str());
+        std::thread([] {
+            std::lock_guard<std::mutex> lock(AndroidHelpers::subprocess_mutex());
+            (void)::system((find_am() +
+                            " startservice -n com.termux.api/.KeepAliveService 2>/dev/null")
+                               .c_str());
+        }).detach();
     }
 
     // Preflight: the Termux:API app must answer a media_player command. The
@@ -701,17 +806,21 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
                  << (socket_path_ ? "listen socket" : "am broadcast + result sockets")
                  << "; app status: " << trim(probe.result));
     } else {
-        // Older Termux:API app: it processes the broadcasts but ignores the
-        // result sockets. Blind mode: delivery only, fixed latency estimate,
-        // no watchdog. Check 'logcat -s MediaPlayerAPI' for app-side errors.
+        // The app received the broadcast but could not write its result back
+        // to the client's result socket. This is the signature of the client
+        // running in a root-shell SELinux domain the confined app may not
+        // connect to (setuid does not change the domain). Blind mode:
+        // delivery only, fixed latency estimate, no watchdog.
         latency_est_ms_.store(std::clamp(static_cast<double>(probe.duration_ms) +
                                              kBlindSeedBiasMs,
                                          kMinLatencyMs, kMaxLatencyMs));
-        LOG_INFO("TermuxApiPlayer: the app returned no result over the result sockets "
-                 "(older Termux:API app?); playing blind via am broadcast, fixed ~"
-                 << static_cast<uint32_t>(latency_est_ms_.load()) << " ms command estimate. "
-                 "Install the current Termux:API from F-Droid for status reporting and "
-                 "watchdog recovery.");
+        LOG_WARN("TermuxApiPlayer: the app received the probe but returned no result "
+                 "over the result socket - usually the client runs in a root-shell "
+                 "context the app cannot connect to (SELinux). Playing blind via am "
+                 "broadcast, fixed ~" << static_cast<uint32_t>(latency_est_ms_.load())
+                 << " ms command estimate. Diagnostics: su -c 'logcat -d -s "
+                 "ResultReturner TermuxApiReceiver'; running without -b (no su) avoids "
+                 "this entirely.");
     }
 
     issue_wall_ms_.store(0);
@@ -737,9 +846,9 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
     }
     LOG_INFO("TermuxApiPlayer: Termux:API media player ready (" << segment_ms_
              << " ms segments, "
-             << (socket_path_ ? "socket protocol"
-                              : (result_channel_.load() ? "am + result sockets"
-                                                        : "blind am broadcast"))
+             << (result_channel_.load() ? (socket_path_ ? "socket protocol"
+                                                        : "am + result sockets")
+                                        : "blind am broadcast")
              << ", cache " << cache_dir_ << ")");
     return true;
 #else
@@ -781,6 +890,20 @@ void TermuxApiPlayer::prepare_cache_as_root() {
             const std::string p = dir + "/seg_p" + std::to_string(i) + ".wav";
             ::chown(p.c_str(), uid, gid);
             ::chmod(p.c_str(), 0666);
+        }
+        // Capture the app's SELinux domain while we can still read it (the
+        // dropped client labels its result sockets with it so the confined
+        // app can connect to them - see create_listener_socket()).
+        const std::string ctx = find_app_context(uid);
+        if (!ctx.empty()) {
+            const std::string p = dir + "/app_context";
+            const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                (void)::write(fd, ctx.data(), ctx.size());
+                ::close(fd);
+            }
+            ::chown(p.c_str(), uid, gid);
+            ::chmod(p.c_str(), 0644);
         }
     }
 #endif
@@ -991,12 +1114,16 @@ void TermuxApiPlayer::issuer_loop() {
                 ++consecutive_no_result_;
                 if (consecutive_no_result_ >= 2 && result_channel_.exchange(false)) {
                     LOG_WARN("TermuxApiPlayer: the app returned no result twice; switching "
-                             "to blind am broadcast (older Termux:API app?). Installing the "
-                             "current Termux:API from F-Droid restores status reporting.");
-                } else {
+                             "to blind am broadcast. The app received the broadcasts but "
+                             "cannot reach the client's result socket - usually a root-shell "
+                             "SELinux context; run without -b (no su), or check: su -c "
+                             "'logcat -d -s ResultReturner TermuxApiReceiver'");
+                } else if (result_channel_.load()) {
                     LOG_WARN("TermuxApiPlayer: play delivered but the app returned no "
-                             "result (" << consecutive_no_result_ << "); check 'logcat -s "
-                             "MediaPlayerAPI' for app-side errors");
+                             "result (" << consecutive_no_result_ << "); check: su -c "
+                             "'logcat -d -s ResultReturner TermuxApiReceiver'");
+                } else {
+                    LOG_DEBUG("TermuxApiPlayer: play delivered (blind mode)");
                 }
             }
         } else {
