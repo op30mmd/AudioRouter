@@ -19,11 +19,19 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#if defined(__ANDROID__) && defined(__BIONIC__)
+#include <sys/system_properties.h>
+#endif
+
 namespace {
 
 // Floor for the issue target (S - L - lead); a too-short segment can make
 // MediaPlayer's prepare() fail. Also used by the host-compiled pure helpers.
 constexpr double kMinSegmentContentMs = 200.0;
+// The issue cadence must stay this far above the command latency so the
+// single issuer thread finishes each play before the next one is due (this
+// is what keeps playback continuous when commands are slow).
+constexpr double kIssueMarginMs = 200.0;
 
 } // namespace
 
@@ -44,29 +52,33 @@ constexpr uint32_t kMaxSegmentMs = 10000;
 // tail of the outgoing segment (a tiny forward skip) instead of opening a
 // silence gap on every boundary.
 constexpr uint32_t kIssueLeadMs = 100;
-// Startup-latency EMA state.
+// Startup-latency EMA state. The upper bound must comfortably exceed the
+// am-broadcast latency on a frozen app, otherwise the issuer cannot keep up.
 constexpr double kInitialLatencyMs = 300.0;
 constexpr double kMinLatencyMs = 60.0;
-constexpr double kMaxLatencyMs = 1500.0;
+constexpr double kMaxLatencyMs = 4000.0;
 // The plain `am broadcast` path cannot observe prepare()+start() (its
 // pclose() returns when the receiver hands the command to the player
 // service), so the measured round trip underestimates the real startup by
 // roughly the service handling time. Compensate with a fixed bias.
 constexpr double kAmFallbackLatencyBiasMs = 150.0;
-// The watchdog restarts playback only when the open segment already holds at
-// least this much audio (shorter WAVs can fail prepare()).
-constexpr uint32_t kMinPlayableMs = 250;
+
+// Segment file pool: a small fixed set of inodes created (and, as root,
+// SELinux-labeled) before streaming starts, then recycled with O_TRUNC so
+// the labels survive the privilege drop and the app can always read them.
+// 8 x 2 s = 16 s of reuse distance - the app finished reading long before a
+// slot is reused.
+constexpr int kPoolSize = 8;
 
 // termux-api socket protocol timeouts (ms).
-constexpr int kSocketConnectTimeoutMs = 800;
-constexpr int kSocketAckTimeoutMs = 2000;
+constexpr int kSocketConnectTimeoutMs = 400;
+constexpr int kSocketAckTimeoutMs = 800;
 constexpr int kInfoTimeoutMs = 1500;
 constexpr int kPlayTimeoutMs = 5000;   // accepts cold app-process starts
 constexpr int kProbeTimeoutMs = 1500;
 
-// Watchdog cadence and recovery rate limit.
+// Watchdog cadence.
 constexpr uint32_t kWatchdogPollMs = 1000;
-constexpr uint64_t kMinRecoverIntervalMs = 3000;
 
 // Abstract unix socket the Termux:API app listens on (termux-api.c).
 constexpr const char* kApiListenAddress = "com.termux.api://listen";
@@ -79,6 +91,19 @@ std::string trim(std::string s) {
     size_t e = s.size();
     while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\n' || s[e - 1] == '\r')) --e;
     return s.substr(b, e - b);
+}
+
+int android_sdk_int() {
+#if defined(__ANDROID__) && defined(__BIONIC__)
+    char buf[PROP_VALUE_MAX];
+    if (__system_property_get("ro.build.version.sdk", buf) > 0) {
+        const int v = std::atoi(buf);
+        if (v > 0) return v;
+    }
+    return 0;
+#else
+    return 0;
+#endif
 }
 
 bool write_all(int fd, const void* buf, size_t len) {
@@ -331,15 +356,24 @@ bool send_am_broadcast(const std::string& action, const std::string& file,
 
 // Preferred command path with result text: socket protocol first, plain am
 // broadcast fallback (only when the socket path could not reach the app at
-// all). Also records which path succeeded. result_complete (optional)
-// reports whether the command duration observed by the caller is a full
-// prepare()+start() measurement (socket path with the result read back, or
-// the am fallback's pclose) — a lost socket result must not be used as a
-// latency sample.
+// all). On Android 14+ (API 34+) the socket is skipped entirely: the system
+// can freeze the API app's process, whose listen socket then accepts
+// connections but never answers (the official termux-api binary skips the
+// socket there for the same reason). Also records which path succeeded.
+// result_complete (optional) reports whether the command duration observed
+// by the caller is a full prepare()+start() measurement (socket path with
+// the result read back, or the am fallback's pclose) — a lost socket result
+// must not be used as a latency sample.
 bool send_media_command(std::atomic<bool>* socket_protocol, const std::string& action,
                         const std::string& file, std::string* result_out, int accept_timeout_ms,
                         bool* result_complete = nullptr) {
 #if defined(__ANDROID__)
+    if (android_sdk_int() >= 34) {
+        socket_protocol->store(false);
+        const bool ok = send_am_broadcast(action, file, result_out);
+        if (result_complete != nullptr) *result_complete = ok;
+        return ok;
+    }
     std::string result;
     bool complete = false;
     const SocketCommandResult sr =
@@ -447,6 +481,10 @@ bool segment_ready(const SegmentClock& clock, uint64_t now_ms, uint32_t segment_
     const uint32_t rate = clock.sample_rate > 0 ? clock.sample_rate : 48000;
     double target_ms = static_cast<double>(segment_ms) - latency_est_ms -
                        static_cast<double>(issue_lead_ms);
+    // The issue cadence must be slower than the command latency so the
+    // single issuer thread keeps up (continuous playback); see the header.
+    const double sustain_ms = latency_est_ms + kIssueMarginMs;
+    if (sustain_ms > target_ms) target_ms = sustain_ms;
     if (target_ms < kMinSegmentContentMs) target_ms = kMinSegmentContentMs;
 
     const double content_ms =
@@ -488,10 +526,12 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
     if (config_.channels == 0) config_.channels = 2;
 
     segment_ms_ = kDefaultSegmentMs;
+    segment_explicit_ = false;
     device_name_ = device_name.empty() ? "termux" : device_name;
     if (device_name_.rfind("termux:", 0) == 0) {
         const std::string rest = device_name_.substr(7);
         if (!rest.empty()) {
+            segment_explicit_ = true;
             try {
                 const long ms = std::stol(rest);
                 const long clamped = std::clamp(ms, static_cast<long>(kMinSegmentMs),
@@ -509,12 +549,20 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
         }
     }
 
+    // Pure-root case (the client's privilege drop did not happen): label and
+    // own the cache now, while we still can.
+    if (AndroidHelpers::is_running_as_root()) {
+        prepare_cache_as_root();
+    }
     if (!resolve_cache_dir()) return false;
     cleanup_stale_segments();
+    if (!ensure_pool()) return false;
 
     // Warm the API app process (and start its socket listener) before the
     // probe: a cold com.termux.api takes hundreds of ms to come up, which
-    // would otherwise cost us the first segment. Best effort.
+    // would otherwise cost us the first segment. Skipped as root — the app's
+    // broadcast permission only accepts the Termux uid, so a root client
+    // will fail the probe and the open supervisor falls back anyway.
     if (geteuid() != 0) {
         std::lock_guard<std::mutex> lock(AndroidHelpers::subprocess_mutex());
         (void)::system((find_am() +
@@ -522,7 +570,10 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
                            .c_str());
     }
 
-    // Preflight: the Termux:API app must answer a media_player command.
+    // Preflight: the Termux:API app must answer a media_player command. The
+    // probe duration seeds the latency EMA (an am-broadcast probe to a cold
+    // app measures almost the real command cost).
+    const uint64_t probe_t0 = get_time_ms();
     std::string probe;
     socket_protocol_.store(false);
     if (!send_media_command(&socket_protocol_, "info", "", &probe, kProbeTimeoutMs)) {
@@ -532,27 +583,50 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
                   "termux-media-player API), then retry with -d termux");
         return false;
     }
+    const uint64_t probe_ms = get_time_ms() - probe_t0;
     if (!probe.empty()) LOG_DEBUG("TermuxApiPlayer: probe result: " << probe);
 
-    latency_est_ms_ = kInitialLatencyMs;
-    issue_wall_ms_ = 0;
-    issued_frames_ = 0;
-    issued_path_prev_.clear();
+    am_only_ = !socket_protocol_.load();
+    if (am_only_) {
+        // am broadcast gives no synchronous play results; seed the EMA from
+        // the probe so the very first segment is scheduled correctly.
+        latency_est_ms_.store(std::clamp(static_cast<double>(probe_ms) + kAmFallbackLatencyBiasMs,
+                                         kMinLatencyMs, kMaxLatencyMs));
+        LOG_INFO("TermuxApiPlayer: Termux:API listen socket unavailable; playing via am "
+                 "broadcast" << (android_sdk_int() >= 34
+                                     ? " (Android 14+: the app's socket stalls while its process is frozen)"
+                                     : ""));
+        LOG_INFO("TermuxApiPlayer: am broadcast commands take ~" << static_cast<uint32_t>(
+                     latency_est_ms_.load()) << " ms here; segments are stretched to keep "
+                 "playback continuous, so expect ~2x that in end-to-end delay");
+    } else {
+        latency_est_ms_.store(kInitialLatencyMs);
+    }
+
+    issue_wall_ms_.store(0);
+    issued_frames_.store(0);
+    first_play_done_.store(false);
+    drops_ = 0;
+    last_drop_warn_ms_ = 0;
     seg_fd_ = -1;
     seg_path_.clear();
     seg_frames_ = 0;
     seg_index_ = 0;
     seg_start_wall_ms_ = 0;
-    last_recover_ms_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(handoff_mutex_);
+        pending_.valid = false;
+    }
 
     is_open_.store(true);
+    stop_issuer_.store(false);
+    issuer_thread_ = std::thread(&TermuxApiPlayer::issuer_loop, this);
     stop_watchdog_.store(false);
-    // Always spawn the watchdog: it only acts while the socket protocol is
-    // available, and it (re)discovers that protocol on its own if the app's
-    // listener came up after open().
-    watchdog_thread_ = std::thread(&TermuxApiPlayer::watchdog_loop, this);
+    if (!am_only_) {
+        watchdog_thread_ = std::thread(&TermuxApiPlayer::watchdog_loop, this);
+    }
     LOG_INFO("TermuxApiPlayer: Termux:API media player ready (" << segment_ms_
-             << " ms segments, " << (socket_protocol_.load() ? "socket protocol" : "am broadcast")
+             << " ms segments, " << (am_only_ ? "am broadcast" : "socket protocol")
              << ", cache " << cache_dir_ << ")");
     return true;
 #else
@@ -563,11 +637,46 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
 #endif
 }
 
+void TermuxApiPlayer::prepare_cache_as_root() {
+#if defined(__ANDROID__)
+    if (!AndroidHelpers::is_running_as_root()) return;
+    std::string termux_home;
+    if (!AndroidHelpers::termux_user(nullptr, nullptr, &termux_home)) return;
+    const std::string dir = termux_home + "/.audiorouter";
+    (void)::mkdir(dir.c_str(), 0777);
+    ::chmod(dir.c_str(), 0777);
+
+    // Create the segment pool and label it with the app-data SELinux context
+    // while we still have root: after the privilege drop new inodes cannot be
+    // relabeled, and com.termux.api can only read app_data_file files.
+    for (int i = 0; i < kPoolSize; ++i) {
+        const std::string p = dir + "/seg_p" + std::to_string(i) + ".wav";
+        const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT, 0666);
+        if (fd >= 0) ::close(fd);
+    }
+    {
+        std::lock_guard<std::mutex> lock(AndroidHelpers::subprocess_mutex());
+        (void)::system(("restorecon -RF " + dir + " 2>/dev/null").c_str());
+    }
+    // Hand the directory and pool to the Termux app user so the dropped
+    // client can open the files for writing.
+    uid_t uid = 0;
+    gid_t gid = 0;
+    if (AndroidHelpers::termux_user(&uid, &gid, nullptr)) {
+        ::chown(dir.c_str(), uid, gid);
+        for (int i = 0; i < kPoolSize; ++i) {
+            const std::string p = dir + "/seg_p" + std::to_string(i) + ".wav";
+            ::chown(p.c_str(), uid, gid);
+            ::chmod(p.c_str(), 0666);
+        }
+    }
+#endif
+}
+
 bool TermuxApiPlayer::resolve_cache_dir() {
 #if defined(__ANDROID__)
     std::string base;
-    const bool root = (geteuid() == 0);
-    if (!root) {
+    if (geteuid() != 0) {
         const char* home = std::getenv("HOME");
         if (home != nullptr && home[0] != '\0' && std::strcmp(home, "/") != 0) {
             base = home;
@@ -579,8 +688,6 @@ bool TermuxApiPlayer::resolve_cache_dir() {
                        : "/data/data/com.termux/files/home";
         }
     } else {
-        // Root: still prefer the Termux home — com.termux.api can only read
-        // files inside the shared Termux sandbox.
         std::string termux_home;
         if (AndroidHelpers::termux_user(nullptr, nullptr, &termux_home)) base = termux_home;
     }
@@ -598,16 +705,6 @@ bool TermuxApiPlayer::resolve_cache_dir() {
         return false;
     }
     ::chmod(cache_dir_.c_str(), 0777);
-    if (root) {
-        // Best effort: give the directory the app-data SELinux label so the
-        // API app can read root-created files. Running as the Termux user is
-        // the supported path for this backend (see termux_run.sh).
-        std::lock_guard<std::mutex> lock(AndroidHelpers::subprocess_mutex());
-        (void)::system(("restorecon -RF " + cache_dir_ + " 2>/dev/null").c_str());
-        LOG_WARN("TermuxApiPlayer: running as root — segments are written to " << cache_dir_
-                 << "; the Termux:API app must be able to read them. Running as the Termux "
-                    "app user (no su) is recommended for -d termux.");
-    }
     return true;
 #else
     return false;
@@ -620,32 +717,50 @@ void TermuxApiPlayer::cleanup_stale_segments() {
     struct dirent* entry;
     while ((entry = ::readdir(dir)) != nullptr) {
         const std::string name = entry->d_name;
-        if (name.rfind("seg_", 0) != 0) continue;
+        // Old naming (seg_<n>.wav) leftovers only — the recycled pool files
+        // (seg_p<n>.wav) must stay, their labels survive the privilege drop.
+        if (name.rfind("seg_", 0) != 0 || name.rfind("seg_p", 0) == 0) continue;
         if (name.size() < 4 || name.compare(name.size() - 4, 4, ".wav") != 0) continue;
         ::unlink((cache_dir_ + "/" + name).c_str());
     }
     ::closedir(dir);
 }
 
-bool TermuxApiPlayer::ensure_segment_locked() {
-    if (seg_fd_ >= 0) return true;
-    return open_next_segment_locked();
+bool TermuxApiPlayer::ensure_pool() {
+#if defined(__ANDROID__)
+    for (int i = 0; i < kPoolSize; ++i) {
+        const std::string p = cache_dir_ + "/seg_p" + std::to_string(i) + ".wav";
+        if (::access(p.c_str(), W_OK) == 0) continue;
+        const int fd = ::open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0) {
+            LOG_ERROR("TermuxApiPlayer: cannot create pool file " << p << ": "
+                      << std::strerror(errno));
+            return false;
+        }
+        ::close(fd);
+    }
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool TermuxApiPlayer::open_next_segment_locked() {
+#if defined(__ANDROID__)
     if (seg_fd_ >= 0) {
         ::close(seg_fd_);
         seg_fd_ = -1;
     }
     ++seg_index_;
-    seg_path_ = cache_dir_ + "/seg_" + std::to_string(seg_index_) + ".wav";
+    // Recycle pool inodes (O_TRUNC): the SELinux label of the file was fixed
+    // when the pool was created, so the app keeps read access regardless of
+    // the domain of this process.
+    seg_path_ = cache_dir_ + "/seg_p" + std::to_string(seg_index_ % kPoolSize) + ".wav";
     seg_fd_ = ::open(seg_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (seg_fd_ < 0) {
-        LOG_ERROR("TermuxApiPlayer: cannot create " << seg_path_ << ": " << std::strerror(errno));
+        LOG_ERROR("TermuxApiPlayer: cannot open " << seg_path_ << ": " << std::strerror(errno));
         return false;
     }
-    // The Termux:API app reads the file under its own uid (shared user id
-    // with Termux), so keep the mode bits permissive.
     ::fchmod(seg_fd_, 0666);
 
     const bool is_float = config_.format == AudioSampleFormat::PCM_FLOAT32LE;
@@ -658,13 +773,15 @@ bool TermuxApiPlayer::open_next_segment_locked() {
                   << std::strerror(errno));
         ::close(seg_fd_);
         seg_fd_ = -1;
-        ::unlink(seg_path_.c_str());
         seg_path_.clear();
         return false;
     }
     seg_frames_ = 0;
     seg_start_wall_ms_ = get_time_ms();
     return true;
+#else
+    return false;
+#endif
 }
 
 void TermuxApiPlayer::discard_segment_locked() {
@@ -672,16 +789,14 @@ void TermuxApiPlayer::discard_segment_locked() {
         ::close(seg_fd_);
         seg_fd_ = -1;
     }
-    if (!seg_path_.empty()) {
-        ::unlink(seg_path_.c_str());
-        seg_path_.clear();
-    }
+    seg_path_.clear();
     seg_frames_ = 0;
     seg_start_wall_ms_ = get_time_ms();  // re-anchor at live audio
 }
 
-void TermuxApiPlayer::issue_segment_locked() {
+void TermuxApiPlayer::finalize_segment_locked() {
 #if defined(__ANDROID__)
+    if (seg_fd_ < 0) return;
     // Patch exact sizes: MediaPlayer's duration comes from the header, and
     // the track then ends exactly at the segment's EOF.
     const size_t bytes_per_frame =
@@ -697,52 +812,112 @@ void TermuxApiPlayer::issue_segment_locked() {
 
     const std::string path = seg_path_;
     const size_t frames = seg_frames_;
+    const uint64_t idx = seg_index_;
+    ::close(seg_fd_);
+    seg_fd_ = -1;
 
-    const uint64_t t0 = get_time_ms();
-    std::string result;
-    bool result_complete = false;
-    const bool ok = send_media_command(&socket_protocol_, "play", path, &result, kPlayTimeoutMs,
-                                       &result_complete);
-    const uint64_t elapsed = get_time_ms() - t0;
-
-    if (ok) {
-        // EMA on the measured startup: the socket protocol's result arrives
-        // only after prepare()+start(), so this includes MediaPlayer's real
-        // startup (cold app processes included); the am fallback gets a
-        // fixed bias instead. A lost result (accept timeout) is not a valid
-        // sample - keep the previous estimate.
-        if (result_complete) {
-            const double bias = socket_protocol_.load() ? 0.0 : kAmFallbackLatencyBiasMs;
-            const double sample = static_cast<double>(elapsed) + bias;
-            latency_est_ms_ = std::clamp(latency_est_ms_ * 0.65 + sample * 0.35,
-                                         kMinLatencyMs, kMaxLatencyMs);
-        } else {
-            LOG_DEBUG("TermuxApiPlayer: play result lost; keeping the previous latency "
-                      "estimate");
+    // Hand off to the issuer thread (never inline: a slow play command must
+    // not stall the jitter-buffer pops on this thread).
+    bool replaced = false;
+    {
+        std::lock_guard<std::mutex> hlock(handoff_mutex_);
+        if (pending_.valid) {
+            // The issuer is still executing the previous play: the pending
+            // segment was never heard; replace it with this fresher one.
+            replaced = true;
         }
-        issue_wall_ms_ = get_time_ms();
-        issued_frames_ = frames;
-        // The player service closed the outgoing track's file when it reset
-        // the player for this play, so its segment file can go now.
-        if (!issued_path_prev_.empty()) {
-            ::unlink(issued_path_prev_.c_str());
-            issued_path_prev_.clear();
-        }
-        issued_path_prev_ = path;
-        if (!result.empty()) {
-            LOG_DEBUG("TermuxApiPlayer: media player: " << trim(result) << " (startup "
-                     << elapsed << " ms)");
-        }
-        open_next_segment_locked();
-        return;
+        pending_ = PendingSegment{path, frames, idx, true};
     }
+    handoff_cv_.notify_one();
+    if (replaced) {
+        ++drops_;
+        const uint64_t now_ms = get_time_ms();
+        if (now_ms - last_drop_warn_ms_ >= 5000) {
+            last_drop_warn_ms_ = now_ms;
+            LOG_WARN("TermuxApiPlayer: media player commands are slower than the segment "
+                     "length; dropping ready segments to stay at live audio (" << drops_
+                     << " dropped so far; -d termux:<larger ms> avoids this)");
+        }
+    }
+    open_next_segment_locked();
+#endif
+}
 
-    LOG_WARN("TermuxApiPlayer: play command failed after " << elapsed << " ms"
-             << (result.empty() ? std::string() : ": " + trim(result)));
-    // The segment's audio has never been heard: discard it and resume at
-    // live audio (the same stale-audio policy as the FIFO backends). The
-    // next boundary retries with a fresh segment.
-    discard_segment_locked();
+void TermuxApiPlayer::issuer_loop() {
+#if defined(__ANDROID__)
+    while (true) {
+        PendingSegment job;
+        {
+            std::unique_lock<std::mutex> lock(handoff_mutex_);
+            handoff_cv_.wait(lock, [this] { return stop_issuer_.load() || pending_.valid; });
+            if (stop_issuer_.load()) break;  // shutdown: drop whatever is pending
+            job = pending_;
+            pending_.valid = false;
+        }
+
+        // This is the only place that talks to the Termux:API app; blocking
+        // here is fine — the recording engine and the jitter buffer keep
+        // running on their own threads.
+        const uint64_t t0 = get_time_ms();
+        std::string result;
+        bool complete = false;
+        const bool ok = send_media_command(&socket_protocol_, "play", job.path, &result,
+                                           kPlayTimeoutMs, &complete);
+        const uint64_t elapsed = get_time_ms() - t0;
+
+        if (ok) {
+            if (complete) {
+                const double bias = socket_protocol_.load() ? 0.0 : kAmFallbackLatencyBiasMs;
+                const double sample = static_cast<double>(elapsed) + bias;
+                const double prev = latency_est_ms_.load();
+                latency_est_ms_.store(std::clamp(prev * 0.65 + sample * 0.35, kMinLatencyMs,
+                                                 kMaxLatencyMs));
+            } else {
+                LOG_DEBUG("TermuxApiPlayer: play result lost; keeping the previous latency "
+                          "estimate");
+            }
+            issue_wall_ms_.store(get_time_ms());
+            issued_frames_.store(job.frames);
+            LOG_INFO("TermuxApiPlayer: media player: " << trim(result) << " (command "
+                     << elapsed << " ms)");
+            if (!first_play_done_.exchange(true) && !socket_protocol_.load()) {
+                verify_first_play();
+            }
+        } else {
+            LOG_WARN("TermuxApiPlayer: play command failed after " << elapsed << " ms"
+                     << (result.empty() ? std::string() : ": " + trim(result)));
+            // Keep the issued bookkeeping as-is: a previously playing
+            // segment runs to its EOF, and the next ready segment restarts
+            // playback at live audio.
+        }
+    }
+#endif
+}
+
+void TermuxApiPlayer::verify_first_play() {
+#if defined(__ANDROID__)
+    // am broadcast gives no result text for the play; ask the app for its
+    // status once prepare()+start() had time to finish. Runs detached (uses
+    // no player state) so the slow `am` call cannot delay the next segment's
+    // play command.
+    std::thread([] {
+        sleep_ms(800);
+        std::string status;
+        if (!send_am_broadcast("info", "", &status)) {
+            LOG_WARN("TermuxApiPlayer: cannot query the media player status (am broadcast "
+                     "failed)");
+            return;
+        }
+        LOG_INFO("TermuxApiPlayer: player status: " << trim(status));
+        if (status.find("No track") != std::string::npos) {
+            LOG_ERROR("TermuxApiPlayer: the Termux:API app did not report a playing track — "
+                      "the segment files may be unreadable by com.termux.api, or MediaPlayer "
+                      "failed to prepare them. Check 'logcat -s MediaPlayerAPI' for the "
+                      "app's error.");
+        }
+    }).detach();
+#else
+    (void)0;
 #endif
 }
 
@@ -751,65 +926,22 @@ void TermuxApiPlayer::watchdog_loop() {
     while (!stop_watchdog_.load()) {
         sleep_ms(kWatchdogPollMs);
         if (stop_watchdog_.load() || !is_open_.load()) break;
+        if (am_only_) continue;               // status invisible without the socket protocol
+        if (issued_frames_.load() == 0) continue;
 
-        // Peek at the player state. This also (re)discovers the socket
-        // protocol when the app's listener only came up after open().
         std::string info;
         if (try_socket_command("info", "", &info, kInfoTimeoutMs) !=
             SocketCommandResult::Executed) {
-            continue;  // socket path unavailable: nothing actionable without results
+            continue;
         }
         socket_protocol_.store(true);
-
-        const bool paused = info.find("Paused") != std::string::npos;
-        const bool no_track = info.find("No track") != std::string::npos;
-        if (!paused && !no_track) continue;
-
-        std::lock_guard<std::mutex> lock(io_mutex_);
-        if (!is_open_.load() || stop_watchdog_.load()) break;
-        if (issued_frames_ == 0) continue;  // nothing was handed to the player yet
-
-        // Re-query under the lock so the decision uses fresh state (a play
-        // issued concurrently could have made the peek above stale).
-        std::string fresh;
-        if (try_socket_command("info", "", &fresh, kInfoTimeoutMs) !=
+        if (info.find("Paused") == std::string::npos) continue;
+        LOG_WARN("TermuxApiPlayer: media player paused (audio focus?); resuming");
+        std::string result;
+        if (try_socket_command("resume", "", &result, kInfoTimeoutMs) !=
             SocketCommandResult::Executed) {
-            continue;
+            LOG_WARN("TermuxApiPlayer: resume command did not reach the app");
         }
-        const bool fresh_paused = fresh.find("Paused") != std::string::npos;
-        const bool fresh_no_track = fresh.find("No track") != std::string::npos;
-
-        if (fresh_paused) {
-            LOG_WARN("TermuxApiPlayer: media player paused (audio focus?); resuming");
-            std::string result;
-            if (try_socket_command("resume", "", &result, kInfoTimeoutMs) !=
-                SocketCommandResult::Executed) {
-                LOG_WARN("TermuxApiPlayer: resume command did not reach the app");
-            }
-            continue;
-        }
-        if (!fresh_no_track) continue;
-
-        // The player died mid-segment (app killed, error, ...). Restart at
-        // live audio from the open segment, rate-limited.
-        const uint64_t now_ms = get_time_ms();
-        if (now_ms - last_recover_ms_ < kMinRecoverIntervalMs) continue;
-        last_recover_ms_ = now_ms;
-
-        const uint32_t rate = config_.sample_rate;
-        const size_t min_frames = static_cast<size_t>(kMinPlayableMs) * rate / 1000;
-        if (seg_fd_ < 0 || seg_frames_ < min_frames) {
-            // Nothing buffered (stalled network): clear the issued
-            // bookkeeping so the normal boundary restarts playback.
-            issue_wall_ms_ = 0;
-            issued_frames_ = 0;
-            continue;
-        }
-        LOG_WARN("TermuxApiPlayer: media player stopped mid-stream; restarting playback at "
-                 "live audio");
-        recovering_.store(true);
-        issue_segment_locked();
-        recovering_.store(false);
     }
 #endif
 }
@@ -818,13 +950,16 @@ void TermuxApiPlayer::close() {
 #if defined(__ANDROID__)
     stop_watchdog_.store(true);
     if (watchdog_thread_.joinable()) watchdog_thread_.join();
+    stop_issuer_.store(true);
+    handoff_cv_.notify_all();
+    if (issuer_thread_.joinable()) issuer_thread_.join();
 
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (!is_open_.exchange(false)) return;
 
     // Politely stop whatever is playing (fire-and-forget am; the track would
     // also end by itself at the segment EOF).
-    if (issued_frames_ > 0) {
+    if (issued_frames_.load() > 0) {
         std::string ignored;
         (void)send_am_broadcast("stop", "", &ignored);
     }
@@ -832,17 +967,14 @@ void TermuxApiPlayer::close() {
         ::close(seg_fd_);
         seg_fd_ = -1;
     }
-    if (!seg_path_.empty()) {
-        ::unlink(seg_path_.c_str());
-        seg_path_.clear();
-    }
-    if (!issued_path_prev_.empty()) {
-        ::unlink(issued_path_prev_.c_str());
-        issued_path_prev_.clear();
-    }
+    seg_path_.clear();
     seg_frames_ = 0;
-    issued_frames_ = 0;
-    issue_wall_ms_ = 0;
+    issued_frames_.store(0);
+    issue_wall_ms_.store(0);
+    {
+        std::lock_guard<std::mutex> hlock(handoff_mutex_);
+        pending_.valid = false;
+    }
     LOG_INFO("TermuxApiPlayer: Termux:API playback stopped");
 #else
     is_open_.store(false);
@@ -876,7 +1008,6 @@ size_t TermuxApiPlayer::write_frames(const void* pcm_data, size_t num_frames) {
 #if defined(__ANDROID__)
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (!is_open_.load()) return 0;
-    if (recovering_.load()) return 0;  // watchdog restart in progress: the jitter buffer absorbs
 
     const uint32_t rate = config_.sample_rate;
     const size_t in_bytes_per_frame = config_.bytes_per_frame();
@@ -895,7 +1026,7 @@ size_t TermuxApiPlayer::write_frames(const void* pcm_data, size_t num_frames) {
             ? in_bytes_per_frame
             : 2 * static_cast<size_t>(config_.channels);
 
-    if (!ensure_segment_locked()) return 0;
+    if (seg_fd_ < 0 && !open_next_segment_locked()) return 0;
 
     const size_t total_bytes = num_frames * bytes_per_frame;
     size_t written = 0;
@@ -923,12 +1054,12 @@ size_t TermuxApiPlayer::write_frames(const void* pcm_data, size_t num_frames) {
     const uint64_t duration_us = (static_cast<uint64_t>(num_frames) * 1000000ULL) / rate;
     if (duration_us > 0) sleep_us(static_cast<uint32_t>(duration_us));
 
-    // Hand the segment to the media player once it holds enough audio AND
-    // the wall clock agrees (gapless chaining; see termux_api::segment_ready).
+    // Hand the segment to the issuer once it holds enough audio AND the wall
+    // clock agrees (gapless chaining; see termux_api::segment_ready).
     termux_api::SegmentClock clock{seg_start_wall_ms_, seg_frames_, rate};
-    if (termux_api::segment_ready(clock, get_time_ms(), segment_ms_, latency_est_ms_,
+    if (termux_api::segment_ready(clock, get_time_ms(), segment_ms_, latency_est_ms_.load(),
                                   kIssueLeadMs)) {
-        issue_segment_locked();
+        finalize_segment_locked();
     }
     return num_frames;
 #else
@@ -943,28 +1074,36 @@ size_t TermuxApiPlayer::get_buffer_delay_frames() const {
     std::lock_guard<std::mutex> lock(io_mutex_);
     const uint32_t rate = config_.sample_rate > 0 ? config_.sample_rate : 48000;
 
-    // Frames recorded into the open (not yet handed over) segment.
+    // Frames recorded into the open (not yet finalized) segment.
     const size_t unissued = seg_frames_;
+    // A finalized segment still waiting for its play command.
+    size_t pending_frames = 0;
+    {
+        std::lock_guard<std::mutex> hlock(handoff_mutex_);
+        if (pending_.valid) pending_frames = pending_.frames;
+    }
 
     // Remainder of the issued segment that has not been heard yet, estimated
     // from the wall clock (MediaPlayer plays at real time from issue+start).
+    const double lat = latency_est_ms_.load();
+    const size_t issued = issued_frames_.load();
+    const uint64_t issue_wall = issue_wall_ms_.load();
     size_t issued_remaining = 0;
-    if (issued_frames_ > 0 && issue_wall_ms_ > 0) {
+    if (issued > 0 && issue_wall > 0) {
         const uint64_t now_ms = get_time_ms();
-        if (now_ms > issue_wall_ms_) {
-            const double played_ms =
-                static_cast<double>(now_ms - issue_wall_ms_) - latency_est_ms_;
+        if (now_ms > issue_wall) {
+            const double played_ms = static_cast<double>(now_ms - issue_wall) - lat;
             if (played_ms > 0) {
                 const size_t played = static_cast<size_t>(played_ms * rate / 1000.0);
-                issued_remaining = played < issued_frames_ ? issued_frames_ - played : 0;
+                issued_remaining = played < issued ? issued - played : 0;
             } else {
-                issued_remaining = issued_frames_;
+                issued_remaining = issued;
             }
         }
     }
     // MediaPlayer's own buffered lookahead (~ its startup latency).
-    const size_t in_player = static_cast<size_t>(latency_est_ms_ * rate / 1000.0);
-    return unissued + issued_remaining + in_player;
+    const size_t in_player = static_cast<size_t>(lat * rate / 1000.0);
+    return unissued + pending_frames + issued_remaining + in_player;
 }
 
 void TermuxApiPlayer::flush() {
@@ -976,6 +1115,10 @@ void TermuxApiPlayer::flush() {
     if (seg_frames_ > 0) {
         discard_segment_locked();
         LOG_INFO("TermuxApiPlayer: discarded buffered segment audio (resync to live)");
+    }
+    {
+        std::lock_guard<std::mutex> hlock(handoff_mutex_);
+        pending_.valid = false;
     }
 }
 

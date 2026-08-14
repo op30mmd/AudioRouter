@@ -436,6 +436,11 @@ bool AudioRouterClient::start() {
     // AAudio also renders as that user; the root backends (AGM/ALSA/direct)
     // are given up by the drop.
     if (is_termux_device(config_.device_name) && AndroidHelpers::is_running_as_root()) {
+        // Pre-create the segment cache — including the SELinux labels the
+        // Termux:API app needs to read it — while we still have root: after
+        // setuid() the process cannot relabel files, and the player only
+        // recycles these pre-labeled pool inodes.
+        TermuxApiPlayer::prepare_cache_as_root();
         uid_t termux_uid = 0;
         gid_t termux_gid = 0;
         std::string termux_home;

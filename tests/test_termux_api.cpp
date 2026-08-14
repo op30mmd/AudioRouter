@@ -93,13 +93,25 @@ bool run_termux_api_tests() {
         SegmentClock bigger_lat{1000, kTargetFrames - 10 * 480, kRate};  // 400 ms less
         TEST_ASSERT(segment_ready(bigger_lat, 1000 + 1600, kSegMs, kLat + 400.0, kLead));
 
-        // The target never drops below the 200 ms floor (huge latency
-        // estimates / tiny segments must not produce unplayable 0-byte
-        // segments), but it also never fires below that floor.
+        // The target never drops below the 200 ms floor (tiny segments /
+        // zero latency must not produce unplayable 0-byte segments), but it
+        // also never fires below that floor.
         SegmentClock floor_met{1000, 200 * kRate / 1000, kRate};
-        TEST_ASSERT(segment_ready(floor_met, 1000 + 200, 400, 5000.0, kLead));
+        TEST_ASSERT(segment_ready(floor_met, 1000 + 200, 300, 0.0, kLead));
         SegmentClock floor_miss{1000, 199 * kRate / 1000, kRate};
-        TEST_ASSERT(!segment_ready(floor_miss, 1000 + 100000, 400, 5000.0, kLead));
+        TEST_ASSERT(!segment_ready(floor_miss, 1000 + 100000, 300, 0.0, kLead));
+
+        // Sustain term: when the command latency is large (am broadcast to a
+        // frozen app), the target becomes L + margin so the single issuer
+        // thread keeps up and playback stays continuous. With L = 5000 ms
+        // the target is 5200 ms regardless of the segment length.
+        SegmentClock sustain_met{1000, 5200 * kRate / 1000, kRate};
+        TEST_ASSERT(segment_ready(sustain_met, 1000 + 5200, 2000, 5000.0, kLead));
+        SegmentClock sustain_miss{1000, 5199 * kRate / 1000, kRate};
+        TEST_ASSERT(!segment_ready(sustain_miss, 1000 + 100000, 2000, 5000.0, kLead));
+        // The wall gate still applies on the sustain path.
+        SegmentClock sustain_wall_miss{1000, 5200 * kRate / 1000, kRate};
+        TEST_ASSERT(!segment_ready(sustain_wall_miss, 1000 + 100, 2000, 5000.0, kLead));
     }
 
     // ---- Steady-state chaining simulation ----
