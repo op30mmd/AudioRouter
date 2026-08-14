@@ -93,10 +93,14 @@ ifeq ($(PULSEAUDIO),1)
         # enabling the backend - same approach as the libaaudio probe above.
         # '#' cannot appear literally inside $(shell ...) (make treats it as a
         # comment), so build it from its octal escape via printf.
+        # Termux has no /tmp: honour $TMPDIR (falling back to the build dir,
+        # which always exists here) or the probe would fail to write its
+        # source file and silently disable the backend on-device.
+        PULSE_PROBE_DIR := $(if $(TMPDIR),$(TMPDIR),.)
         PULSE_LINKABLE := $(shell printf '\043include <pulse/simple.h>\nint main(){ pa_simple_free(0); return 0; }\n' \
-            > /tmp/.ar_pulse_probe.cpp; \
-            $(CXX) /tmp/.ar_pulse_probe.cpp $(PULSE_CFLAGS) $(PULSE_LIBS) -o /dev/null 2>/dev/null \
-            && echo 1; rm -f /tmp/.ar_pulse_probe.cpp)
+            > "$(PULSE_PROBE_DIR)/.ar_pulse_probe.cpp" 2>/dev/null && \
+            $(CXX) "$(PULSE_PROBE_DIR)/.ar_pulse_probe.cpp" $(PULSE_CFLAGS) $(PULSE_LIBS) -o /dev/null 2>/dev/null \
+            && echo 1; rm -f "$(PULSE_PROBE_DIR)/.ar_pulse_probe.cpp")
         ifeq ($(PULSE_LINKABLE),1)
             HAVE_PULSEAUDIO = 1
             CXXFLAGS += -DPULSEAUDIO_ENABLED=1 $(PULSE_CFLAGS)
