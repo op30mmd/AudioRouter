@@ -520,9 +520,18 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     "not compiled in this build" means the library was missing when the binary was
     built; "no PulseAudio daemon found" means nothing is listening (`pulseaudio
     --start`, or point `PULSE_SERVER` at a remote/TCP daemon);
-  - the daemon is **per-session**: closing Termux, or Android reclaiming the app,
-    stops it, and the next run then reports `no PulseAudio daemon is reachable` and
-    falls through to AAudio. Re-run `pulseaudio --start` (or add it to `~/.bashrc`);
+  - the daemon is **per-session**, and on Termux a bare `pulseaudio --start` is
+    usually not enough: it exits after 20 s idle (nothing is connected yet) and it
+    needs an explicit Android output sink. Start it as the normal Termux user with
+    `pulseaudio --start --exit-idle-time=-1 --load=module-sles-sink` (add it to
+    `~/.bashrc` to make it stick). If `pactl info` still reports
+    `Connection failure: Timeout`, the daemon is not staying up — run it in the
+    foreground to see why:
+    `pulseaudio -n --exit-idle-time=-1 --load=module-sles-sink --log-target=stderr -vvvv`.
+    On recent Android releases the SLES/AAudio sink modules are the usual culprit
+    (see termux-packages#27978). Closing Termux or Android reclaiming the app also
+    stops it, after which the client reports `no PulseAudio daemon is reachable` and
+    falls through to AAudio;
     `pactl info` says whether one is live. A daemon killed by Android leaves its
     socket file behind, so the client does not trust the inode: it makes a real
     non-blocking `connect()` to it and treats a refused/stale socket as "no daemon". `open()` is gated on that check because
