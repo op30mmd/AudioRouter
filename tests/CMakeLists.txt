@@ -10,16 +10,22 @@ set(TEST_SOURCES
     test_usb_tunnel.cpp
     test_conversion.cpp
     test_termux_api.cpp
+    test_pulse.cpp
     test_thread_safety.cpp
     test_type_safety.cpp
     test_memory_safety.cpp
     ../src/client/jitter_buffer.cpp
     ../src/client/termux_api_player.cpp
+    ../src/client/pulse_player.cpp
     ../src/client/android_helpers.cpp
     ../src/common/socket_util.cpp
 )
 
 add_executable(audiorouter_tests ${TEST_SOURCES})
+
+# Mirror the client's optional PulseAudio backend so the tests exercise the
+# same build of pulse_player.cpp (stub or real).
+audiorouter_link_pulseaudio(audiorouter_tests)
 
 target_include_directories(audiorouter_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/common

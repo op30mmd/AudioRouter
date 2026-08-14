@@ -3,8 +3,8 @@
 High-performance, ultra-low-latency C++ audio routing engine that captures Windows
 system audio output (WASAPI loopback) and streams it to an Android device over UDP,
 where it is rendered through one of several pluggable playback backends (ALSA, direct
-kernel PCM, Qualcomm AGM, Android AAudio, or the Termux:API media player — the last
-two need no root). The server automatically mutes the PC
+kernel PCM, Qualcomm AGM, PulseAudio, Android AAudio, or the Termux:API media player
+— the last three need no root). The server automatically mutes the PC
 speakers while a client is attached and restores the previous volume state on
 disconnect. The stream runs over Wi-Fi (hotspot) by default; a **Voice over USB**
 mode carries the same stream over the USB cable via `adb reverse` — no Wi-Fi at all.
@@ -23,8 +23,10 @@ mode carries the same stream over the USB cable via `adb reverse` — no Wi-Fi a
 │                        Android device (client, Termux)                      │
 │                                                                             │
 │  UDP receiver ──► Adaptive Jitter Buffer ──► Audio Player (pluggable)       │
-│  (reorder + PLC  (256-slot ring, RFC3550   ├─ AAudio   (no root, in-process │
-│   + NAT keepalive) jitter EMA, prefill     │  like stream_daemon)           │
+│  (reorder + PLC  (256-slot ring, RFC3550   ├─ PulseAudio (no root, needs a  │
+│   + NAT keepalive) jitter EMA, prefill     │  running daemon; also PipeWire)│
+│                                             ├─ AAudio   (no root, in-process│
+│                                             │  like stream_daemon)          │
 │                  + stability gate)         ├─ TermuxAPI(no root, WAV        │
 │                                             │  segments via the Termux:API  │
 │                                             │  app's media player)          │
@@ -199,6 +201,7 @@ The device name selects both the backend and the fallback chain:
 
 | `-d` value | Backend | Privilege | Notes |
 |------------|---------|-----------|-------|
+| `pulse` / `pulseaudio` / `pa`, `pulse:<sink>`, `pulse@<ms>`, `pulse:<sink>@<ms>` | **PulseAudio** via `libpulse-simple` | none | Desktop Linux, and Termux with `pkg install pulseaudio`. Also serves PipeWire through its PulseAudio shim. `<sink>` is a `pactl list short sinks` name (omitted / `default` / `@DEFAULT_SINK@` = daemon default); `<ms>` is the playback buffer target (10–500, default derived as 4 packets ≈ 20 ms) requested as `pa_buffer_attr::tlength` — `pa_simple` sets `ADJUST_LATENCY`, so the daemon honours it as end-to-end stream latency. `pa_simple_write()` blocks until the daemon accepts the samples, so this backend paces the playback thread itself (like ALSA, unlike the FIFO backends). A daemon restart / sink removal is detected on write and the stream is rebuilt in place (rate-limited to 2 s). Compiled in only when `libpulse-simple` is found at build time; otherwise it is a stub that fails fast into the fallback chain. |
 | `aaudio` / `aaudio:deep` / `aaudio:voip` | **AAudio** (NDK, in-process) | none | Byte-for-byte mirror of `stream_daemon`: 64 KB (≈341 ms) `O_RDWR` FIFO, ~20 ms pump chunks, 500 ms write timeout, no usage hints, no readiness probe; lenient watchdog (20 failed writes → recreate + drain the FIFO, deep-buffer mode on 2nd rebuild, fall back after 3). FIFO at `/data/local/tmp` as root, `$HOME` otherwise. |
 | `termux` / `termux-api` / `termux:<ms>` | **Termux:API** media player (Android `MediaPlayer` via `com.termux.api`) | none | Needs the Termux:API app (F-Droid). MediaPlayer cannot play a pipe or a growing file, so the stream is laid out as a **file ring buffer**: each segment file is created at its full length (exact sizes in the header, the data region a sparse hole that reads as silence) and the stream is overwritten into it sequentially. The player is handed a file once a ~600 ms prefill is recorded and plays it at 1x while the recorder keeps filling just ahead — the end-to-end delay is **prefill + command latency (~0.7-1.6 s)**, independent of the file length (`<ms>`, default 600000 ms = 10 min, only sets how often the player switches files — every switch costs the app a stop/reset/prepare/start cycle, ~0.3-1 s of silence). Files come from a recycled pool under the Termux home (pre-labeled with the app-data SELinux context before the privilege drop). All IPC runs on a dedicated issuer thread — the playback thread never blocks (see §3.3.1). Commands use the Termux:API listen-socket protocol when available, otherwise `am broadcast` with the client's result sockets (the official termux-api mechanism on Android 14+, where the app process freezes); every play is confirmed by the app's own reply. |
 | `agm` / `agm:<backend>` | **AGM** via vendor `agmplay` subprocess + WAV-over-FIFO | root | Default backend `CODEC_DMA-LPAIF_RXTX-RX-1`; auto-recover: FIFO-stall detection, logcat/mixer preemption watcher, HAL restart. |
@@ -206,9 +209,15 @@ The device name selects both the backend and the fallback chain:
 | `default`, `hw:0,0`, `plughw:0,0` | **ALSA** via `libasound.so` | root | dlopen-based, optional direct fallback. |
 | `dummy` | DummyPlayer | — | Benchmarking / CI. |
 
-Fallback chains (`build_open_strategies`): `aaudio*` → `AAUDIO → TERMUXAPI → AGM →
-NODES → LEGACY`; `termux*` → `TERMUXAPI → AAUDIO → AGM → NODES → LEGACY`;
-`agm*` → `AGM → NODES → LEGACY`; node paths → `NODES`; everything else → `LEGACY`.
+Fallback chains (`build_open_strategies`): `pulse*` → `PULSE → AAUDIO → TERMUXAPI →
+AGM → NODES → LEGACY`; `aaudio*` → `AAUDIO → TERMUXAPI → AGM → NODES → LEGACY`;
+`termux*` → `TERMUXAPI → AAUDIO → AGM → NODES → LEGACY`; `agm*` → `AGM → NODES →
+LEGACY`; node paths → `NODES`; everything else → `LEGACY`, except that when a
+PulseAudio daemon is actually reachable (`PULSE_SERVER`, or a native socket under
+`$XDG_RUNTIME_DIR` / `/run/user/<uid>` / `$PREFIX/var/run/pulse` / `~/.pulse`)
+`default`-style names become `PULSE → LEGACY` — a running daemon owns the sound
+card, so a raw ALSA open would only fight it. Without a daemon the probe is a
+couple of `stat()` calls and the classic behaviour is unchanged.
 Each attempt runs on its own thread with a 20 s hang timeout; abandoned attempts
 hot-swap the device in if they later succeed.
 
@@ -275,6 +284,7 @@ End-to-end audio delay = jitter buffer + backend delay:
 |-----------|---------|------------|----------|
 | Jitter buffer | target `-l` (default 35 ms); excess drained back to ~target+25 ms after bursts | startup prefill 120–500 ms (one-time, protected by a 3 s grace) | prefill / stability gate + drain-to-target |
 | FIFO (AAudio pipe) | ~40 ms (playback thread self-paced against the backend; stale backlog discarded on stall recovery / rebuild) | **341 ms** transient (64 KB @ 192 KB/s, only while a stall is active) | `kFifoSizeBytes` + playback pacing + pump drain-on-recovery |
+| PulseAudio | requested buffer target (`pulse@<ms>`, default ≈ 20 ms); reported live via `pa_simple_get_latency()` | the daemon's own scheduling (typically the sink's period) | `pa_buffer_attr` (`tlength`/`minreq`/`prebuf`, `maxlength` capped at 2× target) + `ADJUST_LATENCY` |
 | AAudio in-stream | ≤ 40 ms (capacity capped at 1920 frames on LOW_LATENCY); deep mode uses the HAL default | 40 ms | `setBufferCapacityInFrames` |
 | Termux:API ring buffer | `prefill (600 ms) + command latency` (~0.7 s socket protocol, ~1.6 s am broadcast) — the file ring pre-sizes each segment, so the player only needs the prefill before starting | + segment length after a player death until the next switch | prefill gate + issuer thread + latency EMA (§3.3.1) |
 | Network / UDP | RTT + jitter (see status line) | — | — |
@@ -350,10 +360,19 @@ as well as ordinary programs.
 
 ### Android client (Termux)
 ```bash
-./scripts/termux_setup.sh         # clang, make, alsa-utils, optional ndk-sysroot
+./scripts/termux_setup.sh         # clang, make, alsa-utils, pulseaudio, optional
+                                  #   ndk-sysroot
 make client                       # probes: Android target, libaaudio (sysroot or
-                                  #   /system/lib64 absolute path), defines AAUDIO_ENABLED
+                                  #   /system/lib64 absolute path), defines AAUDIO_ENABLED;
+                                  #   pkg-config libpulse-simple -> PULSEAUDIO_ENABLED
 ```
+
+The PulseAudio backend is compiled in whenever `pkg-config` finds
+`libpulse-simple` (Debian/Ubuntu: `libpulse-dev`, Termux: `pkg install
+pulseaudio`). Turn it off with `make PULSEAUDIO=0` (Make) or
+`-DAUDIOROUTER_ENABLE_PULSEAUDIO=OFF` (CMake); without the library
+`pulse_player.cpp` compiles as a stub and `-d pulse` fails fast into the
+fallback chain.
 The Makefile probes the toolchain (`--target=<triple>30` for AAudio, matching the
 proven stream_daemon build) and only compiles the AAudio backend when `libaaudio` is
 linkable; otherwise the player compiles as a stub and `-d aaudio` fails fast into the
@@ -396,6 +415,9 @@ bin\audiorouter_server.exe --usb            :: Voice over USB (binds loopback, s
 # root backends (AGM recommended on Qualcomm devices):
 su
 ./bin/audiorouter_client -s 192.168.43.45 -d agm
+# no-root PulseAudio (desktop Linux, or Termux with `pkg install pulseaudio`):
+./bin/audiorouter_client -s 192.168.43.45 -d pulse
+./bin/audiorouter_client -s 192.168.43.45 -d pulse:alsa_output.analog-stereo@30
 # no-root AAudio (in-process, like stream_daemon):
 ./bin/audiorouter_client -s 192.168.43.45 -d aaudio
 # no-root Termux:API media player (needs the Termux:API app from F-Droid):
@@ -446,7 +468,8 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
                       (targets 127.0.0.1; ignored with -b/--discover)
     --discover        auto-discover the server on the local hotspot subnet
     --dummy           DummyPlayer (benchmarks)
-    --list-devices    list ALSA nodes, kernel PCM nodes, AAudio availability
+    --list-devices    list ALSA nodes, kernel PCM nodes, PulseAudio sinks,
+                      AAudio and Termux:API availability
 ```
 
 ## 6. Hotspot topologies
@@ -468,6 +491,27 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   contain the required elevation manifest; rebuild it with one of the supported
   Windows scripts. Protected/DRM audio and applications using an exclusive output
   path can still be unavailable to WASAPI shared-mode loopback.
+- **PulseAudio backend** (`-d pulse`, no root):
+  - needs the library at **build time** (`libpulse-dev` / Termux `pkg install
+    pulseaudio`) and a **running daemon** at run time. `--list-devices` reports both:
+    "not compiled in this build" means the library was missing when the binary was
+    built; "no PulseAudio daemon found" means nothing is listening (`pulseaudio
+    --start`, or point `PULSE_SERVER` at a remote/TCP daemon);
+  - **PipeWire** users need nothing special — its `pipewire-pulse` shim answers on the
+    same socket and behaves identically;
+  - pick a specific output with `-d pulse:<sink>` using a name from `pactl list short
+    sinks`; omitting it (or `pulse:default`) follows the daemon's default sink, so it
+    keeps working across headphone/HDMI switches;
+  - if the audio is choppy, raise the buffer target (`-d pulse@60`); if it is
+    delayed, lower it (`-d pulse@15`, floor 10 ms). The status line's `Audio: <ms>`
+    is the daemon's own `pa_simple_get_latency()` reading, so the effect is visible
+    immediately;
+  - a daemon restart or a sink being unplugged is recovered automatically: writes
+    fail, the stream is torn down and rebuilt (at most one attempt per 2 s), and the
+    log shows `PulsePlayer: Reconnected to the PulseAudio daemon.`;
+  - on Android, a Termux PulseAudio daemon renders through the normal Android audio
+    HAL, so it is an alternative to `-d aaudio` when the AAudio path does not start
+    on a given vendor HAL.
 - **AAudio does not render on some vendor HALs**: the stream opens but never starts
   consuming (watchdog logs `AAudioStream_write wrote X of Y frames (state=..., read=...)`).
   The client falls back to the Termux:API player and then AGM/ALSA automatically; use

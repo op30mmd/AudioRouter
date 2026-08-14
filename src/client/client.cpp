@@ -4,6 +4,7 @@
 #include "agm_fifo_player.hpp"
 #include "aaudio_player.hpp"
 #include "termux_api_player.hpp"
+#include "pulse_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -50,6 +51,9 @@ namespace {
     constexpr size_t kMaxAaudioOpenAttempts = 2;
     // Termux:API opens are an `am` probe round trip; same small budget.
     constexpr size_t kMaxTermuxOpenAttempts = 2;
+    // PulseAudio opens are a socket connect to the local daemon: fast, and
+    // either it answers or it does not.
+    constexpr size_t kMaxPulseOpenAttempts = 2;
 
     // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
     // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
@@ -76,6 +80,19 @@ namespace {
     bool is_termux_device(const std::string& device_name) {
         return device_name.rfind("termux:", 0) == 0 || device_name == "termux" ||
                device_name == "termux-api";
+    }
+
+    // "pulse" / "pulseaudio" / "pa" (optionally ":<sink>" and/or "@<ms>")
+    // plays through a PulseAudio (or PipeWire pulse-shim) daemon. NO root
+    // required — the daemon runs as the user.
+    bool is_pulse_device(const std::string& device_name) {
+        return pulse::is_pulse_device_name(device_name);
+    }
+
+    // A PulseAudio daemon is only worth trying when this binary was built with
+    // libpulse AND a server socket / PULSE_SERVER is actually present.
+    bool pulse_worth_trying() {
+        return PulsePlayer::is_supported() && PulsePlayer::server_available();
     }
 
     std::vector<std::string> build_node_candidates(const std::string& device_name) {
@@ -131,7 +148,7 @@ namespace {
         }
     }
 
-    enum class OpenStrategy { AAUDIO, TERMUXAPI, AGM, NODES, LEGACY };
+    enum class OpenStrategy { PULSE, AAUDIO, TERMUXAPI, AGM, NODES, LEGACY };
 
     // "aaudio"/"aaudio:<mode>" uses AAudio first (no root, works on stock
     // devices; needs Android 8.0+), then the Termux:API media player (no root
@@ -141,6 +158,12 @@ namespace {
     // libagmclient.so at all), then direct kernel PCM nodes, then ALSA-lib.
     // Node-based names open PCM nodes only; everything else is ALSA-lib only.
     std::vector<OpenStrategy> build_open_strategies(const std::string& device_name) {
+        if (is_pulse_device(device_name)) {
+            // Explicitly requested: PulseAudio first, then the other rootless
+            // backends, then the root-requiring ones.
+            return {OpenStrategy::PULSE, OpenStrategy::AAUDIO, OpenStrategy::TERMUXAPI,
+                    OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
+        }
         if (is_aaudio_device(device_name)) {
             return {OpenStrategy::AAUDIO, OpenStrategy::TERMUXAPI, OpenStrategy::AGM,
                     OpenStrategy::NODES, OpenStrategy::LEGACY};
@@ -155,11 +178,20 @@ namespace {
         if (is_node_based_device(device_name)) {
             return {OpenStrategy::NODES};
         }
+        // Plain "default"/"hw:0,0": when a PulseAudio daemon is running it
+        // owns the sound card, so a raw ALSA/PCM open would either fail or
+        // fight it. Try PulseAudio first in that case; on systems without a
+        // daemon (stock Android/Termux) this is skipped entirely and the
+        // behaviour is unchanged.
+        if (pulse_worth_trying()) {
+            return {OpenStrategy::PULSE, OpenStrategy::LEGACY};
+        }
         return {OpenStrategy::LEGACY};
     }
 
     const char* strategy_label(OpenStrategy strategy, bool node_based) {
         switch (strategy) {
+            case OpenStrategy::PULSE: return "PulseAudio daemon via libpulse (no root)";
             case OpenStrategy::AAUDIO: return "AAudio native audio via Android audio HAL (no root)";
             case OpenStrategy::TERMUXAPI: return "Termux:API media player via com.termux.api (no root)";
             case OpenStrategy::AGM: return "AGM playback via vendor agmplay subprocess (FIFO)";
@@ -184,7 +216,8 @@ namespace {
 
         while (!open->shutdown.load() && strategy_index < strategies.size()) {
             const OpenStrategy strategy = strategies[strategy_index];
-            const size_t max_attempts = strategy == OpenStrategy::AAUDIO ? kMaxAaudioOpenAttempts
+            const size_t max_attempts = strategy == OpenStrategy::PULSE ? kMaxPulseOpenAttempts
+                                      : strategy == OpenStrategy::AAUDIO ? kMaxAaudioOpenAttempts
                                       : strategy == OpenStrategy::TERMUXAPI ? kMaxTermuxOpenAttempts
                                       : strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
                                       : strategy == OpenStrategy::NODES ? kMaxNodeOpenAttempts
@@ -218,6 +251,7 @@ namespace {
 
                 std::shared_ptr<IAudioPlayer> device =
                     node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
+                    : strategy == OpenStrategy::PULSE ? std::shared_ptr<IAudioPlayer>(std::make_shared<PulsePlayer>())
                     : strategy == OpenStrategy::AAUDIO ? std::shared_ptr<IAudioPlayer>(std::make_shared<AaudioFifoPlayer>())
                     : strategy == OpenStrategy::TERMUXAPI ? std::shared_ptr<IAudioPlayer>(std::make_shared<TermuxApiPlayer>())
                     : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>())
@@ -547,7 +581,10 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
     // (AudioFlinger) owns the mixer for those streams, and force-routing the
     // codec from outside (tinymix) can jam the HAL's session start - the
     // stream opens but never renders.
-    if (!is_aaudio_device(device_name) && !is_termux_device(device_name)) {
+    // Also skipped for PulseAudio: the daemon owns the mixer for its sinks,
+    // and force-routing the codec underneath it can wedge the sink.
+    if (!is_aaudio_device(device_name) && !is_termux_device(device_name) &&
+        !is_pulse_device(device_name) && !pulse_worth_trying()) {
         AndroidHelpers::apply_speaker_routing();
     }
 

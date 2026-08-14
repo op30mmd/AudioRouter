@@ -78,6 +78,21 @@ ifeq ($(HAVE_AAUDIO),1)
     CXXFLAGS += -DAAUDIO_ENABLED=1
 endif
 
+# PulseAudio playback backend (-d pulse). Compiled in when pkg-config finds
+# libpulse-simple (Debian/Ubuntu: libpulse-dev, Termux: pulseaudio). Without it
+# pulse_player.cpp builds as a stub whose open() fails fast, so the client still
+# builds everywhere. Force off with: make PULSEAUDIO=0
+PULSEAUDIO ?= 1
+ifeq ($(PULSEAUDIO),1)
+    PULSE_CFLAGS := $(shell pkg-config --cflags libpulse-simple 2>/dev/null)
+    PULSE_LIBS := $(shell pkg-config --libs libpulse-simple 2>/dev/null)
+    ifneq ($(PULSE_LIBS),)
+        HAVE_PULSEAUDIO = 1
+        CXXFLAGS += -DPULSEAUDIO_ENABLED=1 $(PULSE_CFLAGS)
+        CLIENT_LIBS += $(PULSE_LIBS)
+    endif
+endif
+
 BUILD_DIR = build
 BIN_DIR = bin
 
@@ -98,6 +113,7 @@ CLIENT_SRCS = src/client/main.cpp \
               src/client/agm_fifo_player.cpp \
               src/client/aaudio_player.cpp \
               src/client/termux_api_player.cpp \
+              src/client/pulse_player.cpp \
               src/client/dummy_player.cpp \
               src/client/jitter_buffer.cpp \
               src/client/android_helpers.cpp
@@ -114,6 +130,7 @@ TEST_SRCS = tests/test_main.cpp \
             tests/test_usb_tunnel.cpp \
             tests/test_conversion.cpp \
             tests/test_termux_api.cpp \
+            tests/test_pulse.cpp \
             tests/test_thread_safety.cpp \
             tests/test_type_safety.cpp \
             tests/test_memory_safety.cpp
@@ -194,7 +211,7 @@ $(CLIENT_TARGET): $(CLIENT_OBJS) $(COMMON_OBJS)
 	@echo "Built: $(CLIENT_TARGET)"
 
 # Link Tests
-$(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(BUILD_DIR)/client_termux_api_player.o $(BUILD_DIR)/client_android_helpers.o $(COMMON_OBJS)
+$(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(BUILD_DIR)/client_termux_api_player.o $(BUILD_DIR)/client_pulse_player.o $(BUILD_DIR)/client_android_helpers.o $(COMMON_OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXTRA) $^ -o $@ $(CLIENT_LIBS)
 	@echo "Built: $(TEST_TARGET)"
 
