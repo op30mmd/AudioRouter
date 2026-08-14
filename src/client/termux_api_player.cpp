@@ -43,12 +43,17 @@ namespace {
 
 // Default segment length. This is NOT the end-to-end delay (which is
 // prefill + command latency): it only sets how often the media player
-// switches files (a ~prepare-time glitch per boundary).
-constexpr uint32_t kDefaultSegmentMs = 6000;
+// switches files. Every switch costs the app a stop/reset/prepare/start
+// cycle (~0.3-1 s of silence on-device), so the default is LONG: one
+// switch every 10 minutes. The file ring pre-sizes each file (sparse), so
+// the delay stays ~0.6 s + command latency regardless of this length.
+constexpr uint32_t kDefaultSegmentMs = 600000;
 // User-overridable segment range (termux:<ms>). The segment must comfortably
-// exceed prefill + command latency so the file ring never collides.
+// exceed prefill + command latency so the file ring never collides; the
+// upper bound is an hour (≈700 MB of recorded audio per file at 48 kHz
+// stereo S16, sparse until written).
 constexpr uint32_t kMinSegmentMs = 2000;
-constexpr uint32_t kMaxSegmentMs = 30000;
+constexpr uint32_t kMaxSegmentMs = 3600000;
 // Blind mode (no result channel): per-play latency estimate = am command
 // time + the app's unobservable prepare/start handling.
 constexpr double kBlindPrepareBiasMs = 250.0;
@@ -60,9 +65,12 @@ constexpr double kMaxLatencyMs = 4000.0;
 // Segment file pool: a small fixed set of inodes created (and, as root,
 // SELinux-labeled) before streaming starts, then recycled with O_TRUNC so
 // the labels survive the privilege drop and the app can always read them.
-// 8 x 2 s = 16 s of reuse distance - the app finished reading long before a
-// slot is reused.
-constexpr int kPoolSize = 8;
+// 4 slots x the segment length is the reuse distance: with the 10-minute
+// default a slot is only reused 30 minutes after the player finished with
+// it. With the result channel the previous file is truncated once the next
+// play is confirmed, bounding disk usage to ~2 files; in blind mode the
+// pool rotation itself is the bound (4 x segment length of recorded audio).
+constexpr int kPoolSize = 4;
 
 // termux-api socket protocol timeouts (ms).
 constexpr int kSocketConnectTimeoutMs = 400;
@@ -835,8 +843,8 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
     if (result_channel_.load()) {
         watchdog_thread_ = std::thread(&TermuxApiPlayer::watchdog_loop, this);
     }
-    LOG_INFO("TermuxApiPlayer: Termux:API media player ready (" << segment_ms_
-             << " ms segments, "
+    LOG_INFO("TermuxApiPlayer: Termux:API media player ready (file switch every "
+             << segment_ms_ << " ms, "
              << (result_channel_.load() ? (socket_path_ ? "socket protocol"
                                                         : "am + result sockets")
                                         : "blind am broadcast")
@@ -1080,6 +1088,7 @@ void TermuxApiPlayer::finalize_segment_locked() {
 
 void TermuxApiPlayer::issuer_loop() {
 #if defined(__ANDROID__)
+    std::string prev_path;  // file of the previously confirmed play
     while (true) {
         PendingSegment job;
         {
@@ -1102,6 +1111,13 @@ void TermuxApiPlayer::issuer_loop() {
             if (out.result_received) {
                 // The app's own confirmation arrived (after prepare+start):
                 // a real latency sample AND proof that playback started.
+                // The app's reset() already closed the previous file, so its
+                // recorded data can be released now (bounds disk usage to
+                // ~2 files in result mode).
+                if (!prev_path.empty() && prev_path != job.path) {
+                    ::truncate(prev_path.c_str(), 0);
+                }
+                prev_path = job.path;
                 consecutive_no_result_ = 0;
                 const double sample = static_cast<double>(out.duration_ms);
                 const double prev = latency_est_ms_.load();

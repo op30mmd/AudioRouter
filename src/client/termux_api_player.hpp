@@ -86,11 +86,12 @@ std::string build_command_line(const std::string& action, const std::string& fil
 // the result sockets does the player run in a blind fallback mode.
 //
 // Device naming (select with -d):
-//   termux            -> 6 s segments (the delay is ~prefill + command
-//                        latency, NOT the segment length; no root)
+//   termux            -> 10-minute files (one ~prepare-time switch pause
+//                        every 10 minutes; the delay is ~prefill + command
+//                        latency, NOT the file length; no root)
 //   termux-api        -> alias for termux
-//   termux:<ms>       -> custom segment length (2000..30000 ms; larger =
-//                        fewer switch glitches, same delay)
+//   termux:<ms>       -> custom file length (2000..3600000 ms; longer =
+//                        fewer switch pauses, same delay, more disk)
 //
 // On non-Android builds the player compiles as a stub whose open() fails
 // fast, letting the client's strategy fallback pick another backend.
