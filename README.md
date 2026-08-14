@@ -3,7 +3,8 @@
 High-performance, ultra-low-latency C++ audio routing engine that captures Windows
 system audio output (WASAPI loopback) and streams it to an Android device over UDP,
 where it is rendered through one of several pluggable playback backends (ALSA, direct
-kernel PCM, Qualcomm AGM, or Android AAudio). The server automatically mutes the PC
+kernel PCM, Qualcomm AGM, Android AAudio, or the Termux:API media player — the last
+two need no root). The server automatically mutes the PC
 speakers while a client is attached and restores the previous volume state on
 disconnect. The stream runs over Wi-Fi (hotspot) by default; a **Voice over USB**
 mode carries the same stream over the USB cable via `adb reverse` — no Wi-Fi at all.
@@ -24,7 +25,10 @@ mode carries the same stream over the USB cable via `adb reverse` — no Wi-Fi a
 │  UDP receiver ──► Adaptive Jitter Buffer ──► Audio Player (pluggable)       │
 │  (reorder + PLC  (256-slot ring, RFC3550   ├─ AAudio   (no root, in-process │
 │   + NAT keepalive) jitter EMA, prefill     │  like stream_daemon)           │
-│                  + stability gate)         ├─ AGM      (vendor agmplay +    │
+│                  + stability gate)         ├─ TermuxAPI(no root, WAV        │
+│                                             │  segments via the Termux:API  │
+│                                             │  app's media player)          │
+│                                             ├─ AGM      (vendor agmplay +    │
 │                                             │           FIFO, root)         │
 │                                             ├─ ALSA     (libasound, root)   │
 │                                             └─ direct   (/dev/snd ioctl,    │
@@ -196,15 +200,72 @@ The device name selects both the backend and the fallback chain:
 | `-d` value | Backend | Privilege | Notes |
 |------------|---------|-----------|-------|
 | `aaudio` / `aaudio:deep` / `aaudio:voip` | **AAudio** (NDK, in-process) | none | Byte-for-byte mirror of `stream_daemon`: 64 KB (≈341 ms) `O_RDWR` FIFO, ~20 ms pump chunks, 500 ms write timeout, no usage hints, no readiness probe; lenient watchdog (20 failed writes → recreate + drain the FIFO, deep-buffer mode on 2nd rebuild, fall back after 3). FIFO at `/data/local/tmp` as root, `$HOME` otherwise. |
+| `termux` / `termux-api` / `termux:<ms>` | **Termux:API** media player (Android `MediaPlayer` via `com.termux.api`) | none | Needs the Termux:API app (F-Droid). MediaPlayer cannot play a pipe or a growing file, so the stream is laid out as a **file ring buffer**: each segment file is created at its full length (exact sizes in the header, the data region a sparse hole that reads as silence) and the stream is overwritten into it sequentially. The player is handed a file once a ~600 ms prefill is recorded and plays it at 1x while the recorder keeps filling just ahead — the end-to-end delay is **prefill + command latency (~0.7-1.6 s)**, independent of the file length (`<ms>`, default 600000 ms = 10 min, only sets how often the player switches files — every switch costs the app a stop/reset/prepare/start cycle, ~0.3-1 s of silence). Files come from a recycled pool under the Termux home (pre-labeled with the app-data SELinux context before the privilege drop). All IPC runs on a dedicated issuer thread — the playback thread never blocks (see §3.3.1). Commands use the Termux:API listen-socket protocol when available, otherwise `am broadcast` with the client's result sockets (the official termux-api mechanism on Android 14+, where the app process freezes); every play is confirmed by the app's own reply. |
 | `agm` / `agm:<backend>` | **AGM** via vendor `agmplay` subprocess + WAV-over-FIFO | root | Default backend `CODEC_DMA-LPAIF_RXTX-RX-1`; auto-recover: FIFO-stall detection, logcat/mixer preemption watcher, HAL restart. |
 | `direct:/dev/snd/pcmC0D0p` or `/dev/snd/...` | **Direct kernel PCM** (ioctl) | root | No ALSA userspace deps; enumerates `/dev/snd` nodes; per-node retry with hang detection. |
 | `default`, `hw:0,0`, `plughw:0,0` | **ALSA** via `libasound.so` | root | dlopen-based, optional direct fallback. |
 | `dummy` | DummyPlayer | — | Benchmarking / CI. |
 
-Fallback chains (`build_open_strategies`): `aaudio*` → `AAUDIO → AGM → NODES → LEGACY`;
+Fallback chains (`build_open_strategies`): `aaudio*` → `AAUDIO → TERMUXAPI → AGM →
+NODES → LEGACY`; `termux*` → `TERMUXAPI → AAUDIO → AGM → NODES → LEGACY`;
 `agm*` → `AGM → NODES → LEGACY`; node paths → `NODES`; everything else → `LEGACY`.
 Each attempt runs on its own thread with a 20 s hang timeout; abandoned attempts
 hot-swap the device in if they later succeed.
+
+#### 3.3.1 How the Termux:API backend streams complete files (file ring buffer)
+
+Android's `MediaPlayer` sizes its source at `prepare()` time, so neither a
+named pipe nor a growing file can carry a live stream into it. The backend
+lays the stream out as a **file ring buffer**, so the file-completeness
+requirement no longer sets the delay:
+
+- each segment file is created at its **full length** right away: the header
+  carries the exact sizes and the data region is a sparse hole (ftruncate)
+  that reads back as silence. The stream is then overwritten into the file
+  sequentially as it arrives — the file IS the buffer, and the player can
+  never read past the recording head (an underrun degrades to silence, never
+  to an error);
+- the file is handed to the media player once its first **prefill (600 ms)**
+  of real audio is recorded **and** the wall clock has advanced that far
+  (the wall gate stops a jitter-buffer prefill burst from skipping audio
+  ahead of real time). The player starts ~command-latency later and plays
+  the file at 1x while the recorder keeps filling the region just ahead —
+  the **end-to-end delay is `prefill + command latency` (~0.7 s over the
+  socket protocol, ~1.6 s over `am broadcast`), independent of the segment
+  length**;
+- `write_frames()` paces itself at real time (like `DummyPlayer`), records a
+  file until its window is complete, and only then rotates to the next pool
+  file — the issue cadence IS the file length (`-T/--termux-segment <ms>`,
+  or the `-d termux:<ms>` device suffix; default 600000 ms = **10 minutes**).
+  The file length therefore only sets how often
+  the player switches files: each switch makes the app stop/reset/prepare/
+  start the new track, an unavoidable **~0.3-1 s pause per boundary** (the
+  app's MediaPlayer has no gapless transition). Long files make that pause
+  rare — roughly once every 10 minutes at the default — at the cost of disk
+  (≈12 MB per minute of 48 kHz stereo S16; with the result channel the
+  previous file is truncated after each confirmed switch, so disk stays at
+  ~2 files);
+- every play runs on a dedicated **issuer thread**: the playback thread only
+  records, paces and hands off, so a slow `am broadcast` (up to seconds on a
+  cold/frozen app) can never stall the jitter-buffer pops. A busy handoff
+  slot means a command outlasted a whole segment: the pending segment is
+  replaced by the fresher one (logged rate-limited) and playback resumes at
+  live audio;
+- `L` (the command latency) is tracked with an EMA of the measured command
+  duration. Commands prefer the Termux:API listen-socket protocol; where it
+  is unavailable they go through `am broadcast` **carrying the client's own
+  result-socket extras** — the app then writes its result back after
+  `prepare()+start()` (the exact mechanism the official termux-api binary
+  uses on Android 14+, where the app's own listen socket freezes). Every
+  play is confirmed by the app's own "Now Playing" reply, which surfaces
+  silent failures in the log; in blind mode (no result channel) the EMA
+  tracks the am time plus a prepare bias;
+- a watchdog (whenever the app has a result channel) polls the player status
+  once a second, resumes a paused player, and restarts a dead one at live
+  audio. Failed plays likewise discard the partial recording segment and
+  re-issue after the prefill, so the stream resumes within ~prefill +
+  latency instead of waiting for the next boundary (the same stale-audio
+  policy as the FIFO backends).
 
 ### 3.4 Latency budget
 
@@ -215,6 +276,7 @@ End-to-end audio delay = jitter buffer + backend delay:
 | Jitter buffer | target `-l` (default 35 ms); excess drained back to ~target+25 ms after bursts | startup prefill 120–500 ms (one-time, protected by a 3 s grace) | prefill / stability gate + drain-to-target |
 | FIFO (AAudio pipe) | ~40 ms (playback thread self-paced against the backend; stale backlog discarded on stall recovery / rebuild) | **341 ms** transient (64 KB @ 192 KB/s, only while a stall is active) | `kFifoSizeBytes` + playback pacing + pump drain-on-recovery |
 | AAudio in-stream | ≤ 40 ms (capacity capped at 1920 frames on LOW_LATENCY); deep mode uses the HAL default | 40 ms | `setBufferCapacityInFrames` |
+| Termux:API ring buffer | `prefill (600 ms) + command latency` (~0.7 s socket protocol, ~1.6 s am broadcast) — the file ring pre-sizes each segment, so the player only needs the prefill before starting | + segment length after a player death until the next switch | prefill gate + issuer thread + latency EMA (§3.3.1) |
 | Network / UDP | RTT + jitter (see status line) | — | — |
 
 The 5 s status line reports the backend portion separately as
@@ -306,8 +368,9 @@ cmake --build build-android --target audiorouter_client stream_daemon
 
 ### Host tests
 ```bash
-make test          # 8 suites: protocol, ring buffer, jitter buffer/PLC,
-                   # socket, conversion, thread/type/memory safety
+make test          # 10 suites: protocol, ring buffer, jitter buffer/PLC,
+                   # socket, conversion, Termux:API segment scheduling,
+                   # thread/type/memory safety
 ```
 
 ### Binary-only release (no source)
@@ -335,6 +398,11 @@ su
 ./bin/audiorouter_client -s 192.168.43.45 -d agm
 # no-root AAudio (in-process, like stream_daemon):
 ./bin/audiorouter_client -s 192.168.43.45 -d aaudio
+# no-root Termux:API media player (needs the Termux:API app from F-Droid):
+./scripts/termux_run.sh -s 192.168.43.45 -d termux
+#   one ~prepare-time switch pause per file (10 min default); the delay is
+#   the same (~0.6 s + command latency) no matter the file length:
+./scripts/termux_run.sh -s 192.168.43.45 -d termux -T 300000   # pause every 5 min
 # with interface binding (root; bypasses VPN):
 ./scripts/termux_run.sh -s 192.168.43.45 -d agm -b auto
 ```
@@ -367,6 +435,11 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
 -s, --server <ip>     server IP
 -p, --port <port>     server port (default 44100)
 -d, --device <dev>    backend/device (see table above; default 'default')
+-T, --termux-segment <ms>
+                      Termux:API file length in ms (default 600000 = one
+                      ~prepare-time switch pause per 10 min; 2000..3600000).
+                      The end-to-end delay is unaffected by it; overrides
+                      -d termux:<ms>. Ignored for other backends.
 -l, --latency <ms>    target jitter-buffer latency (default 35 ms)
 -b, --bind <iface>    pin UDP socket to an interface ('auto' = physical NIC)
 -u, --usb             Voice over USB: stream over the USB cable via adb reverse
@@ -397,8 +470,38 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
   path can still be unavailable to WASAPI shared-mode loopback.
 - **AAudio does not render on some vendor HALs**: the stream opens but never starts
   consuming (watchdog logs `AAudioStream_write wrote X of Y frames (state=..., read=...)`).
-  The client falls back to AGM/ALSA automatically; use `-d agm` directly for the
-  best experience on such devices.
+  The client falls back to the Termux:API player and then AGM/ALSA automatically; use
+  `-d agm` directly for the best experience on such devices (or `-d termux` when the
+  device is not rooted).
+- **Termux:API backend** (`-d termux`, no root):
+  - needs the **Termux:API app** (`com.termux.api`) installed — F-Droid → Termux:API.
+    `--list-devices` probes it; `open()` fails fast into the fallback chain when the
+    app does not answer;
+  - runs **as the Termux app user**: the app only accepts its own uid and reads the
+    segment files from the Termux home. `termux_run.sh` launches `-d termux` without
+    su by default — this is the recommended mode;
+  - with `-b/--bind` (which needs root) the client binds the socket as root,
+    pre-labels the segment pool and captures the app's SELinux context, then drops
+    to the Termux app user in-process — its result sockets carry the app's own
+    context so the confined app can reply. If the log still reports `the app
+    returned no result`, the root domain is being denied anyway: run without
+    `-b` (no su), or check `su -c 'logcat -d -s ResultReturner TermuxApiReceiver'`;
+  - on **Android 14+** the app's listen socket freezes, so commands go through
+    `am broadcast` with the client's result sockets — still fully confirmed by the
+    app, just slower (the startup log prints the estimated end-to-end delay, which is
+    `~0.6 s + command latency` either way; raise `-T <ms>` / `-d termux:<ms>` only
+    to make the per-switch pause rarer);
+  - **not a real-time transport**: the pipeline delay is ~0.7-1.6 s and every file
+    switch costs the app a stop/reset/prepare/start cycle (~0.3-1 s pause; once per
+    10 min at the default). For true real-time playback use `-d aaudio` (no root,
+    in-process, low latency) or `-d agm` / ALSA (root) — Termux:API exists for
+    devices where none of those render;
+  - every play is logged with the app's own reply (`Now Playing: seg_pX.wav`).
+    If the reply is an error or the log reports `the app returned no result`,
+    the app could not play the segment — check `logcat -s MediaPlayerAPI` for its
+    error. If the app confirms every play but no sound comes out, the segment path
+    is fine and the issue is device-side: media volume or the media output route;
+  - playback uses Android's media volume, not the call volume.
 - **`/dev/snd` nodes hang**: Android's `audioserver` usually holds them.
   `su -c "stop audioserver"` frees them (re-enable with `start audioserver`).
 - **AGM preempted by notifications**: the AGM player watches logcat + mixer state
@@ -430,14 +533,15 @@ src/common/    protocol.hpp, socket_util.*, audio_types.hpp, ring_buffer.hpp,
 src/server/    main.cpp, server.*, wasapi_capture.*, dummy_capture.*,
                audio_endpoint_control.*, audio_capture.hpp, UAC manifest/resource
 src/client/    main.cpp, client.*, jitter_buffer.*, audio_player.hpp,
-               aaudio_player.*, agm_fifo_player.*, alsa_player.*,
-               direct_alsa.*, dummy_player.*, android_helpers.*
+               aaudio_player.*, termux_api_player.*, agm_fifo_player.*,
+               alsa_player.*, direct_alsa.*, dummy_player.*, android_helpers.*
 src/tools/     stream_daemon.cpp
 scripts/       termux_setup.sh, termux_run.sh, build_client.sh,
                build_stream_daemon.sh, android_mixer_setup.sh,
                build_server_msvc.bat, build_server_mingw.bat, usb_setup.bat
 tests/         protocol, ring buffer, jitter buffer/PLC, socket,
-               conversion, thread/type/memory safety
+               conversion, Termux:API segments/scheduling/protocol,
+               thread/type/memory safety
 ```
 
 ## 9. License

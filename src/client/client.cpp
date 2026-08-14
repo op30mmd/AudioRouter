@@ -3,6 +3,7 @@
 #include "direct_alsa.hpp"
 #include "agm_fifo_player.hpp"
 #include "aaudio_player.hpp"
+#include "termux_api_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -15,6 +16,9 @@
 #include <chrono>
 #include <algorithm>
 #include <limits>
+#include <cerrno>
+#include <cstdlib>
+#include <grp.h>
 
 namespace audiorouter {
 
@@ -22,6 +26,10 @@ namespace {
     // How long to wait for the ALSA/direct audio device to open before giving
     // up and falling back to the dummy sink.
     constexpr uint32_t kPlayerOpenTimeoutMs = 3000;
+    // Termux:API device opens probe the app via `am` (cold app processes can
+    // take seconds); its budget is deliberately larger so the dummy sink
+    // doesn't flash before the hot-swap.
+    constexpr uint32_t kTermuxPlayerOpenTimeoutMs = 8000;
     // A single open attempt that exceeds this is considered hung in a kernel
     // call and is abandoned (a new attempt is started on a fresh player).
     constexpr uint32_t kDeviceAttemptTimeoutMs = 20000;
@@ -40,6 +48,8 @@ namespace {
     // so a small retry budget is plenty before falling back to the
     // root-requiring backends.
     constexpr size_t kMaxAaudioOpenAttempts = 2;
+    // Termux:API opens are an `am` probe round trip; same small budget.
+    constexpr size_t kMaxTermuxOpenAttempts = 2;
 
     // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
     // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
@@ -58,6 +68,14 @@ namespace {
     // HAL / AudioFlinger) — the only backend that needs NO root.
     bool is_aaudio_device(const std::string& device_name) {
         return device_name.rfind("aaudio:", 0) == 0 || device_name == "aaudio";
+    }
+
+    // "termux" / "termux-api" / "termux:..." plays through the Termux:API
+    // app's media player (Android MediaPlayer). Also needs NO root — just the
+    // Termux:API app installed.
+    bool is_termux_device(const std::string& device_name) {
+        return device_name.rfind("termux:", 0) == 0 || device_name == "termux" ||
+               device_name == "termux-api";
     }
 
     std::vector<std::string> build_node_candidates(const std::string& device_name) {
@@ -113,17 +131,23 @@ namespace {
         }
     }
 
-    enum class OpenStrategy { AAUDIO, AGM, NODES, LEGACY };
+    enum class OpenStrategy { AAUDIO, TERMUXAPI, AGM, NODES, LEGACY };
 
     // "aaudio"/"aaudio:<mode>" uses AAudio first (no root, works on stock
-    // devices; needs Android 8.0+), then falls back to the root-requiring
-    // backends. "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds
-    // don't ship libagmclient.so at all), then direct kernel PCM nodes, then
-    // ALSA-lib. Node-based names open PCM nodes only; everything else is
-    // ALSA-lib only.
+    // devices; needs Android 8.0+), then the Termux:API media player (no root
+    // either), then the root-requiring backends. "termux"/"termux:<ms>" tries
+    // the Termux:API media player first, then AAudio, then the root backends.
+    // "agm"/"agm:<backend>" tries Qualcomm AGM first (some builds don't ship
+    // libagmclient.so at all), then direct kernel PCM nodes, then ALSA-lib.
+    // Node-based names open PCM nodes only; everything else is ALSA-lib only.
     std::vector<OpenStrategy> build_open_strategies(const std::string& device_name) {
         if (is_aaudio_device(device_name)) {
-            return {OpenStrategy::AAUDIO, OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
+            return {OpenStrategy::AAUDIO, OpenStrategy::TERMUXAPI, OpenStrategy::AGM,
+                    OpenStrategy::NODES, OpenStrategy::LEGACY};
+        }
+        if (is_termux_device(device_name)) {
+            return {OpenStrategy::TERMUXAPI, OpenStrategy::AAUDIO, OpenStrategy::AGM,
+                    OpenStrategy::NODES, OpenStrategy::LEGACY};
         }
         if (is_agm_device(device_name)) {
             return {OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
@@ -137,6 +161,7 @@ namespace {
     const char* strategy_label(OpenStrategy strategy, bool node_based) {
         switch (strategy) {
             case OpenStrategy::AAUDIO: return "AAudio native audio via Android audio HAL (no root)";
+            case OpenStrategy::TERMUXAPI: return "Termux:API media player via com.termux.api (no root)";
             case OpenStrategy::AGM: return "AGM playback via vendor agmplay subprocess (FIFO)";
             case OpenStrategy::NODES: return node_based ? "direct kernel PCM nodes (/dev/snd)" : "direct kernel PCM nodes";
             default: return "ALSA-lib device (default/hw:0,0)";
@@ -160,6 +185,7 @@ namespace {
         while (!open->shutdown.load() && strategy_index < strategies.size()) {
             const OpenStrategy strategy = strategies[strategy_index];
             const size_t max_attempts = strategy == OpenStrategy::AAUDIO ? kMaxAaudioOpenAttempts
+                                      : strategy == OpenStrategy::TERMUXAPI ? kMaxTermuxOpenAttempts
                                       : strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
                                       : strategy == OpenStrategy::NODES ? kMaxNodeOpenAttempts
                                                                         : std::numeric_limits<size_t>::max();
@@ -193,6 +219,7 @@ namespace {
                 std::shared_ptr<IAudioPlayer> device =
                     node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
                     : strategy == OpenStrategy::AAUDIO ? std::shared_ptr<IAudioPlayer>(std::make_shared<AaudioFifoPlayer>())
+                    : strategy == OpenStrategy::TERMUXAPI ? std::shared_ptr<IAudioPlayer>(std::make_shared<TermuxApiPlayer>())
                     : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>())
                                                     : std::shared_ptr<IAudioPlayer>(std::make_shared<AlsaPlayer>());
                 auto finished = std::make_shared<std::atomic<bool>>(false);
@@ -291,6 +318,22 @@ bool AudioRouterClient::start() {
     LOG_INFO("=================================================");
     LOG_INFO(" Starting AudioRouter Android ALSA Client Engine");
     LOG_INFO("=================================================");
+
+    // -T/--termux-segment overrides the file length of the Termux:API
+    // backend (how often the media player switches files; the end-to-end
+    // delay is unaffected). It rewrites the device name to the equivalent
+    // termux:<ms> form so every code path sees one source of truth.
+    if (config_.termux_segment_ms != 0) {
+        if (is_termux_device(config_.device_name)) {
+            config_.device_name = "termux:" + std::to_string(config_.termux_segment_ms);
+            LOG_INFO("-T/--termux-segment: Termux:API file length set to "
+                     << config_.termux_segment_ms << " ms (one ~prepare-time switch pause per "
+                     << config_.termux_segment_ms / 1000 << " s)");
+        } else {
+            LOG_WARN("-T/--termux-segment is ignored for device '" << config_.device_name
+                     << "' (Termux:API backend only)");
+        }
+    }
 
     // Check Android root permissions
     if (AndroidHelpers::is_running_as_root()) {
@@ -405,6 +448,38 @@ bool AudioRouterClient::start() {
 
     LOG_INFO("Target Server: " << server_addr_.to_string());
 
+    // Termux:API playback must run as the Termux app user: its listen-socket
+    // protocol only accepts that uid and com.termux.api reads the segment
+    // files from the Termux sandbox. The interface binding above (-b/--bind)
+    // needed root; now that the socket is pinned, drop to the Termux app
+    // user so the backend runs in-process with working sandbox access.
+    // AAudio also renders as that user; the root backends (AGM/ALSA/direct)
+    // are given up by the drop.
+    if (is_termux_device(config_.device_name) && AndroidHelpers::is_running_as_root()) {
+        // Pre-create the segment cache — including the SELinux labels the
+        // Termux:API app needs to read it — while we still have root: after
+        // setuid() the process cannot relabel files, and the player only
+        // recycles these pre-labeled pool inodes.
+        TermuxApiPlayer::prepare_cache_as_root();
+        uid_t termux_uid = 0;
+        gid_t termux_gid = 0;
+        std::string termux_home;
+        if (!AndroidHelpers::termux_user(&termux_uid, &termux_gid, &termux_home)) {
+            LOG_WARN("Termux:API backend: Termux app user not found; continuing as root "
+                     "(plain am broadcast path)");
+        } else if (::setgroups(0, nullptr) != 0 || ::setgid(termux_gid) != 0 ||
+                   ::setuid(termux_uid) != 0) {
+            LOG_WARN("Termux:API backend: could not drop to the Termux app user ("
+                     << std::strerror(errno) << "); continuing as root (plain am broadcast "
+                     "path)");
+        } else {
+            ::setenv("HOME", termux_home.c_str(), 1);
+            LOG_INFO("Termux:API backend: socket bound as root; dropped privileges to the "
+                     "Termux app user (uid " << termux_uid << ", gid " << termux_gid
+                     << ") so the Termux:API sandbox and socket protocol work");
+        }
+    }
+
     // Create Audio Player (ALSA or Dummy)
     {
         std::lock_guard<std::mutex> lock(open_->mutex);
@@ -447,7 +522,13 @@ bool AudioRouterClient::start() {
 
     // Open the audio player on a bounded, cancellable path: a hung ALSA /
     // kernel driver must never block the main thread or stall shutdown.
-    open_player_with_timeout(config_.device_name, kPlayerOpenTimeoutMs);
+    // The Termux:API backend needs a larger budget: its open() probes the
+    // app over `am broadcast`, which takes ~2-4 s when the app process is
+    // cold (the 3 s ALSA budget made it flash the dummy sink on device).
+    open_player_with_timeout(config_.device_name,
+                             is_termux_device(config_.device_name)
+                                 ? kTermuxPlayerOpenTimeoutMs
+                                 : kPlayerOpenTimeoutMs);
 
     LOG_INFO("AudioRouter Client connected and streaming directly to Android speakers!");
     return true;
@@ -462,10 +543,11 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
 
     // Route the codec to the speaker before any open attempt so a successful
     // open has an audible path right away. Best effort: some devices name the
-    // mixer controls differently. NOT for AAudio: the audio HAL owns the mixer
-    // for AAudio streams, and force-routing the codec from outside (tinymix)
-    // can jam the HAL's session start - the stream opens but never renders.
-    if (!is_aaudio_device(device_name)) {
+    // mixer controls differently. NOT for AAudio or Termux:API: the audio HAL
+    // (AudioFlinger) owns the mixer for those streams, and force-routing the
+    // codec from outside (tinymix) can jam the HAL's session start - the
+    // stream opens but never renders.
+    if (!is_aaudio_device(device_name) && !is_termux_device(device_name)) {
         AndroidHelpers::apply_speaker_routing();
     }
 

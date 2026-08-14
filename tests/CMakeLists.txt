@@ -9,10 +9,13 @@ set(TEST_SOURCES
     test_socket.cpp
     test_usb_tunnel.cpp
     test_conversion.cpp
+    test_termux_api.cpp
     test_thread_safety.cpp
     test_type_safety.cpp
     test_memory_safety.cpp
     ../src/client/jitter_buffer.cpp
+    ../src/client/termux_api_player.cpp
+    ../src/client/android_helpers.cpp
     ../src/common/socket_util.cpp
 )
 

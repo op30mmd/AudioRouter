@@ -7,6 +7,12 @@
 # Backward-compatible: ./scripts/termux_run.sh [SERVER_IP] [PORT] [CLIENT_ARGS...]
 # e.g. ./scripts/termux_run.sh 10.16.211.80 44100 -d agm -b auto
 #      ./scripts/termux_run.sh -s 10.58.30.80 -d aaudio -b auto
+#      ./scripts/termux_run.sh -s 10.58.30.80 -d termux   (Termux:API media
+#                                                player, no root - needs the
+#                                                Termux:API app installed;
+#                                                -T <ms> sets the file length,
+#                                                e.g. -T 300000 = switch
+#                                                pause every 5 min)
 #      ./scripts/termux_run.sh -u -d aaudio     (Voice over USB: no server IP)
 #      ./scripts/termux_run.sh --tether -d agm  (USB tethering: native UDP over
 #                                                the cable, lowest latency - the
@@ -54,7 +60,7 @@ while [ $# -gt 0 ]; do
             POS=2
             shift 2
             ;;
-        -d|--device|-b|--bind|-l|--latency)
+        -d|--device|-b|--bind|-l|--latency|-T|--termux-segment)
             if [ $# -lt 2 ]; then
                 echo "Error: $1 requires an argument." >&2
                 exit 1
@@ -274,14 +280,19 @@ if [ "$TETHER" -eq 1 ]; then
     trap restore_usb EXIT
 fi
 
-# AAudio runs in-process like the stream_daemon (which works as root), so:
-#   - aaudio + -b/--bind  -> run via su (root) for SO_BINDTODEVICE.
-#   - aaudio without -b   -> run directly as the current user.
+# AAudio runs in-process like the stream_daemon (which works as root), and the
+# Termux:API backend must run as the Termux app user (its listen-socket
+# protocol only accepts the Termux uid, and com.termux.api reads the segment
+# files from the Termux home), so:
+#   - aaudio/termux + -b/--bind  -> run via su (root) for SO_BINDTODEVICE.
+#   - aaudio/termux without -b   -> run directly as the current user.
 IS_AAUDIO=0
+IS_TERMUX=0
 HAS_BIND=0
 for a in "${CLIENT_ARGS[@]}"; do
     case "$a" in
         aaudio|aaudio:*) IS_AAUDIO=1 ;;
+        termux|termux-api|termux:*) IS_TERMUX=1 ;;
         -b|--bind) HAS_BIND=1 ;;
     esac
 done
@@ -296,6 +307,18 @@ if [ "$TETHER" -eq 1 ] && [ "$IS_AAUDIO" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
     echo "Error: --tether pins the socket with -b (root), but AAudio does not render as root." >&2
     echo "For AAudio over USB tethering: enable 'USB tethering' in the phone Settings," >&2
     echo "then run:  ./scripts/termux_run.sh -s <PC-USB-IP> -d aaudio" >&2
+    echo "(the server prints its USB interface IP on startup; no root needed)." >&2
+    exit 1
+fi
+
+# Same for the Termux:API backend: it must run as the Termux app user (the
+# API app only accepts the Termux uid and reads the segment files from the
+# Termux home), so it cannot be combined with the root rndis0 pin either.
+if [ "$TETHER" -eq 1 ] && [ "$IS_TERMUX" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "Error: --tether pins the socket with -b (root), but the Termux:API backend must" >&2
+    echo "run as the Termux app user. For Termux:API over USB tethering: enable 'USB" >&2
+    echo "tethering' in the phone Settings, then run:" >&2
+    echo "  ./scripts/termux_run.sh -s <PC-USB-IP> -d termux" >&2
     echo "(the server prints its USB interface IP on startup; no root needed)." >&2
     exit 1
 fi
@@ -363,19 +386,31 @@ run_via_su() {
 }
 
 if [ "$(id -u)" -ne 0 ]; then
-    if [ "$IS_AAUDIO" -eq 1 ] && [ "$HAS_BIND" -eq 1 ]; then
+    if { [ "$IS_AAUDIO" -eq 1 ] || [ "$IS_TERMUX" -eq 1 ]; } && [ "$HAS_BIND" -eq 1 ]; then
         # Root for the socket binding; AAudio runs in-process like the
-        # stream_daemon (which works as root).
+        # stream_daemon (which works as root). Termux:API binds the socket as
+        # root and then drops to the Termux app user inside the client, so
+        # the API sandbox and socket protocol keep working.
         if ! command -v su >/dev/null 2>&1; then
             echo "Error: '-b' needs root but 'su' is not available. Run 'su' first or install su." >&2
             exit 1
         fi
-        echo "Requesting root privileges via su (for -b auto); AAudio runs in-process like stream_daemon..."
+        if [ "$IS_TERMUX" -eq 1 ]; then
+            echo "Note: -d termux with -b: the client binds the socket as root and then drops"
+            echo "to the Termux app user, so the Termux:API sandbox still works."
+        fi
+        echo "Requesting root privileges via su (for -b auto); the backend runs in-process..."
         run_via_su "$CMD"
+    elif [ "$IS_TERMUX" -eq 1 ]; then
+        echo "Termux:API backend: running as the current user (requires the Termux:API app)."
+        echo "Note: if the Termux:API media player is unavailable, the client falls back to"
+        echo "AAudio (no root) and then the root backends (AGM/ALSA)."
+        launch_direct
     elif [ "$IS_AAUDIO" -eq 1 ]; then
         echo "AAudio backend: running as the current user (like: ./stream_daemon)."
-        echo "Note: if AAudio does not work on this device, the AGM/ALSA fallbacks need root -"
-        echo "re-run with '-b auto' (or '-d agm') via su in that case."
+        echo "Note: if AAudio does not work on this device, the Termux:API / AGM / ALSA"
+        echo "fallbacks take over - re-run with '-b auto' (or '-d agm') via su for the"
+        echo "root backends in that case."
         launch_direct
     else
         if ! command -v su >/dev/null 2>&1; then
@@ -385,12 +420,10 @@ if [ "$(id -u)" -ne 0 ]; then
         echo "Requesting root privileges via su..."
         run_via_su "$CMD"
     fi
-elif [ "$IS_AAUDIO" -eq 1 ]; then
-    # Already root (e.g. a root shell) and AAudio requested: launch directly;
-    # AAudio runs in-process like the stream_daemon (which works as root).
-    launch_direct
 else
-    # Already root (Android/system shell) with a root-requiring backend:
-    # launch the absolute path directly.
+    # Already root (Android/system shell): launch the absolute path directly.
+    # AAudio runs in-process like the stream_daemon (which works as root);
+    # Termux:API degrades to am broadcast (its socket protocol only accepts
+    # the Termux app user) and logs a hint - see termux_api_player.cpp.
     launch_direct
 fi

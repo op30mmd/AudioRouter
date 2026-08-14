@@ -60,7 +60,7 @@ jobs:
               -DCMAKE_CXX_STANDARD=23
             cmake --build build-android-arm64 --target audiorouter_client --parallel --verbose
             cmake --build build-android-arm64 --target stream_daemon --parallel --verbose
-            
+
             mkdir -p staging-arm64
             cp build-android-arm64/src/client/audiorouter_client staging-arm64/audiorouter_client
             cp build-android-arm64/src/client/stream_daemon staging-arm64/stream_daemon
@@ -75,6 +75,7 @@ jobs:
               src/client/direct_alsa.cpp \
               src/client/agm_fifo_player.cpp \
               src/client/aaudio_player.cpp \
+              src/client/termux_api_player.cpp \
               src/client/dummy_player.cpp \
               src/client/jitter_buffer.cpp \
               src/client/android_helpers.cpp \
@@ -186,12 +187,12 @@ jobs:
             audiorouter-*.tar.gz
           body: |
             ## 🎵 AudioRouter ${{ steps.tag_gen.outputs.tag_name }}
-            
+
             High-performance audio streaming engine from Windows PC to Android Termux (ALSA / Root / AAudio no-root).
 
             ### 📦 Release Assets
             - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-windows-x64.zip`**: Windows PC Server (`audiorouter_server.exe` with WASAPI Loopback Capture and Endpoint Volume muting).
-            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-android-termux-arm64.tar.gz`**: Android ARM64 Client for Termux (`audiorouter_client` with ALSA, direct `/dev/snd/`, Qualcomm AGM, and AAudio backends + standalone `stream_daemon`).
+            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-android-termux-arm64.tar.gz`**: Android ARM64 Client for Termux (`audiorouter_client` with ALSA, direct `/dev/snd/`, Qualcomm AGM, AAudio, and Termux:API media player backends + standalone `stream_daemon`).
 
             ### 🚀 Quick Start
             1. **Windows PC**: Run `audiorouter_server.exe`

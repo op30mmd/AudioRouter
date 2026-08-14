@@ -97,6 +97,7 @@ CLIENT_SRCS = src/client/main.cpp \
               src/client/direct_alsa.cpp \
               src/client/agm_fifo_player.cpp \
               src/client/aaudio_player.cpp \
+              src/client/termux_api_player.cpp \
               src/client/dummy_player.cpp \
               src/client/jitter_buffer.cpp \
               src/client/android_helpers.cpp
@@ -112,6 +113,7 @@ TEST_SRCS = tests/test_main.cpp \
             tests/test_socket.cpp \
             tests/test_usb_tunnel.cpp \
             tests/test_conversion.cpp \
+            tests/test_termux_api.cpp \
             tests/test_thread_safety.cpp \
             tests/test_type_safety.cpp \
             tests/test_memory_safety.cpp
@@ -192,7 +194,7 @@ $(CLIENT_TARGET): $(CLIENT_OBJS) $(COMMON_OBJS)
 	@echo "Built: $(CLIENT_TARGET)"
 
 # Link Tests
-$(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(COMMON_OBJS)
+$(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(BUILD_DIR)/client_termux_api_player.o $(BUILD_DIR)/client_android_helpers.o $(COMMON_OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXTRA) $^ -o $@ $(CLIENT_LIBS)
 	@echo "Built: $(TEST_TARGET)"
 

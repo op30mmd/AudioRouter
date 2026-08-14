@@ -1,6 +1,7 @@
 #include "client.hpp"
 #include "alsa_player.hpp"
 #include "aaudio_player.hpp"
+#include "termux_api_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
@@ -51,7 +52,7 @@ void print_banner() {
     const char* green = banner_green();
     const char* bold  = banner_bold();
     const char* reset = banner_reset();
-    const char* tag   = "Windows PC audio -> Android speakers  (AAudio / AGM / ALSA)";
+    const char* tag   = "Windows PC audio -> Android speakers  (AAudio / Termux:API / AGM / ALSA)";
 
     if (term_width >= 84) {
         std::cout << cyan << R"(
@@ -92,6 +93,14 @@ void print_usage(const char* prog) {
               << "                              Direct kernel: 'direct:/dev/snd/pcmC0D0p' or any '/dev/snd/...'\n"
               << "                              Qualcomm AGM: 'agm' or 'agm:<backend>'\n"
               << "                              AAudio (NO ROOT needed): 'aaudio', 'aaudio:deep', 'aaudio:voip'\n"
+              << "                              Termux:API (NO ROOT, needs the Termux:API app):\n"
+              << "                                'termux', 'termux-api', 'termux:<ms>'\n"
+              << "                                (ms = file length; one ~prepare-time switch pause\n"
+              << "                                 per file. The delay is ~0.6 s + command latency,\n"
+              << "                                 not the file length)\n"
+              << "  -T, --termux-segment <ms>  Termux:API file length in ms (default 600000 = one\n"
+              << "                              switch pause per 10 min; 2000..3600000). Same delay\n"
+              << "                              regardless; overrides -d termux:<ms>\n"
               << "  -l, --latency <ms>        Target Jitter Buffer latency in ms (default: 35ms)\n"
               << "  -b, --bind <iface>        Pin UDP socket to a network interface (bypasses Android VPN tunnels):\n"
               << "                              'auto' = detect physical NIC (e.g. wlan0), or specify e.g. 'wlan0'\n"
@@ -166,6 +175,13 @@ int main(int argc, char* argv[]) {
             config.server_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
             config.device_name = argv[++i];
+        } else if ((arg == "-T" || arg == "--termux-segment") && i + 1 < argc) {
+            try {
+                config.termux_segment_ms = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } catch (const std::exception&) {
+                std::cerr << "Invalid -T/--termux-segment value: " << argv[i] << "\n";
+                return 1;
+            }
         } else if ((arg == "-l" || arg == "--latency") && i + 1 < argc) {
             config.target_latency_ms = static_cast<uint32_t>(std::stoi(argv[++i]));
             latency_explicit = true;
@@ -216,6 +232,17 @@ int main(int argc, char* argv[]) {
             std::cout << "  -> available — use -d aaudio (or aaudio:deep / aaudio:voip)\n";
         } else {
             std::cout << "  -> not compiled in this build (needs an Android API 26+ toolchain with libaaudio)\n";
+        }
+        std::cout << "\nTermux:API media player (no root, needs the Termux:API app):\n";
+        if (audiorouter::TermuxApiPlayer::is_supported()) {
+            if (audiorouter::TermuxApiPlayer::api_available()) {
+                std::cout << "  -> available — use -d termux (or termux:1000 for ~1 s segments)\n";
+            } else {
+                std::cout << "  -> the Termux:API app (com.termux.api) is not answering — install it from\n"
+                          << "     F-Droid, then use -d termux\n";
+            }
+        } else {
+            std::cout << "  -> not available on this platform\n";
         }
         return 0;
     }

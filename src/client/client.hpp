@@ -40,6 +40,11 @@ struct ClientConfig {
     // Network interface to pin the UDP socket to ("auto" = detect physical
     // NIC, "" = leave routing to the OS). Bypasses Android VPN tunnels.
     std::string bind_iface = "";
+    // Termux:API backend: file length in ms (how often the media player
+    // switches files; one ~prepare-time pause per switch). 0 = the backend
+    // default (600000 ms) or the -d termux:<ms> device suffix. Overrides
+    // the device suffix when set. Ignored for other backends.
+    uint32_t termux_segment_ms = 0;
     // Stream over the USB cable: the PC runs "adb reverse udp:PORT udp:PORT",
     // which tunnels the phone's loopback UDP port over USB to the PC's
     // loopback. The client then just targets 127.0.0.1; no Wi-Fi involved.

@@ -88,6 +88,16 @@ fi
 
 echo "[4/4] Setup complete!"
 echo ""
+# Termux:API backend (-d termux, no root): needs the Termux:API app, whose
+# media player renders the stream. Check for it and hint when missing.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Note: run 'pm path com.termux.api' as the Termux user to check for the Termux:API"
+    echo "app (needed only for the no-root '-d termux' backend)."
+elif ! pm path com.termux.api >/dev/null 2>&1; then
+    echo "Note: the Termux:API app is not installed - the no-root '-d termux' backend"
+    echo "needs it. Install Termux:API from F-Droid, then run:"
+    echo "  ./scripts/termux_run.sh -s <PC_IP> -d termux"
+fi
 if [ -x "$SCRIPT_DIR/audiorouter_client" ]; then
     # Release layout: the binary sits next to this script.
     echo "To run AudioRouter Client:"
