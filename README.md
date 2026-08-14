@@ -293,6 +293,14 @@ End-to-end audio delay = jitter buffer + backend delay:
 | Termux:API ring buffer | `prefill (600 ms) + command latency` (~0.7 s socket protocol, ~1.6 s am broadcast) — the file ring pre-sizes each segment, so the player only needs the prefill before starting | + segment length after a player death until the next switch | prefill gate + issuer thread + latency EMA (§3.3.1) |
 | Network / UDP | RTT + jitter (see status line) | — | — |
 
+While a device is still opening, the player slot is left **empty** rather than
+filled with the dummy sink: the playback thread treats a null player as "nothing
+to write to yet" and paces itself, so audio starts the instant the supervisor
+hot-swaps a real backend in. (A placeholder there used to consume frames, print
+the Android troubleshooting wall prematurely, and — because it reports
+`is_open()` — could be mistaken for a live backend and block the real one.) The
+dummy sink is now only used when it is explicitly requested with `--dummy`.
+
 The 5 s status line reports the backend portion separately as
 `Audio: <ms>` (`ClientStats::audio_backend_delay_ms`, sampled from
 `IAudioPlayer::get_buffer_delay_frames()` = FIFO bytes + AAudio

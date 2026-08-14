@@ -403,6 +403,11 @@ namespace {
                       << "most likely holding the primary PCM device. Run (as root):");
             LOG_ERROR("    stop audioserver");
             LOG_ERROR("then re-run the client. Re-enable Android audio later with: start audioserver");
+            // Only now is the troubleshooting wall actually warranted: every
+            // backend has been tried and failed. It used to print the moment
+            // the first open exceeded its budget, while the supervisor was
+            // still working and a device was usually seconds away.
+            AndroidHelpers::print_android_troubleshooting_tips();
         }
         LOG_INFO("Audio device open thread exiting.");
     }
@@ -719,19 +724,25 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
         return;
     }
 
+    // Do NOT install a dummy sink here. The open supervisor is still running in
+    // the background and a real backend usually lands a few seconds later; a
+    // placeholder in the slot only invites the "is something already playing?"
+    // ambiguity that previously discarded real devices, and it silently
+    // consumes frames (and prints a full ALSA troubleshooting wall) while the
+    // real open is still in flight.
+    //
+    // Leaving open_->player empty is safe: the playback thread already treats a
+    // null player as "nothing to write to yet" and paces itself, so audio
+    // simply starts the moment the supervisor hot-swaps a device in.
     if (!completed) {
-        LOG_WARN("Audio device open timed out after " << timeout_ms
-                 << "ms (ALSA driver may be busy). Using dummy sink; retrying in background...");
+        LOG_WARN("Audio device '" << device_name << "' has not opened yet after "
+                 << timeout_ms << " ms; still trying in the background. Playback starts "
+                 "as soon as a backend opens.");
     } else {
-        LOG_WARN("Could not open ALSA device '" << device_name << "'. Using dummy sink; retrying in background...");
+        LOG_WARN("Could not open audio device '" << device_name
+                 << "' yet; still trying in the background. Playback starts as soon as a "
+                 "backend opens.");
     }
-
-    {
-        std::lock_guard<std::mutex> lock(open_->mutex);
-        open_->player = std::make_shared<DummyPlayer>();
-        open_->player->open(audio_config_, "dummy_fallback");
-    }
-    AndroidHelpers::print_android_troubleshooting_tips();
 }
 
 void AudioRouterClient::stop() {
