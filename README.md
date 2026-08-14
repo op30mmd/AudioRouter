@@ -200,7 +200,7 @@ The device name selects both the backend and the fallback chain:
 | `-d` value | Backend | Privilege | Notes |
 |------------|---------|-----------|-------|
 | `aaudio` / `aaudio:deep` / `aaudio:voip` | **AAudio** (NDK, in-process) | none | Byte-for-byte mirror of `stream_daemon`: 64 KB (≈341 ms) `O_RDWR` FIFO, ~20 ms pump chunks, 500 ms write timeout, no usage hints, no readiness probe; lenient watchdog (20 failed writes → recreate + drain the FIFO, deep-buffer mode on 2nd rebuild, fall back after 3). FIFO at `/data/local/tmp` as root, `$HOME` otherwise. |
-| `termux` / `termux-api` / `termux:<ms>` | **Termux:API** media player (Android `MediaPlayer` via `com.termux.api`) | none | Needs the Termux:API app (F-Droid). MediaPlayer cannot play a pipe or a growing file, so the stream is cut into self-contained WAV segments (`<ms>` length, default 2000 ms) recorded into a recycled 8-file pool under the Termux home (pre-labeled with the app-data SELinux context before the privilege drop) and handed over as `--es api_method MediaPlayer -a play`. All IPC runs on a dedicated issuer thread — the playback thread never blocks — and the issue gate stretches segments past the command latency so audio stays continuous even when commands are slow (see §3.3.1). Commands use the Termux:API listen-socket protocol when available and fall back to plain `am broadcast` (the only path on Android 14+, where the app process gets frozen). |
+| `termux` / `termux-api` / `termux:<ms>` | **Termux:API** media player (Android `MediaPlayer` via `com.termux.api`) | none | Needs the Termux:API app (F-Droid). MediaPlayer cannot play a pipe or a growing file, so the stream is cut into self-contained WAV segments (`<ms>` length, default 2000 ms) recorded into a recycled 8-file pool under the Termux home (pre-labeled with the app-data SELinux context before the privilege drop) and handed over as `--es api_method MediaPlayer -a play`. All IPC runs on a dedicated issuer thread — the playback thread never blocks — and the issue gate stretches segments past the command latency so audio stays continuous even when commands are slow (see §3.3.1). Commands use the Termux:API listen-socket protocol when available, otherwise `am broadcast` with the client's result sockets (the official termux-api mechanism on Android 14+, where the app process freezes); every play is confirmed by the app's own reply. |
 | `agm` / `agm:<backend>` | **AGM** via vendor `agmplay` subprocess + WAV-over-FIFO | root | Default backend `CODEC_DMA-LPAIF_RXTX-RX-1`; auto-recover: FIFO-stall detection, logcat/mixer preemption watcher, HAL restart. |
 | `direct:/dev/snd/pcmC0D0p` or `/dev/snd/...` | **Direct kernel PCM** (ioctl) | root | No ALSA userspace deps; enumerates `/dev/snd` nodes; per-node retry with hang detection. |
 | `default`, `hw:0,0`, `plughw:0,0` | **ALSA** via `libasound.so` | root | dlopen-based, optional direct fallback. |
@@ -246,19 +246,21 @@ gapless:
   segment is replaced by the fresher one (logged rate-limited) and playback
   resumes at live audio;
 - `L` is tracked with an EMA of the measured command latency (seeded from the
-  open() probe). Over the Termux:API listen-socket protocol the command
-  result only arrives after `prepare()+start()`, so the measurement includes
-  the real player startup; the plain-`am` fallback adds a fixed bias. On
-  Android 14+ (API 34+) the socket is skipped entirely — the app process can
-  be frozen, its listen socket then accepts but never answers (the official
-  termux-api binary does the same);
-- a watchdog (socket protocol only) polls the player status once a second and
-  resumes a paused player. Every scheduled boundary re-issues `play`
-  regardless, so the stream self-heals from a dead player at the next
-  boundary; the first play in `am broadcast` mode is verified with a status
-  query so silent failures surface in the log. Failed plays keep the stream
-  recording and resume at the next segment (the same stale-audio policy as
-  the FIFO backends).
+  open() probe). Commands prefer the Termux:API listen-socket protocol; where
+  it is unavailable they go through `am broadcast` **carrying the client's own
+  result-socket extras** — the app then writes its result back after
+  `prepare()+start()` (the exact mechanism the official termux-api binary uses
+  on Android 14+, where the app's own listen socket freezes). Every play is
+  therefore confirmed by the app's own "Now Playing" reply, which surfaces
+  silent failures in the log; apps too old to answer over the result sockets
+  fall back to a blind delivery-only mode with a fixed latency estimate;
+- a watchdog (whenever the app has a result channel) polls the player status
+  once a second and resumes a paused player. Every scheduled boundary
+  re-issues `play` regardless, so the stream self-heals from a dead player at
+  the next boundary; every play is confirmed by the app's own reply, so
+  silent failures surface in the log. Failed plays keep the stream recording
+  and resume at the next segment (the same stale-audio policy as the FIFO
+  backends).
 
 Trade-off: delay vs. switch glitches — `-d termux:1000` plays ~1 s behind the
 PC with more frequent boundaries, `-d termux` (2000 ms) is the balanced
@@ -476,13 +478,16 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
     needs root) the client binds the socket as root, pre-labels the segment pool, and
     then drops to the Termux app user in-process, so the sandbox and socket protocol
     keep working;
-  - on **Android 14+** the listen socket is skipped (the app process gets frozen), so
-    commands go through `am broadcast`, which is slower: playback stays continuous but
-    sits `~2 × command latency` behind the PC (the log prints the measured latency and
-    warns when segments are dropped — raise `-d termux:<ms>` in that case);
-  - the first play is verified with a status query; if the log reports
-    `did not report a playing track`, the segment files were unreadable or `prepare()`
-    failed — check `logcat -s MediaPlayerAPI` for the app's error;
+  - on **Android 14+** the app's listen socket freezes, so commands go through
+    `am broadcast` with the client's result sockets — still fully confirmed by the
+    app, just slower (the startup log prints the measured command latency; playback
+    stays continuous but sits `~2 × command latency` behind the PC, so raise
+    `-d termux:<ms>` if the log reports dropping segments);
+  - every play is logged with the app's own reply (`Now Playing: seg_pX.wav`).
+    If the reply is an error or the log reports `the app returned no result`,
+    the app could not play the segment — check `logcat -s MediaPlayerAPI` for its
+    error. If the app confirms every play but no sound comes out, the segment path
+    is fine and the issue is device-side: media volume or the media output route;
   - playback uses Android's media volume, not the call volume.
 - **`/dev/snd` nodes hang**: Android's `audioserver` usually holds them.
   `su -c "stop audioserver"` frees them (re-enable with `start audioserver`).

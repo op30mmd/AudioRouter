@@ -86,13 +86,15 @@ std::string build_command_line(const std::string& action, const std::string& fil
 // when commands are slow (am broadcast), with continuous audio either way.
 //
 // Commands prefer the termux-api listen-socket protocol (mirrors the official
-// termux-api binary; gives synchronous results) and fall back to plain
-// `am broadcast`. On Android 14+ (API 34+) the socket is skipped entirely —
-// the app process can be frozen, its listen socket then accepts but never
-// answers, which is why the official termux-api binary does the same.
-// A lightweight watchdog (socket protocol only) resumes a paused player;
-// every scheduled segment boundary re-issues `play` regardless, so the
-// stream self-heals from a dead player at the next boundary.
+// termux-api binary; gives synchronous results) and otherwise go through
+// `am broadcast` carrying the client's own result-socket extras — the app
+// then writes its result (after prepare()+start()) to the client's socket,
+// which is exactly how the official termux-api binary works on Android 14+
+// where the app's own listen socket freezes. A lightweight watchdog resumes
+// a paused player; every scheduled segment boundary re-issues `play`
+// regardless, so the stream self-heals from a dead player at the next
+// boundary. Apps too old to answer over the result sockets run in a blind
+// fallback mode (delivery only, fixed latency estimate, logcat advised).
 //
 // Device naming (select with -d):
 //   termux            -> 2 s segments (default: ~2 s delay, no root)
@@ -163,9 +165,13 @@ private:
     std::atomic<uint64_t> issue_wall_ms_{0};
     std::atomic<size_t> issued_frames_{0};
     std::atomic<double> latency_est_ms_{300.0};  // EMA of the play command latency
-    std::atomic<bool> socket_protocol_{false};   // listen-socket protocol working
-    bool am_only_ = false;                       // set at open() after the probe
-    std::atomic<bool> first_play_done_{false};
+    // True while the app answers commands with result text (listen-socket
+    // protocol, or am broadcast with result sockets on Android 14+). False =
+    // blind am broadcast mode (old app without a result channel): no EMA
+    // updates, no watchdog.
+    std::atomic<bool> result_channel_{true};
+    bool socket_path_ = false;                   // listen-socket protocol (vs am)
+    int consecutive_no_result_ = 0;              // issuer thread only
 
     std::thread issuer_thread_;
     std::atomic<bool> stop_issuer_{false};
@@ -186,9 +192,6 @@ private:
     // fresher one. Caller holds io_mutex_.
     void finalize_segment_locked();
     void issuer_loop();
-    // am-broadcast mode cannot observe play results; after the first play,
-    // ask the app for its status so silent failures surface in the log.
-    void verify_first_play();
     void watchdog_loop();
 };
 

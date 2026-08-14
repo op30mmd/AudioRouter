@@ -57,11 +57,10 @@ constexpr uint32_t kIssueLeadMs = 100;
 constexpr double kInitialLatencyMs = 300.0;
 constexpr double kMinLatencyMs = 60.0;
 constexpr double kMaxLatencyMs = 4000.0;
-// The plain `am broadcast` path cannot observe prepare()+start() (its
-// pclose() returns when the receiver hands the command to the player
-// service), so the measured round trip underestimates the real startup by
-// roughly the service handling time. Compensate with a fixed bias.
-constexpr double kAmFallbackLatencyBiasMs = 150.0;
+// Blind mode only (no result channel at all): the am round trip cannot
+// observe prepare()+start(), so the fixed estimate gets a small bias on top
+// of the measured am duration.
+constexpr double kBlindSeedBiasMs = 150.0;
 
 // Segment file pool: a small fixed set of inodes created (and, as root,
 // SELinux-labeled) before streaming starts, then recycled with O_TRUNC so
@@ -322,9 +321,9 @@ SocketCommandResult try_socket_command(const std::string& action, const std::str
 #endif
 }
 
-// Plain `am broadcast` fallback (works on Termux:API versions without the
-// listen socket; command results are only visible in its output on older app
-// versions). Returns the captured output.
+// Plain `am broadcast` (no result sockets): delivery only, the am command's
+// own chatter comes back as the "result". Used by close()'s fire-and-forget
+// stop and by blind mode.
 bool send_am_broadcast(const std::string& action, const std::string& file,
                        std::string* result_out) {
 #if defined(__ANDROID__)
@@ -354,49 +353,156 @@ bool send_am_broadcast(const std::string& action, const std::string& file,
 #endif
 }
 
-// Preferred command path with result text: socket protocol first, plain am
-// broadcast fallback (only when the socket path could not reach the app at
-// all). On Android 14+ (API 34+) the socket is skipped entirely: the system
-// can freeze the API app's process, whose listen socket then accepts
-// connections but never answers (the official termux-api binary skips the
-// socket there for the same reason). Also records which path succeeded.
-// result_complete (optional) reports whether the command duration observed
-// by the caller is a full prepare()+start() measurement (socket path with
-// the result read back, or the am fallback's pclose) — a lost socket result
-// must not be used as a latency sample.
-bool send_media_command(std::atomic<bool>* socket_protocol, const std::string& action,
-                        const std::string& file, std::string* result_out, int accept_timeout_ms,
-                        bool* result_complete = nullptr) {
-#if defined(__ANDROID__)
-    if (android_sdk_int() >= 34) {
-        socket_protocol->store(false);
-        const bool ok = send_am_broadcast(action, file, result_out);
-        if (result_complete != nullptr) *result_complete = ok;
-        return ok;
-    }
+// Outcome of one media command.
+struct MediaCommandOutcome {
+    bool delivered = false;        // the app got the command
+    bool result_received = false;  // the app wrote its result text back
+    bool socket_path = false;      // listen-socket protocol (vs am broadcast)
     std::string result;
-    bool complete = false;
-    const SocketCommandResult sr =
-        try_socket_command(action, file, &result, accept_timeout_ms, &complete);
-    if (sr == SocketCommandResult::Executed) {
-        socket_protocol->store(true);
-        if (result_out != nullptr) *result_out = result;
-        if (result_complete != nullptr) *result_complete = complete;
-        return true;
+    // Duration of the successful delivery path. With a result received this
+    // is the full command time incl. prepare()+start() — a real latency
+    // sample. Without one it is just the am round trip.
+    uint64_t duration_ms = 0;
+};
+
+// `am broadcast` carrying the client's own result-socket extras — the path
+// the official termux-api binary uses on Android 14+, where the app's own
+// listen socket freezes but the client's listener sockets work fine. The
+// app writes its result (after prepare()+start()) to socket_output; we wait
+// for it after `am` returns.
+MediaCommandOutcome send_am_socket_broadcast(const std::string& action,
+                                             const std::string& file,
+                                             int accept_timeout_ms) {
+    MediaCommandOutcome out;
+#if defined(__ANDROID__)
+    static std::atomic<uint64_t> s_am_counter{0};
+    const uint64_t c = s_am_counter.fetch_add(1, std::memory_order_relaxed);
+    const std::string base =
+        "audiorouter_tapi_am_" + std::to_string(static_cast<long>(::getpid())) + "_" +
+        std::to_string(static_cast<unsigned long long>(c));
+    const std::string in_name = base + "_in";
+    const std::string out_name = base + "_out";
+
+    const int in_fd = make_abstract_listener(in_name);
+    const int out_fd = make_abstract_listener(out_name);
+    if (in_fd < 0 || out_fd < 0) {
+        if (in_fd >= 0) ::close(in_fd);
+        if (out_fd >= 0) ::close(out_fd);
+        // No listener sockets available: degrade to delivery-only am.
+        std::string txt;
+        const uint64_t t0 = audiorouter::get_time_ms();
+        out.delivered = send_am_broadcast(action, file, &txt);
+        out.duration_ms = audiorouter::get_time_ms() - t0;
+        out.result = txt;
+        return out;
     }
-    socket_protocol->store(false);
-    const bool ok = send_am_broadcast(action, file, result_out);
-    if (result_complete != nullptr) *result_complete = ok;
-    return ok;
+
+    const std::string shell = find_am() +
+        " broadcast --user 0 -n com.termux.api/.TermuxApiReceiver " +
+        audiorouter::termux_api::build_command_line(action, file, in_name, out_name) +
+        " 2>&1";
+
+    std::string am_stdout;
+    int rc = -1;
+    const uint64_t t0 = audiorouter::get_time_ms();
+    {
+        std::lock_guard<std::mutex> lock(audiorouter::AndroidHelpers::subprocess_mutex());
+        if (FILE* f = ::popen(shell.c_str(), "r")) {
+            char buf[512];
+            while (::fgets(buf, static_cast<int>(sizeof(buf)), f) != nullptr) {
+                am_stdout += buf;
+            }
+            rc = ::pclose(f);
+        }
+    }
+    const uint64_t am_ms = audiorouter::get_time_ms() - t0;
+    if (rc != 0) {
+        ::close(in_fd);
+        ::close(out_fd);
+        out.result = trim(am_stdout);
+        return out;  // not delivered
+    }
+    out.delivered = true;
+    out.duration_ms = am_ms;
+
+    // The broadcast is out; now wait for the app to write its result to the
+    // result socket (for play, the result only arrives after
+    // prepare()+start()).
+    std::string result;
+    const int acc = accept_with_timeout(out_fd, accept_timeout_ms);
+    if (acc >= 0) {
+        out.result_received = read_to_eof(acc, &result, accept_timeout_ms);
+        ::close(acc);
+    }
+    ::close(in_fd);
+    ::close(out_fd);
+    if (out.result_received) {
+        out.result = result;
+        out.duration_ms = audiorouter::get_time_ms() - t0;
+    }
+    return out;
 #else
-    (void)socket_protocol;
     (void)action;
     (void)file;
-    (void)result_out;
     (void)accept_timeout_ms;
-    if (result_complete != nullptr) *result_complete = false;
-    return false;
+    return out;
 #endif
+}
+
+// Preferred command path with results: the listen-socket protocol first (it
+// is the fastest and measures prepare()+start() precisely), then am
+// broadcast with result sockets. On Android 14+ (API 34+) the app's listen
+// socket freezes, so the am path is used directly — exactly like the
+// official termux-api binary.
+MediaCommandOutcome send_media_command(const std::string& action, const std::string& file,
+                                       int accept_timeout_ms) {
+    MediaCommandOutcome out;
+#if defined(__ANDROID__)
+    if (android_sdk_int() < 34) {
+        const uint64_t t0 = audiorouter::get_time_ms();
+        std::string result;
+        bool complete = false;
+        if (try_socket_command(action, file, &result, accept_timeout_ms, &complete) ==
+            SocketCommandResult::Executed) {
+            out.delivered = true;
+            out.result_received = complete;
+            out.socket_path = true;
+            out.result = result;
+            out.duration_ms = audiorouter::get_time_ms() - t0;
+            return out;
+        }
+    }
+    out = send_am_socket_broadcast(action, file, accept_timeout_ms);
+#else
+    (void)action;
+    (void)file;
+    (void)accept_timeout_ms;
+#endif
+    return out;
+}
+
+// Player-level command path: respects the blind fallback (result_channel ==
+// false), where commands go out as plain am broadcasts with no result wait.
+MediaCommandOutcome media_command(std::atomic<bool>* result_channel, const std::string& action,
+                                  const std::string& file, int accept_timeout_ms) {
+    MediaCommandOutcome out;
+#if defined(__ANDROID__)
+    if (!result_channel->load()) {
+        const uint64_t t0 = audiorouter::get_time_ms();
+        std::string txt;
+        out.delivered = send_am_broadcast(action, file, &txt);
+        out.duration_ms = audiorouter::get_time_ms() - t0;
+        out.result = txt;
+        return out;
+    }
+    out = send_media_command(action, file, accept_timeout_ms);
+#else
+    (void)result_channel;
+    (void)action;
+    (void)file;
+    (void)accept_timeout_ms;
+#endif
+    return out;
 }
 
 // Converts S24LE / S32LE interleaved input to S16LE (the WAV on disk is
@@ -571,41 +677,45 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
     }
 
     // Preflight: the Termux:API app must answer a media_player command. The
-    // probe duration seeds the latency EMA (an am-broadcast probe to a cold
-    // app measures almost the real command cost).
-    const uint64_t probe_t0 = get_time_ms();
-    std::string probe;
-    socket_protocol_.store(false);
-    if (!send_media_command(&socket_protocol_, "info", "", &probe, kProbeTimeoutMs)) {
+    // probe also decides the transport: listen socket, am broadcast with
+    // result sockets, or blind am (old app without a result channel).
+    MediaCommandOutcome probe = media_command(&result_channel_, "info", "", kProbeTimeoutMs);
+    if (!probe.delivered) {
         LOG_ERROR("TermuxApiPlayer: the Termux:API app did not answer a media_player "
                   "command (is com.termux.api installed?)");
         LOG_ERROR("TermuxApiPlayer: install Termux:API from F-Droid (the "
                   "termux-media-player API), then retry with -d termux");
         return false;
     }
-    const uint64_t probe_ms = get_time_ms() - probe_t0;
-    if (!probe.empty()) LOG_DEBUG("TermuxApiPlayer: probe result: " << probe);
-
-    am_only_ = !socket_protocol_.load();
-    if (am_only_) {
-        // am broadcast gives no synchronous play results; seed the EMA from
-        // the probe so the very first segment is scheduled correctly.
-        latency_est_ms_.store(std::clamp(static_cast<double>(probe_ms) + kAmFallbackLatencyBiasMs,
-                                         kMinLatencyMs, kMaxLatencyMs));
-        LOG_INFO("TermuxApiPlayer: Termux:API listen socket unavailable; playing via am "
-                 "broadcast" << (android_sdk_int() >= 34
-                                     ? " (Android 14+: the app's socket stalls while its process is frozen)"
-                                     : ""));
-        LOG_INFO("TermuxApiPlayer: am broadcast commands take ~" << static_cast<uint32_t>(
-                     latency_est_ms_.load()) << " ms here; segments are stretched to keep "
-                 "playback continuous, so expect ~2x that in end-to-end delay");
+    socket_path_ = probe.socket_path;
+    result_channel_.store(probe.result_received);
+    consecutive_no_result_ = 0;
+    if (probe.result_received) {
+        // The app answers with result text: every play's command duration
+        // includes prepare()+start(), so the EMA converges quickly.
+        latency_est_ms_.store(socket_path_ ? kInitialLatencyMs
+                                           : std::clamp(static_cast<double>(probe.duration_ms) +
+                                                            kBlindSeedBiasMs,
+                                                        kMinLatencyMs, kMaxLatencyMs));
+        LOG_INFO("TermuxApiPlayer: app result channel: "
+                 << (socket_path_ ? "listen socket" : "am broadcast + result sockets")
+                 << "; app status: " << trim(probe.result));
     } else {
-        latency_est_ms_.store(kInitialLatencyMs);
+        // Older Termux:API app: it processes the broadcasts but ignores the
+        // result sockets. Blind mode: delivery only, fixed latency estimate,
+        // no watchdog. Check 'logcat -s MediaPlayerAPI' for app-side errors.
+        latency_est_ms_.store(std::clamp(static_cast<double>(probe.duration_ms) +
+                                             kBlindSeedBiasMs,
+                                         kMinLatencyMs, kMaxLatencyMs));
+        LOG_INFO("TermuxApiPlayer: the app returned no result over the result sockets "
+                 "(older Termux:API app?); playing blind via am broadcast, fixed ~"
+                 << static_cast<uint32_t>(latency_est_ms_.load()) << " ms command estimate. "
+                 "Install the current Termux:API from F-Droid for status reporting and "
+                 "watchdog recovery.");
     }
 
     issue_wall_ms_.store(0);
     issued_frames_.store(0);
-    first_play_done_.store(false);
     drops_ = 0;
     last_drop_warn_ms_ = 0;
     seg_fd_ = -1;
@@ -622,11 +732,14 @@ bool TermuxApiPlayer::open(const AudioConfig& config, const std::string& device_
     stop_issuer_.store(false);
     issuer_thread_ = std::thread(&TermuxApiPlayer::issuer_loop, this);
     stop_watchdog_.store(false);
-    if (!am_only_) {
+    if (result_channel_.load()) {
         watchdog_thread_ = std::thread(&TermuxApiPlayer::watchdog_loop, this);
     }
     LOG_INFO("TermuxApiPlayer: Termux:API media player ready (" << segment_ms_
-             << " ms segments, " << (am_only_ ? "am broadcast" : "socket protocol")
+             << " ms segments, "
+             << (socket_path_ ? "socket protocol"
+                              : (result_channel_.load() ? "am + result sockets"
+                                                        : "blind am broadcast"))
              << ", cache " << cache_dir_ << ")");
     return true;
 #else
@@ -858,34 +971,37 @@ void TermuxApiPlayer::issuer_loop() {
         // This is the only place that talks to the Termux:API app; blocking
         // here is fine — the recording engine and the jitter buffer keep
         // running on their own threads.
-        const uint64_t t0 = get_time_ms();
-        std::string result;
-        bool complete = false;
-        const bool ok = send_media_command(&socket_protocol_, "play", job.path, &result,
-                                           kPlayTimeoutMs, &complete);
-        const uint64_t elapsed = get_time_ms() - t0;
+        MediaCommandOutcome out = media_command(&result_channel_, "play", job.path,
+                                                kPlayTimeoutMs);
 
-        if (ok) {
-            if (complete) {
-                const double bias = socket_protocol_.load() ? 0.0 : kAmFallbackLatencyBiasMs;
-                const double sample = static_cast<double>(elapsed) + bias;
+        if (out.delivered) {
+            issue_wall_ms_.store(get_time_ms());
+            issued_frames_.store(job.frames);
+            if (out.result_received) {
+                // The app's own confirmation arrived (after prepare+start):
+                // a real latency sample AND proof that playback started.
+                consecutive_no_result_ = 0;
+                const double sample = static_cast<double>(out.duration_ms);
                 const double prev = latency_est_ms_.load();
                 latency_est_ms_.store(std::clamp(prev * 0.65 + sample * 0.35, kMinLatencyMs,
                                                  kMaxLatencyMs));
+                LOG_INFO("TermuxApiPlayer: media player: " << trim(out.result) << " (command "
+                         << out.duration_ms << " ms)");
             } else {
-                LOG_DEBUG("TermuxApiPlayer: play result lost; keeping the previous latency "
-                          "estimate");
-            }
-            issue_wall_ms_.store(get_time_ms());
-            issued_frames_.store(job.frames);
-            LOG_INFO("TermuxApiPlayer: media player: " << trim(result) << " (command "
-                     << elapsed << " ms)");
-            if (!first_play_done_.exchange(true) && !socket_protocol_.load()) {
-                verify_first_play();
+                ++consecutive_no_result_;
+                if (consecutive_no_result_ >= 2 && result_channel_.exchange(false)) {
+                    LOG_WARN("TermuxApiPlayer: the app returned no result twice; switching "
+                             "to blind am broadcast (older Termux:API app?). Installing the "
+                             "current Termux:API from F-Droid restores status reporting.");
+                } else {
+                    LOG_WARN("TermuxApiPlayer: play delivered but the app returned no "
+                             "result (" << consecutive_no_result_ << "); check 'logcat -s "
+                             "MediaPlayerAPI' for app-side errors");
+                }
             }
         } else {
-            LOG_WARN("TermuxApiPlayer: play command failed after " << elapsed << " ms"
-                     << (result.empty() ? std::string() : ": " + trim(result)));
+            LOG_WARN("TermuxApiPlayer: play command failed"
+                     << (out.result.empty() ? std::string() : ": " + trim(out.result)));
             // Keep the issued bookkeeping as-is: a previously playing
             // segment runs to its EOF, and the next ready segment restarts
             // playback at live audio.
@@ -894,52 +1010,21 @@ void TermuxApiPlayer::issuer_loop() {
 #endif
 }
 
-void TermuxApiPlayer::verify_first_play() {
-#if defined(__ANDROID__)
-    // am broadcast gives no result text for the play; ask the app for its
-    // status once prepare()+start() had time to finish. Runs detached (uses
-    // no player state) so the slow `am` call cannot delay the next segment's
-    // play command.
-    std::thread([] {
-        sleep_ms(800);
-        std::string status;
-        if (!send_am_broadcast("info", "", &status)) {
-            LOG_WARN("TermuxApiPlayer: cannot query the media player status (am broadcast "
-                     "failed)");
-            return;
-        }
-        LOG_INFO("TermuxApiPlayer: player status: " << trim(status));
-        if (status.find("No track") != std::string::npos) {
-            LOG_ERROR("TermuxApiPlayer: the Termux:API app did not report a playing track — "
-                      "the segment files may be unreadable by com.termux.api, or MediaPlayer "
-                      "failed to prepare them. Check 'logcat -s MediaPlayerAPI' for the "
-                      "app's error.");
-        }
-    }).detach();
-#else
-    (void)0;
-#endif
-}
-
 void TermuxApiPlayer::watchdog_loop() {
 #if defined(__ANDROID__)
     while (!stop_watchdog_.load()) {
         sleep_ms(kWatchdogPollMs);
         if (stop_watchdog_.load() || !is_open_.load()) break;
-        if (am_only_) continue;               // status invisible without the socket protocol
+        if (!result_channel_.load()) continue;  // blind mode: no status channel
         if (issued_frames_.load() == 0) continue;
 
-        std::string info;
-        if (try_socket_command("info", "", &info, kInfoTimeoutMs) !=
-            SocketCommandResult::Executed) {
-            continue;
-        }
-        socket_protocol_.store(true);
-        if (info.find("Paused") == std::string::npos) continue;
+        MediaCommandOutcome info = media_command(&result_channel_, "info", "", kInfoTimeoutMs);
+        if (!info.delivered || !info.result_received) continue;
+        if (info.result.find("Paused") == std::string::npos) continue;
         LOG_WARN("TermuxApiPlayer: media player paused (audio focus?); resuming");
-        std::string result;
-        if (try_socket_command("resume", "", &result, kInfoTimeoutMs) !=
-            SocketCommandResult::Executed) {
+        MediaCommandOutcome resume =
+            media_command(&result_channel_, "resume", "", kInfoTimeoutMs);
+        if (!resume.delivered) {
             LOG_WARN("TermuxApiPlayer: resume command did not reach the app");
         }
     }
@@ -995,9 +1080,7 @@ bool TermuxApiPlayer::is_supported() {
 
 bool TermuxApiPlayer::api_available() {
 #if defined(__ANDROID__)
-    std::atomic<bool> protocol{false};
-    std::string result;
-    return send_media_command(&protocol, "info", "", &result, kProbeTimeoutMs);
+    return send_media_command("info", "", kProbeTimeoutMs).delivered;
 #else
     return false;
 #endif
