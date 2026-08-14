@@ -22,6 +22,24 @@ public:
 
     virtual void flush() = 0;
     virtual std::string get_device_name() const = 0;
+
+    // True for FIFO-style backends (AAudio, AGM) that buffer whatever they are
+    // handed: the playback thread must throttle itself against
+    // get_buffer_delay_frames(), or the pipe accumulates a permanent backlog.
+    // False for backends whose write_frames() blocks until the device consumes
+    // the samples (ALSA, PulseAudio) and for sinks with no real device
+    // (dummy). Defaults to false so a backend only opts in deliberately.
+    //
+    // This must be a property of the PLAYER, not of the requested device name:
+    // after a fallback the name still refers to the backend the user asked
+    // for, not the one that actually opened.
+    virtual bool needs_playback_pacing() const { return false; }
+
+    // True for the silent stand-in installed while a real device is still
+    // being opened. It must never be treated as "a backend is already
+    // playing": a real backend that finishes opening later has to be allowed
+    // to replace it, or the client streams silence forever.
+    virtual bool is_placeholder() const { return false; }
 };
 
 } // namespace audiorouter

@@ -4,6 +4,7 @@
 #include "agm_fifo_player.hpp"
 #include "aaudio_player.hpp"
 #include "termux_api_player.hpp"
+#include "pulse_player.hpp"
 #include "dummy_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
@@ -30,6 +31,12 @@ namespace {
     // take seconds); its budget is deliberately larger so the dummy sink
     // doesn't flash before the hot-swap.
     constexpr uint32_t kTermuxPlayerOpenTimeoutMs = 8000;
+    // PulseAudio gets the same generous budget: resuming a suspended sink
+    // re-opens the Android HAL stream and can take seconds. With the 3 s
+    // default the client flashed the dummy sink (and the ALSA troubleshooting
+    // wall) on every run that started more than 5 s after the previous one,
+    // even though the connect then succeeded moments later.
+    constexpr uint32_t kPulsePlayerOpenTimeoutMs = pulse::kPlayerOpenTimeoutMs;
     // A single open attempt that exceeds this is considered hung in a kernel
     // call and is abandoned (a new attempt is started on a fresh player).
     constexpr uint32_t kDeviceAttemptTimeoutMs = 20000;
@@ -50,6 +57,24 @@ namespace {
     constexpr size_t kMaxAaudioOpenAttempts = 2;
     // Termux:API opens are an `am` probe round trip; same small budget.
     constexpr size_t kMaxTermuxOpenAttempts = 2;
+    // PulseAudio opens are a socket connect to the local daemon: fast, and
+    // either it answers or it does not.
+    constexpr size_t kMaxPulseOpenAttempts = 2;
+    // ...but libpulse does not always honour that. With no daemon running,
+    // pa_simple_new() can BLOCK (name resolution, autospawn) instead of
+    // returning an error, which used to hold this strategy for the full
+    // kDeviceAttemptTimeoutMs (20 s) - far past the caller's open budget, so
+    // playback was stranded on the dummy sink and the chain never reached
+    // AAudio.
+    //
+    // The cap must still be generous enough for a legitimate slow connect.
+    // PulseAudio's module-suspend-on-idle suspends a sink after 5 s of
+    // silence, and resuming it re-opens the Android HAL stream - measured at
+    // ~2.5 s on device. A 1500 ms cap turned that into a spurious "hung in a
+    // kernel call", so any run starting more than 5 s after the previous one
+    // fell back to AAudio while the PulseAudio connect completed moments
+    // later and had to be discarded.
+    constexpr uint32_t kPulseAttemptTimeoutMs = pulse::kOpenAttemptTimeoutMs;
 
     // "direct:/dev/snd/pcmC0D0p" or a bare "/dev/snd/..." path opens individual
     // kernel PCM nodes; any other name (default, hw:0,0, plughw:...) goes
@@ -76,6 +101,19 @@ namespace {
     bool is_termux_device(const std::string& device_name) {
         return device_name.rfind("termux:", 0) == 0 || device_name == "termux" ||
                device_name == "termux-api";
+    }
+
+    // "pulse" / "pulseaudio" / "pa" (optionally ":<sink>" and/or "@<ms>")
+    // plays through a PulseAudio (or PipeWire pulse-shim) daemon. NO root
+    // required — the daemon runs as the user.
+    bool is_pulse_device(const std::string& device_name) {
+        return pulse::is_pulse_device_name(device_name);
+    }
+
+    // A PulseAudio daemon is only worth trying when this binary was built with
+    // libpulse AND a server socket / PULSE_SERVER is actually present.
+    bool pulse_worth_trying() {
+        return PulsePlayer::is_supported() && PulsePlayer::server_available();
     }
 
     std::vector<std::string> build_node_candidates(const std::string& device_name) {
@@ -112,16 +150,47 @@ namespace {
             opened = open_fn();
         }
 
+        bool superseded = false;
+        std::shared_ptr<IAudioPlayer> displaced;
         if (opened && !open->shutdown.load()) {
             {
                 std::lock_guard<std::mutex> lock(open->mutex);
-                open->player = device;
-                open->result = true;
-                open->pending = false;
+                // A slow attempt that was abandoned can finish AFTER a later
+                // strategy already opened a device. Hot-swapping then would
+                // leave two engines (e.g. this PulseAudio stream and the
+                // AAudio fallback) both feeding the Android HAL. Only take
+                // the slot if it is still free.
+                //
+                // The dummy sink does NOT count as occupied: it is the silent
+                // placeholder installed while the open is still in flight.
+                // Treating it as a live backend made every real device that
+                // opened afterwards get discarded, so the client played
+                // silence for the whole session.
+                if (open->player && open->player->is_open() &&
+                    !open->player->is_placeholder()) {
+                    superseded = true;
+                } else {
+                    displaced = open->player;   // dummy placeholder, if any
+                    open->player = device;
+                    open->result = true;
+                    open->pending = false;
+                }
             }
-            open->cv.notify_all();
-        } else {
-            if (opened) device->close();  // shutdown raced the open
+            if (superseded) {
+                LOG_INFO("Audio device: a late open attempt succeeded but another backend "
+                         "is already playing; discarding the duplicate stream.");
+                device->close();
+            } else {
+                if (displaced) {
+                    LOG_INFO("Audio device: real backend took over from the dummy sink.");
+                    displaced->close();
+                }
+                open->cv.notify_all();
+                return;
+            }
+        }
+        {
+            if (opened && !superseded) device->close();  // shutdown raced the open
             {
                 std::lock_guard<std::mutex> lock(open->mutex);
                 open->result = false;
@@ -131,7 +200,7 @@ namespace {
         }
     }
 
-    enum class OpenStrategy { AAUDIO, TERMUXAPI, AGM, NODES, LEGACY };
+    enum class OpenStrategy { PULSE, AAUDIO, TERMUXAPI, AGM, NODES, LEGACY };
 
     // "aaudio"/"aaudio:<mode>" uses AAudio first (no root, works on stock
     // devices; needs Android 8.0+), then the Termux:API media player (no root
@@ -141,6 +210,12 @@ namespace {
     // libagmclient.so at all), then direct kernel PCM nodes, then ALSA-lib.
     // Node-based names open PCM nodes only; everything else is ALSA-lib only.
     std::vector<OpenStrategy> build_open_strategies(const std::string& device_name) {
+        if (is_pulse_device(device_name)) {
+            // Explicitly requested: PulseAudio first, then the other rootless
+            // backends, then the root-requiring ones.
+            return {OpenStrategy::PULSE, OpenStrategy::AAUDIO, OpenStrategy::TERMUXAPI,
+                    OpenStrategy::AGM, OpenStrategy::NODES, OpenStrategy::LEGACY};
+        }
         if (is_aaudio_device(device_name)) {
             return {OpenStrategy::AAUDIO, OpenStrategy::TERMUXAPI, OpenStrategy::AGM,
                     OpenStrategy::NODES, OpenStrategy::LEGACY};
@@ -155,11 +230,26 @@ namespace {
         if (is_node_based_device(device_name)) {
             return {OpenStrategy::NODES};
         }
+        // Plain "default"/"hw:0,0": when a PulseAudio daemon is running it
+        // owns the sound card, so a raw ALSA/PCM open would either fail or
+        // fight it. Try PulseAudio first in that case; on systems without a
+        // daemon (stock Android/Termux) this is skipped entirely and the
+        // behaviour is unchanged.
+        if (pulse_worth_trying()) {
+            // Keep the rootless backends in the chain behind PulseAudio. The
+            // daemon socket is only detected passively (a dead daemon leaves
+            // its socket file behind), so PULSE can still fail here - and
+            // dropping straight to LEGACY would skip AAudio/Termux:API, which
+            // usually work when PulseAudio does not.
+            return {OpenStrategy::PULSE, OpenStrategy::AAUDIO, OpenStrategy::TERMUXAPI,
+                    OpenStrategy::LEGACY};
+        }
         return {OpenStrategy::LEGACY};
     }
 
     const char* strategy_label(OpenStrategy strategy, bool node_based) {
         switch (strategy) {
+            case OpenStrategy::PULSE: return "PulseAudio daemon via libpulse (no root)";
             case OpenStrategy::AAUDIO: return "AAudio native audio via Android audio HAL (no root)";
             case OpenStrategy::TERMUXAPI: return "Termux:API media player via com.termux.api (no root)";
             case OpenStrategy::AGM: return "AGM playback via vendor agmplay subprocess (FIFO)";
@@ -184,7 +274,8 @@ namespace {
 
         while (!open->shutdown.load() && strategy_index < strategies.size()) {
             const OpenStrategy strategy = strategies[strategy_index];
-            const size_t max_attempts = strategy == OpenStrategy::AAUDIO ? kMaxAaudioOpenAttempts
+            const size_t max_attempts = strategy == OpenStrategy::PULSE ? kMaxPulseOpenAttempts
+                                      : strategy == OpenStrategy::AAUDIO ? kMaxAaudioOpenAttempts
                                       : strategy == OpenStrategy::TERMUXAPI ? kMaxTermuxOpenAttempts
                                       : strategy == OpenStrategy::AGM ? kMaxAgmOpenAttempts
                                       : strategy == OpenStrategy::NODES ? kMaxNodeOpenAttempts
@@ -205,6 +296,21 @@ namespace {
 
             size_t attempts_in_strategy = 0;
             while (!open->shutdown.load() && attempts_in_strategy < max_attempts) {
+                // An earlier, abandoned attempt may have hot-swapped a real
+                // device in while we were waiting. Stop churning through the
+                // remaining strategies in that case - otherwise the client
+                // keeps opening and discarding backends behind a device that
+                // is already playing.
+                {
+                    std::lock_guard<std::mutex> lock(open->mutex);
+                    if (open->player && open->player->is_open() &&
+                        !open->player->is_placeholder()) {
+                        LOG_INFO("Audio device: already playing on "
+                                 << open->player->get_device_name()
+                                 << "; stopping the open supervisor.");
+                        return;
+                    }
+                }
                 ++attempts_in_strategy;
 
                 std::string candidate;
@@ -218,6 +324,7 @@ namespace {
 
                 std::shared_ptr<IAudioPlayer> device =
                     node_based ? std::shared_ptr<IAudioPlayer>(std::make_shared<DirectAlsaPlayer>())
+                    : strategy == OpenStrategy::PULSE ? std::shared_ptr<IAudioPlayer>(std::make_shared<PulsePlayer>())
                     : strategy == OpenStrategy::AAUDIO ? std::shared_ptr<IAudioPlayer>(std::make_shared<AaudioFifoPlayer>())
                     : strategy == OpenStrategy::TERMUXAPI ? std::shared_ptr<IAudioPlayer>(std::make_shared<TermuxApiPlayer>())
                     : strategy == OpenStrategy::AGM ? std::shared_ptr<IAudioPlayer>(std::make_shared<AgmFifoPlayer>())
@@ -236,8 +343,10 @@ namespace {
                     finished->store(true);
                 });
 
+                const uint32_t attempt_timeout_ms = strategy == OpenStrategy::PULSE
+                    ? kPulseAttemptTimeoutMs : kDeviceAttemptTimeoutMs;
                 uint32_t waited = 0;
-                for (; waited < kDeviceAttemptTimeoutMs && !open->shutdown.load() && !finished->load();
+                for (; waited < attempt_timeout_ms && !open->shutdown.load() && !finished->load();
                      waited += kDeviceAttemptPollMs) {
                     sleep_ms(kDeviceAttemptPollMs);
                 }
@@ -264,7 +373,7 @@ namespace {
                 if (!finished->load()) {
                     LOG_WARN("Audio device open attempt " << attempt
                              << (candidate.empty() ? "" : " on '" + candidate + "'")
-                             << " hung in a kernel call (" << kDeviceAttemptTimeoutMs << "ms). Abandoning it and trying "
+                             << " hung in a kernel call (" << attempt_timeout_ms << "ms). Abandoning it and trying "
                              << (node_based ? "the next PCM node" : "again with a fresh player") << "; if the abandoned "
                              << "attempt later succeeds the real device is hot-swapped in automatically.");
                     attempt_thread.detach();
@@ -294,6 +403,11 @@ namespace {
                       << "most likely holding the primary PCM device. Run (as root):");
             LOG_ERROR("    stop audioserver");
             LOG_ERROR("then re-run the client. Re-enable Android audio later with: start audioserver");
+            // Only now is the troubleshooting wall actually warranted: every
+            // backend has been tried and failed. It used to print the moment
+            // the first open exceeded its budget, while the supervisor was
+            // still working and a device was usually seconds away.
+            AndroidHelpers::print_android_troubleshooting_tips();
         }
         LOG_INFO("Audio device open thread exiting.");
     }
@@ -455,28 +569,57 @@ bool AudioRouterClient::start() {
     // user so the backend runs in-process with working sandbox access.
     // AAudio also renders as that user; the root backends (AGM/ALSA/direct)
     // are given up by the drop.
-    if (is_termux_device(config_.device_name) && AndroidHelpers::is_running_as_root()) {
+    // The PulseAudio daemon is a per-user service: its socket lives in the
+    // Termux user's runtime dir and is owned by that uid, so a root client
+    // cannot connect to it (pa_simple_new -> "Connection refused", preceded by
+    // libpulse trying to create //.config/pulse because root's HOME is "/").
+    // The same privilege drop the Termux:API backend uses fixes it: bind the
+    // socket as root for -b/--bind, then become the Termux app user before the
+    // backend opens.
+    const bool pulse_needs_drop =
+        is_pulse_device(config_.device_name) && AndroidHelpers::is_running_as_root();
+    if (pulse_needs_drop) {
+        LOG_INFO("PulseAudio backend: running as root, but the daemon is a per-user "
+                 "service; dropping to the Termux app user after the socket binding.");
+    }
+
+    if ((is_termux_device(config_.device_name) || pulse_needs_drop) &&
+        AndroidHelpers::is_running_as_root()) {
         // Pre-create the segment cache — including the SELinux labels the
         // Termux:API app needs to read it — while we still have root: after
         // setuid() the process cannot relabel files, and the player only
         // recycles these pre-labeled pool inodes.
-        TermuxApiPlayer::prepare_cache_as_root();
+        if (is_termux_device(config_.device_name)) {
+            TermuxApiPlayer::prepare_cache_as_root();
+        }
         uid_t termux_uid = 0;
         gid_t termux_gid = 0;
         std::string termux_home;
+        const char* backend_label = pulse_needs_drop ? "PulseAudio backend" : "Termux:API backend";
         if (!AndroidHelpers::termux_user(&termux_uid, &termux_gid, &termux_home)) {
-            LOG_WARN("Termux:API backend: Termux app user not found; continuing as root "
-                     "(plain am broadcast path)");
+            LOG_WARN(backend_label << ": Termux app user not found; continuing as root "
+                     "(the PulseAudio daemon will likely refuse the connection)");
         } else if (::setgroups(0, nullptr) != 0 || ::setgid(termux_gid) != 0 ||
                    ::setuid(termux_uid) != 0) {
-            LOG_WARN("Termux:API backend: could not drop to the Termux app user ("
-                     << std::strerror(errno) << "); continuing as root (plain am broadcast "
-                     "path)");
+            LOG_WARN(backend_label << ": could not drop to the Termux app user ("
+                     << std::strerror(errno) << "); continuing as root");
         } else {
             ::setenv("HOME", termux_home.c_str(), 1);
-            LOG_INFO("Termux:API backend: socket bound as root; dropped privileges to the "
+            // libpulse locates the daemon through XDG_RUNTIME_DIR / HOME, which
+            // still describe root's view until rewritten here.
+            //
+            // Do NOT invent an XDG_RUNTIME_DIR: Termux's PulseAudio keeps its
+            // runtime dir under $HOME/.config/pulse/<machine-id>-runtime, not
+            // in $PREFIX/var/run. Pointing XDG_RUNTIME_DIR at the latter made
+            // libpulse look in an empty directory and miss a daemon that was
+            // running perfectly well. Clearing it lets libpulse fall back to
+            // its HOME-based lookup, which is what the Termux daemon uses.
+            if (pulse_needs_drop) {
+                ::unsetenv("XDG_RUNTIME_DIR");
+            }
+            LOG_INFO(backend_label << ": socket bound as root; dropped privileges to the "
                      "Termux app user (uid " << termux_uid << ", gid " << termux_gid
-                     << ") so the Termux:API sandbox and socket protocol work");
+                     << ") so the per-user audio service is reachable");
         }
     }
 
@@ -528,6 +671,8 @@ bool AudioRouterClient::start() {
     open_player_with_timeout(config_.device_name,
                              is_termux_device(config_.device_name)
                                  ? kTermuxPlayerOpenTimeoutMs
+                             : is_pulse_device(config_.device_name)
+                                 ? kPulsePlayerOpenTimeoutMs
                                  : kPlayerOpenTimeoutMs);
 
     LOG_INFO("AudioRouter Client connected and streaming directly to Android speakers!");
@@ -547,7 +692,10 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
     // (AudioFlinger) owns the mixer for those streams, and force-routing the
     // codec from outside (tinymix) can jam the HAL's session start - the
     // stream opens but never renders.
-    if (!is_aaudio_device(device_name) && !is_termux_device(device_name)) {
+    // Also skipped for PulseAudio: the daemon owns the mixer for its sinks,
+    // and force-routing the codec underneath it can wedge the sink.
+    if (!is_aaudio_device(device_name) && !is_termux_device(device_name) &&
+        !is_pulse_device(device_name) && !pulse_worth_trying()) {
         AndroidHelpers::apply_speaker_routing();
     }
 
@@ -576,19 +724,25 @@ void AudioRouterClient::open_player_with_timeout(const std::string& device_name,
         return;
     }
 
+    // Do NOT install a dummy sink here. The open supervisor is still running in
+    // the background and a real backend usually lands a few seconds later; a
+    // placeholder in the slot only invites the "is something already playing?"
+    // ambiguity that previously discarded real devices, and it silently
+    // consumes frames (and prints a full ALSA troubleshooting wall) while the
+    // real open is still in flight.
+    //
+    // Leaving open_->player empty is safe: the playback thread already treats a
+    // null player as "nothing to write to yet" and paces itself, so audio
+    // simply starts the moment the supervisor hot-swaps a device in.
     if (!completed) {
-        LOG_WARN("Audio device open timed out after " << timeout_ms
-                 << "ms (ALSA driver may be busy). Using dummy sink; retrying in background...");
+        LOG_WARN("Audio device '" << device_name << "' has not opened yet after "
+                 << timeout_ms << " ms; still trying in the background. Playback starts "
+                 "as soon as a backend opens.");
     } else {
-        LOG_WARN("Could not open ALSA device '" << device_name << "'. Using dummy sink; retrying in background...");
+        LOG_WARN("Could not open audio device '" << device_name
+                 << "' yet; still trying in the background. Playback starts as soon as a "
+                 "backend opens.");
     }
-
-    {
-        std::lock_guard<std::mutex> lock(open_->mutex);
-        open_->player = std::make_shared<DummyPlayer>();
-        open_->player->open(audio_config_, "dummy_fallback");
-    }
-    AndroidHelpers::print_android_troubleshooting_tips();
 }
 
 void AudioRouterClient::stop() {
@@ -906,12 +1060,17 @@ void AudioRouterClient::audio_playback_thread() {
                     // full backlog (the jitter prefill burst + stalls), which
                     // shows up as a constant multi-hundred-ms audio delay.
                     // Sleep so the backend drains back toward ~40 ms. Direct
-                    // backends (ALSA) pace themselves on blocking writes and
-                    // report ~0 buffered delay, so they are unaffected.
-                    const std::string dev_name = player->get_device_name();
-                    if (backend_ms > 60 &&
-                        (dev_name.rfind("aaudio", 0) == 0 ||
-                         dev_name.rfind("agm", 0) == 0)) {
+                    // backends (ALSA, PulseAudio) pace themselves on blocking
+                    // writes and report their true buffered delay, so they are
+                    // unaffected.
+                    //
+                    // The gate is the backend's own reported delay, NOT the
+                    // requested device name: after a fallback (e.g. -d pulse
+                    // failing over to AAudio) get_device_name() still returns
+                    // the name the user asked for, so a name-based check
+                    // silently disabled pacing for the backend that actually
+                    // ran - the AAudio pipe then sat at a constant ~358 ms.
+                    if (backend_ms > 60 && player->needs_playback_pacing()) {
                         sleep_ms(backend_ms - 40);
                     }
                 } else {

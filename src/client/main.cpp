@@ -2,6 +2,7 @@
 #include "alsa_player.hpp"
 #include "aaudio_player.hpp"
 #include "termux_api_player.hpp"
+#include "pulse_player.hpp"
 #include "android_helpers.hpp"
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
@@ -92,6 +93,11 @@ void print_usage(const char* prog) {
               << "                              ALSA: 'default', 'hw:0,0', 'plughw:0,0'\n"
               << "                              Direct kernel: 'direct:/dev/snd/pcmC0D0p' or any '/dev/snd/...'\n"
               << "                              Qualcomm AGM: 'agm' or 'agm:<backend>'\n"
+              << "                              PulseAudio (NO ROOT, desktop Linux or Termux with a\n"
+              << "                                running daemon; also serves PipeWire's pulse shim):\n"
+              << "                                'pulse', 'pulse:<sink>', 'pulse@<ms>', 'pulse:<sink>@<ms>'\n"
+              << "                                (ms = playback buffer target, 10..500; default is\n"
+              << "                                 derived from the packet size)\n"
               << "                              AAudio (NO ROOT needed): 'aaudio', 'aaudio:deep', 'aaudio:voip'\n"
               << "                              Termux:API (NO ROOT, needs the Termux:API app):\n"
               << "                                'termux', 'termux-api', 'termux:<ms>'\n"
@@ -227,6 +233,27 @@ int main(int argc, char* argv[]) {
         for (const auto& c : cards) {
             std::cout << "  " << c << "\n";
         }
+        std::cout << "\nPulseAudio (no root, needs a running daemon):\n";
+        if (audiorouter::PulsePlayer::is_supported()) {
+            if (audiorouter::PulsePlayer::server_available()) {
+                std::cout << "  -> daemon reachable — use -d pulse (or pulse:<sink>)\n";
+                auto sinks = audiorouter::PulsePlayer::get_available_sinks();
+                if (sinks.empty()) {
+                    std::cout << "     (no sinks listed; is 'pactl' installed?)\n";
+                } else {
+                    for (const auto& sink : sinks) {
+                        std::cout << "     sink: " << sink << "\n";
+                    }
+                }
+            } else {
+                std::cout << "  -> no PulseAudio daemon found (no PULSE_SERVER and no native socket).\n"
+                          << "     Start one with 'pulseaudio --start', then use -d pulse\n";
+            }
+        } else {
+            std::cout << "  -> not compiled in this build (install libpulse-dev / the Termux\n"
+                      << "     'pulseaudio' package and rebuild)\n";
+        }
+
         std::cout << "\nAAudio (no root, Android 8.0+):\n";
         if (audiorouter::AaudioFifoPlayer::is_supported()) {
             std::cout << "  -> available — use -d aaudio (or aaudio:deep / aaudio:voip)\n";

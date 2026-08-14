@@ -42,6 +42,9 @@ public:
     void flush() override;
     std::string get_device_name() const override;
 
+    // FIFO-backed: the playback thread self-paces against the pipe depth.
+    bool needs_playback_pacing() const override { return true; }
+
 private:
     bool wait_for_reader(int timeout_ms);
     void write_wav_header(uint32_t sample_rate);

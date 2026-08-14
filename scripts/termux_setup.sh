@@ -54,19 +54,25 @@ fi
 if [ "$HAS_SOURCE" -eq 1 ]; then
     echo "[2/4] Source checkout: installing compiler and ALSA tools..."
     if [ "$(id -u)" -ne 0 ]; then
-        pkg install -y clang make alsa-utils || true
+        pkg install -y clang make alsa-utils pkg-config || true
         # Optional: NDK sysroot with Android platform stub libraries. Needed only
         # to link the AAudio no-root backend (-laaudio); skipped when unavailable.
         pkg install -y ndk-sysroot 2>/dev/null || true
+        # Optional: PulseAudio (no-root playback backend, -d pulse). The Makefile
+        # detects libpulse-simple through pkg-config; skipped when unavailable.
+        pkg install -y pulseaudio 2>/dev/null || true
     else
-        echo "     Skipped: pkg cannot run as root. Run 'pkg install clang make alsa-utils' as the Termux user."
+        echo "     Skipped: pkg cannot run as root. Run 'pkg install clang make alsa-utils pkg-config pulseaudio' as the Termux user."
     fi
 else
     echo "[2/4] Binary-only package: installing runtime tools only (tinymix for mixer routing)..."
     if [ "$(id -u)" -ne 0 ]; then
         pkg install -y alsa-utils || true
+        # Optional: the PulseAudio daemon, so the prebuilt client's -d pulse
+        # backend has a server to talk to (start it with 'pulseaudio --start').
+        pkg install -y pulseaudio 2>/dev/null || true
     else
-        echo "     Skipped: pkg cannot run as root. Run 'pkg install alsa-utils' as the Termux user."
+        echo "     Skipped: pkg cannot run as root. Run 'pkg install alsa-utils pulseaudio' as the Termux user."
     fi
 fi
 

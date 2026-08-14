@@ -6,6 +6,7 @@ set(CLIENT_SOURCES
     agm_fifo_player.cpp
     aaudio_player.cpp
     termux_api_player.cpp
+    pulse_player.cpp
     dummy_player.cpp
     jitter_buffer.cpp
     android_helpers.cpp
@@ -20,6 +21,7 @@ set(CLIENT_HEADERS
     agm_fifo_player.hpp
     aaudio_player.hpp
     termux_api_player.hpp
+    pulse_player.hpp
     dummy_player.hpp
     jitter_buffer.hpp
     android_helpers.hpp
@@ -32,6 +34,11 @@ set(CLIENT_HEADERS
 )
 
 add_executable(audiorouter_client ${CLIENT_SOURCES} ${CLIENT_HEADERS})
+
+# PulseAudio playback backend (-d pulse); detected once in the top-level
+# CMakeLists (option AUDIOROUTER_ENABLE_PULSEAUDIO). No-op when libpulse-simple
+# is absent, in which case pulse_player.cpp compiles as a fail-fast stub.
+audiorouter_link_pulseaudio(audiorouter_client)
 
 target_include_directories(audiorouter_client PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
