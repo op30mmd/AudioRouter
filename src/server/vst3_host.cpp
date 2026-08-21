@@ -1,23 +1,28 @@
 // VST3 plugin host implementation.
 //
-// This file is compiled only when AUDIOROUTER_ENABLE_VST3 is defined at
-// build time (see src/server/CMakeLists.txt). The companion stub
+// This file is compiled only when AUDIOROUTER_ENABLE_VST3 is defined
+// at build time (see src/server/CMakeLists.txt). The companion stub
 // (vst3_host_stub.cpp) provides the same make_vst3_stage() symbol so
 // the rest of the codebase can always link regardless of whether the
 // VST3 SDK was present at configure time.
 //
-// When the real VST3 SDK is available, it provides all the public
-// types (Steinberg::FUnknown, IPluginFactory, IComponent,
-// IAudioProcessor, the bus/ProcessData/ProcessSetup structs, and the
-// official IIDs). When only a partial header set is present, we fall
-// back to the local minimal declarations in this file (forward-declared
-// at the top, exactly matching the official public API) so the host
-// can still be built. The official VST3 public API is stable and the
-// type layouts we depend on have not changed since VST 3.0.
+// Namespace and IID conventions used here:
+//
+//   * The base FUnknown / IPluginFactory / IPluginFactory2 /
+//     IPluginFactory3 interfaces are in the Steinberg:: namespace
+//     (ipluginbase.h).
+//   * All VST-specific interfaces (IComponent, IAudioProcessor,
+//     IBStream fwd-declared here, AudioBusBuffers, ProcessData,
+//     ProcessSetup, the MediaTypes / BusDirections /
+//     SymbolicSampleSizes / ProcessModes enums, and the speaker
+//     arrangement types) are in the Steinberg::Vst:: namespace.
+//   * Interface IDs are exposed as static class members: IComponent::iid,
+//     IAudioProcessor::iid, IPluginFactory::iid, etc. (FUID / TUID
+//     types, not FIDString / const char*).
 //
 // The three lifecycle phases for a plugin instance are:
 //
-//   1. initialize(IAudioHost* host) on the IComponent - tells the
+//   1. initialize(FUnknown* hostContext) on the IComponent - tells the
 //      plugin about the host (this module's simple no-op host).
 //   2. activateBus(mediaType, dir, busIndex, true) for the input and
 //      output buses - the plugin needs to know which buses it should
@@ -58,28 +63,50 @@
     using DlHandle = void*;
 #endif
 
-// Bring in the official VST3 public SDK if it is on the include path.
-// The headers we use live under pluginterfaces/vst/. When the SDK is
-// not installed, the build still proceeds (the stub is compiled) so
-// the rest of the system can be developed and tested without it.
+// VST3 public SDK headers. The pluginterfaces/ subdirectory holds the
+// interface definitions; public.sdk/source/vst/hosting/ has the
+// host-side helper types (ProcessData helpers, etc.). We only need
+// the public interface definitions; the dynamic loader
+// (dlopen/LoadLibrary) resolves the rest at runtime, so no SDK
+// libraries are linked.
+//
+// INIT_CLASS_IID tells the SDK headers to emit the out-of-line static
+// `iid` members (e.g. IComponent::iid) inside the headers themselves
+// rather than relying on a separate .cpp file (which we have not
+// vendored). This is the recommended way to use the SDK headers-only
+// in a self-contained host: define INIT_CLASS_IID, then include the
+// SDK headers, and the IIDs become available as linkable symbols.
+#define INIT_CLASS_IID 1
+#include <pluginterfaces/base/ipluginbase.h>
+#include <pluginterfaces/base/ibstream.h>
 #include <pluginterfaces/vst/ivstcomponent.h>
 #include <pluginterfaces/vst/ivstaudioprocessor.h>
-#include <pluginterfaces/vst/ivstpluginterfacesupport.h>
 #include <pluginterfaces/vst/vsttypes.h>
-#include <public.sdk/source/vst/hosting/hostclasses.h> // optional
+#include <pluginterfaces/vst/vstspeaker.h>
+#undef INIT_CLASS_IID
 
-namespace Steinberg {
-    // IID definitions. The hex IIDs are the official, public, stable
-    // values from the VST3 SDK. They are listed here rather than
-    // pulled from <pluginterfaces/vst/ivstpluginterfaces.h> because
-    // some SDK versions place them in a private header.
-    static constexpr FIDString kIID_IPluginFactory   = "IPluginFactory0000000000000000000000000000000";
-    static constexpr FIDString kIID_IComponent       = "IComponent00000000000000000000000000000000";
-    static constexpr FIDString kIID_IAudioProcessor  = "IAudioProcessor000000000000000000000000000";
-    static constexpr FIDString kIID_IConnectionPoint = "IConnectionPoint0000000000000000000000000";
-}
+// Provide a definition for Steinberg::FUnknownPrivate::atomicAdd
+// (declared in pluginterfaces/base/funknown.h, normally defined in
+// the SDK's funknown.cpp which we have not vendored). The host uses
+// it for refcounting on the FUnknown interface; the operation is a
+// straightforward atomic add. We use C++11 std::atomic here (the
+// SDK's funknown.cpp has a platform-specific fast-path; the std
+// version is portable and not on a hot path -- atomicAdd is called
+// once per addRef/release, not per audio sample).
+//
+// Defined at global scope (not inside namespace audiorouter) so it
+// lands in the right namespace: Steinberg::FUnknownPrivate, which
+// is where the SDK declares it.
+namespace Steinberg { namespace FUnknownPrivate {
+    ::Steinberg::int32 PLUGIN_API atomicAdd(::Steinberg::int32& value, ::Steinberg::int32 amount) {
+        return static_cast<::Steinberg::int32>(
+            reinterpret_cast<std::atomic<::Steinberg::int32>&>(value).fetch_add(amount));
+    }
+}} // namespace Steinberg::FUnknownPrivate
 
 namespace audiorouter {
+
+using namespace Steinberg::Vst;  // kAudio, kInput, kOutput, kRealtime, kSample32, ProcessData, ...
 
 // ---------------------------------------------------------------------------
 // Vst3Module: a loaded shared library with a valid GetPluginFactory entry.
@@ -103,10 +130,10 @@ private:
     Steinberg::IPluginFactory* factory_;
 };
 
-// A VST3 module is a directory whose name ends in ".vst3" and contains a
-// shared library named after the directory (the "bundle" pattern, like
-// .app on macOS). On Linux this resolves to "<dir>/<basename>.so"; on
-// Windows to "<dir>\<basename>.dll"; on macOS to
+// A VST3 module is a directory whose name ends in ".vst3" and contains
+// a shared library named after the directory (the "bundle" pattern,
+// like .app on macOS). On Linux this resolves to "<dir>/<basename>.so";
+// on Windows to "<dir>\<basename>.dll"; on macOS to
 // "<dir>/Contents/MacOS/<basename>". We resolve the inner binary here.
 static std::string resolve_module_binary(const std::string& path) {
 #if defined(_WIN32)
@@ -167,10 +194,10 @@ static std::unique_ptr<Vst3Module> load_module(const std::string& path) {
         return nullptr;
     }
 #else
-    // RTLD_NOW: resolve all symbols upfront so a broken plugin does not
-    // crash the audio thread on first use. RTLD_LOCAL: keep plugin's
-    // symbols private so a second plugin with the same name does not
-    // collide.
+    // RTLD_NOW: resolve all symbols upfront so a broken plugin does
+    // not crash the audio thread on first use. RTLD_LOCAL: keep
+    // plugin's symbols private so a second plugin with the same name
+    // does not collide.
     void* h = ::dlopen(bin.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) {
         const char* err = ::dlerror();
@@ -196,27 +223,51 @@ static std::unique_ptr<Vst3Module> load_module(const std::string& path) {
     return std::make_unique<Vst3Module>(h, factory);
 }
 
-// A minimal IUnknown-derived host context. The VST3 spec requires us to
-// hand the plugin a host pointer on initialize(); the only contract here
-// is that we implement IUnknown. Plugins normally do not call back into
-// the host in any interesting way during this host's lifetime, so a
-// stub is sufficient.
-class HostContext : public Steinberg::FUnknown {
+// A minimal IUnknown-derived host context. The VST3 spec requires us
+// to hand the plugin a host pointer on initialize(); the only
+// contract here is that we implement FUnknown (queryInterface,
+// addRef, release). Plugins normally do not call back into the host
+// in any interesting way during this host's lifetime, so a stub is
+// sufficient.
+//
+// The SDK's convention for refcounting is to store the refcount in
+// a `__funknownRefCount` member (see DECLARE_FUNKNOWN_METHODS /
+// IMPLEMENT_REFCOUNT) and `delete this` when it hits zero. The
+// destructor does NOT need to be virtual (FUnknown has no virtual
+// destructor in the public SDK) -- the SDK design relies on the
+// convention that every object derived from FUnknown implements
+// the refcount macros correctly so the static-dispatch delete is
+// safe. We follow that convention and use the same field name so
+// the SDK's macro-based helpers (FUNKNOWN_DTOR, etc.) work.
+//
+// `final` silences the -Wdelete-non-virtual-dtor warning: it tells
+// the compiler that no further derived class can call delete via a
+// base pointer, so the static-dispatch `delete this` is safe.
+class HostContext final : public Steinberg::FUnknown {
 public:
-    Steinberg::tresult queryInterface(const char* iid, void** obj) override {
-        if (!iid || !obj) return -1;
-        // We expose nothing; the official VST3 SDK defines a host class
-        // hierarchy (IHostApplication etc.) that we do not need.
+    HostContext() : __funknownRefCount(1) {}
+
+    Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID /*iid*/, void** obj) SMTG_OVERRIDE {
+        if (!obj) return Steinberg::kInvalidArgument;
         *obj = nullptr;
-        return -1;
+        return Steinberg::kNoInterface;
     }
-    Steinberg::uint32 addRef() override { return ++refcount_; }
-    Steinberg::uint32 release() override {
-        if (--refcount_ == 0) { delete this; return 0; }
-        return refcount_;
+    Steinberg::uint32 PLUGIN_API addRef() SMTG_OVERRIDE {
+        return ::Steinberg::FUnknownPrivate::atomicAdd(__funknownRefCount, 1);
     }
-private:
-    Steinberg::uint32 refcount_ = 1;
+    Steinberg::uint32 PLUGIN_API release() SMTG_OVERRIDE {
+        if (::Steinberg::FUnknownPrivate::atomicAdd(__funknownRefCount, -1) == 0) {
+            delete this;
+            return 0;
+        }
+        return static_cast<Steinberg::uint32>(__funknownRefCount);
+    }
+
+protected:
+    // Field name matches the SDK's DECLARE_FUNKNOWN_METHODS macro so
+    // any SDK helper (FUNKNOWN_DTOR assertions, etc.) sees the
+    // expected name.
+    ::Steinberg::int32 __funknownRefCount;
 };
 
 // ---------------------------------------------------------------------------
@@ -225,8 +276,8 @@ private:
 class Vst3Stage : public IPluginStage {
 public:
     Vst3Stage(std::unique_ptr<Vst3Module> module,
-              Steinberg::IComponent* component,
-              Steinberg::IAudioProcessor* processor,
+              Steinberg::Vst::IComponent* component,
+              Steinberg::Vst::IAudioProcessor* processor,
               std::string name)
         : module_(std::move(module)),
           component_(component),
@@ -253,7 +304,7 @@ public:
         //    happen exactly once in the plugin's lifetime.
         HostContext host;
         Steinberg::tresult r = component_->initialize(static_cast<Steinberg::FUnknown*>(&host));
-        if (r != 0) {
+        if (r != Steinberg::kResultOk) {
             LOG_ERROR("VST3: IComponent::initialize failed for '" << name_ << "'");
             return false;
         }
@@ -261,35 +312,39 @@ public:
         // 2. Discover the plugin's audio buses. We want exactly one
         //    stereo (or matching channel count) input bus and one
         //    matching output bus. Many VST3 plugins expose a single
-        //    stereo in and out; we activate those. If the plugin's
-        //    channel layout does not match, we still try to route audio
-        //    through it but log a warning.
-        int32_t in_bus_count  = component_->getBusCount(Steinberg::kAudio, Steinberg::kInput);
-        int32_t out_bus_count = component_->getBusCount(Steinberg::kAudio, Steinberg::kOutput);
+        //    stereo in and out; we activate those.
+        int32_t in_bus_count  = component_->getBusCount(Steinberg::Vst::kAudio, Steinberg::Vst::kInput);
+        int32_t out_bus_count = component_->getBusCount(Steinberg::Vst::kAudio, Steinberg::Vst::kOutput);
         if (in_bus_count < 1 || out_bus_count < 1) {
-            LOG_ERROR("VST3: plugin '" << name_ << "' has no audio I/O (in=" << in_bus_count << " out=" << out_bus_count << ")");
+            LOG_ERROR("VST3: plugin '" << name_ << "' has no audio I/O (in=" << in_bus_count
+                     << " out=" << out_bus_count << ")");
             component_->terminate();
             return false;
         }
 
-        Steinberg::tresult ar = component_->activateBus(Steinberg::kAudio, Steinberg::kInput,  0, 1);
-        Steinberg::tresult br = component_->activateBus(Steinberg::kAudio, Steinberg::kOutput, 0, 1);
-        if (ar != 0 || br != 0) {
+        Steinberg::tresult ar = component_->activateBus(Steinberg::Vst::kAudio, Steinberg::Vst::kInput,  0, 1);
+        Steinberg::tresult br = component_->activateBus(Steinberg::Vst::kAudio, Steinberg::Vst::kOutput, 0, 1);
+        if (ar != Steinberg::kResultOk || br != Steinberg::kResultOk) {
             LOG_ERROR("VST3: plugin '" << name_ << "' refused to activate audio buses");
             component_->terminate();
             return false;
         }
 
-        // 3. Tell the plugin which channel arrangement we will provide.
-        //    Speaker arrangements are 64-bit VstSpeakerArrangement
-        //    structs; the canonical value for a stereo bus is the
-        //    constant SpeakerArr::kStereo (defined in the SDK). We use
-        //    the uint64 layout here, which the public SDK makes stable.
-        //    The bit pattern for stereo is L (bit 0) + R (bit 1) = 0x3.
-        constexpr Steinberg::SpeakerArrangement kStereo = 0x0000000000000003ULL;
-        Steinberg::tresult ba = processor_->setBusArrangements(&kStereo, 1, &kStereo, 1);
-        if (ba != 0) {
-            LOG_ERROR("VST3: setBusArrangements failed for '" << name_ << "' (this plugin does not support stereo I/O)");
+        // 3. Tell the plugin which channel arrangement we will
+        //    provide. Speaker arrangements are 64-bit
+        //    VstSpeakerArrangement structs. The canonical value for a
+        //    stereo bus is SpeakerArr::kStereo (defined in the SDK).
+        //    Its bit pattern is L (bit 0) + R (bit 1) = 0x3.
+        //    setBusArrangements takes a non-const pointer despite the
+        //    logical read-only intent (the SDK API allows the plugin
+        //    to overwrite it in some edge cases; we don't, so const_cast
+        //    is safe here).
+        Steinberg::Vst::SpeakerArrangement kStereo = 0x0000000000000003ULL;
+        Steinberg::Vst::SpeakerArrangement kStereoOut = 0x0000000000000003ULL;
+        Steinberg::tresult ba = processor_->setBusArrangements(&kStereo, 1, &kStereoOut, 1);
+        if (ba != Steinberg::kResultOk) {
+            LOG_ERROR("VST3: setBusArrangements failed for '" << name_
+                     << "' (this plugin does not support stereo I/O)");
             component_->terminate();
             return false;
         }
@@ -299,17 +354,15 @@ public:
         }
 
         // 4. setupProcessing() with our format. The plugin may accept
-        //    or refuse the sample rate / block size; the most common
-        //    refusals are for symbolic sample sizes other than
-        //    kSample32 (which we are always using) or block sizes
-        //    smaller than its internal granularity.
-        Steinberg::ProcessSetup setup{};
-        setup.processMode          = Steinberg::kRealtime;
-        setup.symbolicSampleSize   = Steinberg::kSample32;
+        //    or refuse the sample rate / block size. The SDK takes
+        //    setup by reference, not pointer.
+        Steinberg::Vst::ProcessSetup setup{};
+        setup.processMode          = Steinberg::Vst::kRealtime;
+        setup.symbolicSampleSize   = Steinberg::Vst::kSample32;
         setup.maxSamplesPerBlock   = static_cast<int32_t>(max_frames_per_block);
         setup.sampleRate           = static_cast<double>(sample_rate);
-        r = processor_->setupProcessing(&setup);
-        if (r != 0) {
+        r = processor_->setupProcessing(setup);
+        if (r != Steinberg::kResultOk) {
             LOG_ERROR("VST3: setupProcessing failed for '" << name_ << "' ("
                      << sample_rate << "Hz, " << max_frames_per_block << " frames)");
             component_->terminate();
@@ -318,16 +371,16 @@ public:
 
         // 5. setActive(true) and setProcessing(true) - the plugin
         //    enters its real-time-ready state.
-        r = component_->setActive(Steinberg::kIsActive);
-        if (r != 0) {
+        r = component_->setActive(true);
+        if (r != Steinberg::kResultOk) {
             LOG_ERROR("VST3: IComponent::setActive failed for '" << name_ << "'");
             component_->terminate();
             return false;
         }
-        r = processor_->setProcessing(Steinberg::kIsActive);
-        if (r != 0) {
+        r = processor_->setProcessing(true);
+        if (r != Steinberg::kResultOk) {
             LOG_ERROR("VST3: IAudioProcessor::setProcessing failed for '" << name_ << "'");
-            component_->setActive(Steinberg::kIsInactive);
+            component_->setActive(false);
             component_->terminate();
             return false;
         }
@@ -336,10 +389,8 @@ public:
         channels_ = channels;
         max_frames_per_block_ = max_frames_per_block;
 
-        // Scratch buffer for the input copy. Sized for the maximum block
-        // we'll ever hand to it; we make it a bit larger than
-        // max_frames_per_block to leave headroom for plugins that
-        // re-pitch the block internally.
+        // Scratch buffer for the input copy. Sized for the maximum
+        // block we'll ever hand to it.
         scratch_.resize(static_cast<size_t>(max_frames_per_block) * channels);
 
         prepared_ = true;
@@ -349,8 +400,8 @@ public:
     void unprepare() override {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!prepared_) return;
-        if (processor_) processor_->setProcessing(Steinberg::kIsInactive);
-        if (component_) component_->setActive(Steinberg::kIsInactive);
+        if (processor_) processor_->setProcessing(false);
+        if (component_) component_->setActive(false);
         if (component_) component_->terminate();
         prepared_ = false;
     }
@@ -369,46 +420,43 @@ public:
 
         // Copy the input to scratch. The plugin will read from the
         // scratch (channel-strided) and write back to interleaved.
-        // Using a separate output buffer makes in-place safe and lets
-        // the plugin write its full output without aliasing the input.
         const size_t total = num_frames * channels_;
         std::memcpy(scratch_.data(), interleaved, total * sizeof(float));
 
         // Set up channel pointers: each channel's data is
         // scratch_[channel * num_frames .. (channel+1) * num_frames]
         // for input, and interleaved[channel * num_frames ..] for
-        // output. The plugin reads input via in_bus_.channelBuffers
-        // and writes output via out_bus_.channelBuffers.
-        std::vector<void*> in_chan(channels_);
+        // output.
+        std::vector<float*> in_chan(channels_);
         for (uint16_t c = 0; c < channels_; ++c) {
             in_chan[c] = scratch_.data() + static_cast<size_t>(c) * num_frames;
         }
-        std::vector<void*> out_chan(channels_);
+        std::vector<float*> out_chan(channels_);
         for (uint16_t c = 0; c < channels_; ++c) {
             out_chan[c] = interleaved + static_cast<size_t>(c) * num_frames;
         }
 
-        Steinberg::AudioBusBuffers in_bus{};
-        in_bus.numChannels  = static_cast<int32_t>(channels_);
-        in_bus.silentFlags  = 0;
-        in_bus.channelBuffers = in_chan.data();
+        Steinberg::Vst::AudioBusBuffers in_bus{};
+        in_bus.numChannels         = static_cast<int32_t>(channels_);
+        in_bus.silenceFlags        = 0;
+        in_bus.channelBuffers32    = in_chan.data();
 
-        Steinberg::AudioBusBuffers out_bus{};
-        out_bus.numChannels  = static_cast<int32_t>(channels_);
-        out_bus.silentFlags  = 0;
-        out_bus.channelBuffers = out_chan.data();
+        Steinberg::Vst::AudioBusBuffers out_bus{};
+        out_bus.numChannels        = static_cast<int32_t>(channels_);
+        out_bus.silenceFlags       = 0;
+        out_bus.channelBuffers32   = out_chan.data();
 
-        Steinberg::ProcessData data{};
-        data.processMode         = Steinberg::kRealtime;
-        data.symbolicSampleSize  = Steinberg::kSample32;
-        data.numSamples          = static_cast<int32_t>(num_frames);
-        data.numInputs           = 1;
-        data.numOutputs          = 1;
-        data.inputs              = &in_bus;
-        data.outputs             = &out_bus;
+        Steinberg::Vst::ProcessData data{};
+        data.processMode           = Steinberg::Vst::kRealtime;
+        data.symbolicSampleSize    = Steinberg::Vst::kSample32;
+        data.numSamples            = static_cast<int32_t>(num_frames);
+        data.numInputs             = 1;
+        data.numOutputs            = 1;
+        data.inputs                = &in_bus;
+        data.outputs               = &out_bus;
 
-        Steinberg::tresult r = processor_->process(&data);
-        if (r != 0) {
+        Steinberg::tresult r = processor_->process(data);
+        if (r != Steinberg::kResultOk) {
             // A non-zero return typically means the plugin entered a
             // bad state (e.g. out-of-memory). We log once and pass
             // through the input for the rest of the lifetime to avoid
@@ -425,9 +473,9 @@ public:
 
 private:
     std::unique_ptr<Vst3Module> module_;
-    Steinberg::IComponent*      component_ = nullptr;
-    Steinberg::IAudioProcessor* processor_ = nullptr;
-    std::string                 name_;
+    Steinberg::Vst::IComponent*      component_ = nullptr;
+    Steinberg::Vst::IAudioProcessor* processor_ = nullptr;
+    std::string                      name_;
 
     uint32_t sample_rate_ = 0;
     uint16_t channels_ = 0;
@@ -435,7 +483,7 @@ private:
     bool prepared_ = false;
     std::mutex mutex_;
 
-    std::vector<float> scratch_;             // input copy
+    std::vector<float> scratch_;
 };
 
 // Pick the first audio effect class from the module. The VST3 spec
@@ -443,6 +491,13 @@ private:
 // "Audio FX" category first and fall back to "Fx" (some plugins use
 // the older "Fx" label). If neither matches, the first class is used
 // (most .vst3 bundles ship exactly one audio effect).
+//
+// PClassInfo's text fields are fixed-size char8 arrays (never null)
+// and may not be NUL-terminated within their declared size, so we
+// use strnlen + std::string's (ptr, count) constructor to build a
+// bounded string. The class ID (cid) is a 16-byte TUID and is
+// returned as a binary string (suitable for reinterpret_cast to
+// FIDString when calling createInstance).
 static std::pair<std::string, std::string> pick_class(Steinberg::IPluginFactory* factory) {
     int32_t n = factory->countClasses();
     int first_audio_fx = -1;
@@ -450,24 +505,23 @@ static std::pair<std::string, std::string> pick_class(Steinberg::IPluginFactory*
     int first_any = 0;
     for (int32_t i = 0; i < n; ++i) {
         Steinberg::PClassInfo info{};
-        if (factory->getClassInfo(i, &info) != 0) continue;
-        std::string cat = info.category ? info.category : "";
-        std::string cid = info.cid ? info.cid : "";
-        std::string name = info.name ? info.name : "";
+        if (factory->getClassInfo(i, &info) != Steinberg::kResultOk) continue;
+        const std::string cat(info.category,
+            strnlen(info.category, sizeof(info.category)));
         if (first_audio_fx < 0 && cat == "Audio FX") first_audio_fx = i;
         if (first_fx < 0 && (cat == "Fx" || cat == "FX")) first_fx = i;
         if (i == 0) { first_any = i; }
-        (void)cid;
     }
     int idx = (first_audio_fx >= 0) ? first_audio_fx
             : (first_fx >= 0)         ? first_fx
             :                            first_any;
     Steinberg::PClassInfo info{};
-    if (factory->getClassInfo(idx, &info) != 0) {
+    if (factory->getClassInfo(idx, &info) != Steinberg::kResultOk) {
         return {"", ""};
     }
-    return {std::string(info.cid ? info.cid : ""),
-            std::string(info.name ? info.name : "<unnamed>")};
+    return {std::string(reinterpret_cast<const char*>(info.cid), sizeof(info.cid)),
+            std::string(info.name,
+                strnlen(info.name, sizeof(info.name)))};
 }
 
 std::shared_ptr<IPluginStage> make_vst3_stage(const std::string& vst3_path) {
@@ -481,22 +535,23 @@ std::shared_ptr<IPluginStage> make_vst3_stage(const std::string& vst3_path) {
         return nullptr;
     }
 
-    // Instantiate the class. We ask for IComponent first because that's
-    // the root lifecycle interface; IAudioProcessor is queried off the
-    // same instance below.
-    Steinberg::IComponent* component = nullptr;
-    Steinberg::tresult r = factory->createInstance(cid.c_str(),
-                                                   Steinberg::kIID_IComponent,
+    // Instantiate the class. We ask for IComponent first because
+    // that's the root lifecycle interface; IAudioProcessor is queried
+    // off the same instance below. IIDs are FUID / TUID class-static
+    // members, not string constants.
+    Steinberg::Vst::IComponent* component = nullptr;
+    Steinberg::tresult r = factory->createInstance(reinterpret_cast<Steinberg::FIDString>(cid.data()),
+                                                   Steinberg::Vst::IComponent::iid,
                                                    reinterpret_cast<void**>(&component));
-    if (r != 0 || !component) {
+    if (r != Steinberg::kResultOk || !component) {
         LOG_ERROR("VST3: createInstance(IComponent) failed for class '" << name << "' in '" << vst3_path << "'");
         return nullptr;
     }
 
-    Steinberg::IAudioProcessor* processor = nullptr;
-    r = component->queryInterface(Steinberg::kIID_IAudioProcessor,
+    Steinberg::Vst::IAudioProcessor* processor = nullptr;
+    r = component->queryInterface(Steinberg::Vst::IAudioProcessor::iid,
                                   reinterpret_cast<void**>(&processor));
-    if (r != 0 || !processor) {
+    if (r != Steinberg::kResultOk || !processor) {
         LOG_ERROR("VST3: '" << name << "' does not expose IAudioProcessor (not an audio plugin?)");
         component->release();
         return nullptr;

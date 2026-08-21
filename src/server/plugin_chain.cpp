@@ -1,4 +1,5 @@
 #include "plugin_chain.hpp"
+#include "vst3_host.hpp"
 #include "../common/logger.hpp"
 
 namespace audiorouter {
