@@ -14,6 +14,7 @@ set(TEST_SOURCES
     test_thread_safety.cpp
     test_type_safety.cpp
     test_memory_safety.cpp
+    test_plugin_chain.cpp
     ../src/client/jitter_buffer.cpp
     ../src/client/termux_api_player.cpp
     ../src/client/pulse_player.cpp
@@ -21,6 +22,8 @@ set(TEST_SOURCES
     ../src/client/aaudio_player.cpp
     ../src/client/android_helpers.cpp
     ../src/common/socket_util.cpp
+    ../src/server/plugin_chain.cpp
+    ../src/server/vst3_host_stub.cpp
 )
 
 add_executable(audiorouter_tests ${TEST_SOURCES})

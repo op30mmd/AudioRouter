@@ -4,6 +4,8 @@ set(SERVER_SOURCES
     wasapi_capture.cpp
     dummy_capture.cpp
     audio_endpoint_control.cpp
+    plugin_chain.cpp
+    vst3_host_stub.cpp
     ../common/socket_util.cpp
 )
 
@@ -13,6 +15,8 @@ set(SERVER_HEADERS
     wasapi_capture.hpp
     dummy_capture.hpp
     audio_endpoint_control.hpp
+    plugin_chain.hpp
+    vst3_host.hpp
     ../common/protocol.hpp
     ../common/socket_util.hpp
     ../common/audio_types.hpp
@@ -20,6 +24,54 @@ set(SERVER_HEADERS
     ../common/logger.hpp
     ../common/time_util.hpp
 )
+
+# VST3 plugin support: optional. The plugin chain abstraction (plugin_chain.hpp
+# + plugin_chain.cpp + vst3_host_stub.cpp) is always compiled so the rest of
+# the audio path always works. The "real" VST3 host (vst3_host.cpp) is only
+# compiled when AUDIOROUTER_ENABLE_VST3 is ON AND the VST3 public SDK headers
+# (third_party/vst3) are present; otherwise --vst3 at runtime is a no-op
+# (the chain is a BypassPluginChain that logs a warning and forwards audio
+# unchanged).
+option(AUDIOROUTER_ENABLE_VST3 "Build the VST3 audio effects host" OFF)
+set(AUDIOROUTER_VST3_FOUND OFF)
+if (AUDIOROUTER_ENABLE_VST3)
+    # The VST3 public SDK is BSD-licensed and a vendored copy of the
+    # required headers lives under third_party/vst3/. We only need the
+    # public interface definitions; the dynamic loader (dlopen/LoadLibrary)
+    # resolves the rest at runtime, so no SDK libraries are linked.
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/vst3/aeffect.h"
+            OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/vst3/pluginterfaces/vst/ivstcomponent.h")
+        # The vendored SDK uses the full layout. We only require that one
+        # of the public headers is present; CMake does not include the
+        # whole tree, but we tell the compiler where to find it.
+        set(AUDIOROUTER_VST3_FOUND ON)
+        message(STATUS "VST3 host: enabled (public headers under third_party/vst3/)")
+    else()
+        message(STATUS "VST3 host: disabled (third_party/vst3/ headers not found; "
+                       "the public SDK is BSD-licensed; place headers there or "
+                       "set -DAUDIOROUTER_VST3_INCLUDE_DIR to a custom location)")
+    endif()
+endif()
+
+if (AUDIOROUTER_VST3_FOUND)
+    list(APPEND SERVER_SOURCES vst3_host.cpp)
+    target_compile_definitions(audiorouter_server PRIVATE AUDIOROUTER_ENABLE_VST3=1)
+    if (DEFINED AUDIOROUTER_VST3_INCLUDE_DIR)
+        target_include_directories(audiorouter_server PRIVATE "${AUDIOROUTER_VST3_INCLUDE_DIR}")
+    else()
+        target_include_directories(audiorouter_server PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/vst3"
+        )
+    endif()
+    if (WIN32)
+        # VST3 plugins on Windows link against the MS COM runtime.
+        target_link_libraries(audiorouter_server PRIVATE ole32)
+    endif()
+else()
+    # No SDK: ensure the stub symbol is the one that ends up in the binary.
+    # (vst3_host_stub.cpp is already in SERVER_SOURCES.)
+    target_compile_definitions(audiorouter_server PRIVATE AUDIOROUTER_ENABLE_VST3=0)
+endif()
 
 add_executable(audiorouter_server ${SERVER_SOURCES} ${SERVER_HEADERS})
 

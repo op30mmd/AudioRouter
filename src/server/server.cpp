@@ -5,6 +5,7 @@
 #include "../common/time_util.hpp"
 #include "../common/usb_tunnel.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -83,6 +84,21 @@ bool AudioRouterServer::start() {
             this->on_audio_captured(data, num_frames, config);
         }
     );
+
+    // Build the VST3 plugin chain. If no plugins are configured, or all
+    // configured plugins failed to load, this is a BypassPluginChain
+    // (no-op) and the audio path stays exactly as before. We construct
+    // it before start() of the capture engine because prepare() needs
+    // to know the sample rate, which the capture engine has not yet
+    // resolved; the chain is therefore prepared lazily in
+    // on_audio_captured() the first time audio arrives, by which point
+    // actual_audio_config_ is known.
+    plugin_chain_ = make_plugin_chain(config_.vst3_plugins);
+    if (plugin_chain_->num_stages() > 0) {
+        LOG_INFO("VST3 plugin chain: " << plugin_chain_->describe());
+    } else if (!config_.vst3_plugins.empty()) {
+        LOG_WARN("VST3 plugin chain is empty: no plugins were loaded successfully.");
+    }
 
     is_running_ = true;
     state_ = ServerState::LISTENING;
@@ -282,6 +298,21 @@ void AudioRouterServer::handle_connect_req(const protocol::CommonHeader& hdr, co
         if (!capture_engine_->start(desired_config, actual_audio_config_)) {
             LOG_ERROR("Failed to start audio capture engine");
             return;
+        }
+    }
+
+    // Prepare the plugin chain now that we know the actual sample rate
+    // and channel layout. max_frames_per_block is the size of the
+    // largest chunk we will hand to process(); the capture engine
+    // typically delivers in slightly larger bursts, but the chain
+    // gracefully passes through any oversized block (with a warning),
+    // and the server's packetizer then re-chunks the output into
+    // frames_per_packet-sized UDP packets as before.
+    if (plugin_chain_) {
+        if (!plugin_chain_->prepare(actual_audio_config_.sample_rate,
+                                    actual_audio_config_.channels,
+                                    actual_audio_config_.frames_per_packet)) {
+            LOG_WARN("Plugin chain prepare() failed; continuing without effects");
         }
     }
 
@@ -500,6 +531,16 @@ void AudioRouterServer::disconnect_client(const std::string& reason, bool send_a
             endpoint_control_.unmute_pc_speaker();
         }
 
+        // Tear down the plugin chain so a re-connect with a different
+        // sample rate re-prepares correctly. If we keep the chain
+        // prepared across disconnects, a subsequent CONNECT with a
+        // different preferred_sample_rate would mismatch the plugin's
+        // internal sample rate and either drop audio or refuse to
+        // process.
+        if (plugin_chain_) {
+            plugin_chain_->unprepare();
+        }
+
         active_client_ = SocketAddress();
         state_ = ServerState::LISTENING;
         LOG_INFO("Server back in LISTENING state. Waiting for next client.");
@@ -534,8 +575,57 @@ void AudioRouterServer::on_audio_captured(const void* data, size_t num_frames, c
     const size_t target_chunk_frames = config_.frames_per_packet > 0 ? config_.frames_per_packet : 240;
     const size_t target_chunk_bytes = target_chunk_frames * bytes_per_frame;
 
+    // The audio pipeline now runs: capture (S16LE) -> float32 -> plugin
+    // chain -> float32 -> S16LE -> packetize. The float-side buffers
+    // are reused across calls to avoid per-block heap traffic; they
+    // are sized to the maximum number of frames we will ever receive
+    // in a single capture callback, which is bounded by the
+    // capture engine's quantum (a few ms at 48 kHz).
+    std::vector<float>       float_buf(num_frames * config.channels);
+    std::vector<int16_t>     pcm_buf;
+    // Only allocate the converted-PCM vector when we actually have
+    // plugins to run; the bypass path is allocation-free.
+    const bool run_plugins = plugin_chain_ && plugin_chain_->num_stages() > 0;
+    if (run_plugins) {
+        pcm_buf.resize(num_frames * config.channels);
+    }
+
+    // Convert the capture-engine-native format into float32 in place.
+    // The capture engine in practice emits S16LE (the only format the
+    // server negotiates on connect); we handle it generically so a
+    // future float capture backend is also supported without code
+    // changes here.
+    if (config.format == AudioSampleFormat::PCM_S16LE) {
+        const auto* in = reinterpret_cast<const int16_t*>(data);
+        for (size_t i = 0; i < float_buf.size(); ++i) {
+            float_buf[i] = static_cast<float>(in[i]) / 32768.0f;
+        }
+    } else if (config.format == AudioSampleFormat::PCM_FLOAT32LE) {
+        std::memcpy(float_buf.data(), data, float_buf.size() * sizeof(float));
+    } else {
+        // Unsupported format; fall back to treating the raw bytes as
+        // silence so the chain cannot crash on bogus input.
+        std::memset(float_buf.data(), 0, float_buf.size() * sizeof(float));
+    }
+
+    if (run_plugins) {
+        // Run the configured VST3 (or future) plugin chain on the
+        // float buffer. The chain processes in place; if it has zero
+        // stages (e.g. all plugins failed to load and the chain is a
+        // bypass) this is a no-op.
+        plugin_chain_->process(float_buf.data(), num_frames);
+
+        // Convert float -> S16LE for the on-wire format.
+        for (size_t i = 0; i < pcm_buf.size(); ++i) {
+            float v = std::clamp(float_buf[i], -1.0f, 1.0f);
+            pcm_buf[i] = static_cast<int16_t>(v * 32767.0f);
+        }
+    }
+
     std::lock_guard<std::mutex> lock(chunk_mutex_);
-    const uint8_t* byte_ptr = reinterpret_cast<const uint8_t*>(data);
+    const uint8_t* byte_ptr = run_plugins
+        ? reinterpret_cast<const uint8_t*>(pcm_buf.data())
+        : reinterpret_cast<const uint8_t*>(data);
 
     // Append incoming captured audio bytes into chunking buffer
     chunk_buffer_.insert(chunk_buffer_.end(), byte_ptr, byte_ptr + total_input_bytes);
