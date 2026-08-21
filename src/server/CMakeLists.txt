@@ -36,9 +36,17 @@ set(SERVER_HEADERS
 # always links.
 option(AUDIOROUTER_ENABLE_VST3 "Build the VST3 audio effects host" OFF)
 set(AUDIOROUTER_VST3_FOUND OFF)
-set(AUDIOROUTER_VST3_INCLUDE_DIR "" CACHE PATH
-    "Path to the VST3 public SDK headers (parent of pluginterfaces/vst/). "
-    "Leave empty to use the vendored third_party/vst3/ tree when AUDIOROUTER_ENABLE_VST3=ON.")
+# AUDIOROUTER_VST3_INCLUDE_DIR: when AUDIOROUTER_ENABLE_VST3 is ON, point
+# this at the directory that contains the VST3 public SDK's
+# 'pluginterfaces/' subdirectory. When empty (the default), the build
+# looks for a vendored copy at third_party/vst3/ and silently downgrades
+# to a no-op stub if neither is present. The cache type is PATH so CMake
+# GUI / ccmake show a directory picker, and the docstring is kept on a
+# single line because CMake's argument parser concatenates adjacent
+# quoted strings and treats them as one value -- splitting across lines
+# here would put 'CACHE', 'PATH', and the docstring into the variable's
+# value list instead.
+set(AUDIOROUTER_VST3_INCLUDE_DIR "" CACHE PATH "Path to the VST3 public SDK headers (parent of pluginterfaces/vst/). Leave empty to use the vendored third_party/vst3/ tree when AUDIOROUTER_ENABLE_VST3=ON.")
 if (AUDIOROUTER_ENABLE_VST3)
     if (AUDIOROUTER_VST3_INCLUDE_DIR)
         # Caller pointed us at an explicit SDK location. Trust it.
