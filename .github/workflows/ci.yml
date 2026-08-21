@@ -29,8 +29,14 @@ jobs:
           sudo apt-get install -y cmake make g++ gcc-aarch64-linux-gnu g++-aarch64-linux-gnu zip pkg-config libpulse-dev
 
       - name: Build host tests & binaries
+        # Linux test build: explicitly disable VST3 since the VST3
+        # SDK headers are Windows-only in this repo and the Linux
+        # build's purpose is to run the cross-platform unit tests
+        # (jitter buffer, protocol, conversions, etc.) and the new
+        # VST3 plugin-chain tests in bypass mode. The VST3 host code
+        # path is exercised by the Windows job below.
         run: |
-          cmake -B build-host -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23
+          cmake -B build-host -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 -DAUDIOROUTER_ENABLE_VST3=OFF
           cmake --build build-host --config Release --parallel --verbose
 
       - name: Run Unit Tests
@@ -108,13 +114,40 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure CMake
+      - name: Configure CMake (release)
+        # Primary Release build: matches the existing released
+        # artifact exactly. VST3 is OFF here so the shipped
+        # audiorouter_server.exe stays bit-compatible with the
+        # current release. Users who want VST3 support build
+        # locally with -DAUDIOROUTER_ENABLE_VST3=ON and the VST3
+        # public SDK.
         run: |
-          cmake -B build-win -A x64 -DCMAKE_BUILD_TYPE=Release
+          cmake -B build-win -A x64 -DCMAKE_BUILD_TYPE=Release -DAUDIOROUTER_ENABLE_VST3=OFF
 
-      - name: Build Windows Server
+      - name: Build Windows Server (release)
         run: |
           cmake --build build-win --config Release --target audiorouter_server --parallel
+
+      - name: Configure CMake (VST3 verification)
+        # Secondary build that turns on VST3. The purpose is to
+        # catch any breakage in the VST3 host code path (Windows
+        # LoadLibrary, IComponent / IAudioProcessor lifecycle, the
+        # S16LE<->float32 conversion, the prepare/unprepare on
+        # connect/disconnect, etc.) without affecting the
+        # shipped artifact. The binary produced here is not
+        # uploaded and not released; if this step fails, CI fails.
+        run: |
+          cmake -B build-win-vst3 -A x64 -DCMAKE_BUILD_TYPE=Release -DAUDIOROUTER_ENABLE_VST3=ON
+
+      - name: Build Windows Server (VST3 verification)
+        # If the VST3 SDK headers are not present (e.g. a fork
+        # that hasn't vendored them), the CMake option silently
+        # downgrades to a no-op stub and this build still
+        # succeeds. The VST3 verification therefore catches
+        # "code does not compile" but not "headers missing" --
+        # the latter is a configuration choice, not a regression.
+        run: |
+          cmake --build build-win-vst3 --config Release --target audiorouter_server --parallel
 
       - name: Stage Windows Artifacts
         shell: bash
