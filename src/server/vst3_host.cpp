@@ -528,6 +528,16 @@ public:
 
     std::string name() const override { return name_; }
 
+    // Native handle accessors. Used by the server's open_editors
+    // plumbing to pass the IComponent and IPluginFactory pointers to
+    // the GUI thread without dragging the SDK headers into
+    // IPluginStage. The values are only valid while the stage is
+    // prepared (i.e. between successful prepare() and unprepare()).
+    void* native_handle() const override { return component_; }
+    void* plugin_factory() const override {
+        return module_ ? module_->factory() : nullptr;
+    }
+
 private:
     std::unique_ptr<Vst3Module> module_;
     Steinberg::Vst::IComponent*      component_ = nullptr;

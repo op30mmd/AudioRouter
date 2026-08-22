@@ -100,6 +100,13 @@ bool AudioRouterServer::start() {
         LOG_WARN("VST3 plugin chain is empty: no plugins were loaded successfully.");
     }
 
+    // Open the plugin editor windows. For each stage that exposes a
+    // native handle (currently only VST3 stages), this spawns a UI
+    // thread that creates a host window and attaches the plugin's
+    // IPlugView. The windows appear asynchronously; the audio
+    // pipeline is unaffected. No-op when no stages have editors.
+    plugin_chain_->open_editors();
+
     is_running_ = true;
     state_ = ServerState::LISTENING;
 
@@ -127,6 +134,13 @@ void AudioRouterServer::stop() {
     // Stop audio capture
     if (capture_engine_) {
         capture_engine_->stop();
+    }
+
+    // Close plugin editor windows. Safe even if no editor was opened
+    // (the chain's close_editors() is a no-op in that case). The
+    // call blocks briefly while each editor's UI thread joins.
+    if (plugin_chain_) {
+        plugin_chain_->close_editors();
     }
 
     // Close socket to unblock receive thread

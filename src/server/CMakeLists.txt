@@ -82,7 +82,8 @@ endif()
 # add_executable() so the source list is final.
 if (AUDIOROUTER_VST3_FOUND)
     list(REMOVE_ITEM SERVER_SOURCES vst3_host_stub.cpp)
-    list(APPEND SERVER_SOURCES vst3_host.cpp)
+    list(APPEND SERVER_SOURCES vst3_host.cpp vst3_gui.cpp)
+    list(APPEND SERVER_HEADERS vst3_gui.hpp)
 endif()
 
 add_executable(audiorouter_server ${SERVER_SOURCES} ${SERVER_HEADERS})
@@ -108,7 +109,10 @@ if (AUDIOROUTER_VST3_FOUND)
     endif()
     if (WIN32)
         # VST3 plugins on Windows link against the MS COM runtime.
-        target_link_libraries(audiorouter_server PRIVATE ole32)
+        # The VST3 GUI (vst3_gui.cpp) creates a real Win32 window and
+        # runs a message loop, so we also need the user32 library
+        # (CreateWindowEx, GetMessage, DispatchMessage, etc.).
+        target_link_libraries(audiorouter_server PRIVATE ole32 user32)
     endif()
 else()
     # No SDK: the stub symbol (vst3_host_stub.cpp, still in

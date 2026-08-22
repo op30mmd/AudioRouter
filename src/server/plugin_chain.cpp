@@ -1,5 +1,6 @@
 #include "plugin_chain.hpp"
 #include "vst3_host.hpp"
+#include "vst3_gui.hpp"
 #include "../common/logger.hpp"
 
 namespace audiorouter {
@@ -86,6 +87,49 @@ public:
         return out;
     }
 
+    void open_editors() override {
+#if AUDIOROUTER_ENABLE_VST3
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stages_.empty()) return;
+        // Lazily create the editor manager on first use. We share one
+        // manager across the chain's stages; the manager owns one
+        // editor per plugin (a single plugin per chain in the
+        // current design, but the manager is built to scale to N).
+        if (!editor_manager_) {
+            editor_manager_ = std::make_unique<Vst3EditorManager>();
+        }
+        for (auto& s : stages_) {
+            void* component = s->native_handle();
+            void* factory = s->plugin_factory();
+            if (!component || !factory) {
+                // Stage has no GUI (non-VST3, or failed to expose
+                // its handle). Skip silently.
+                continue;
+            }
+            editor_manager_->open_editor(static_cast<Steinberg::IPluginFactory*>(factory),
+                                          s->name(),
+                                          component,
+                                          nullptr);
+        }
+#else
+        // VST3 not compiled in: no editor to open. The base
+        // IPluginChain::open_editors() is a no-op already; this
+        // override exists so the call site can always use the
+        // same symbol regardless of the build configuration.
+        (void)0;
+#endif
+    }
+
+    void close_editors() override {
+#if AUDIOROUTER_ENABLE_VST3
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (editor_manager_) {
+            editor_manager_->close_all();
+            editor_manager_.reset();
+        }
+#endif
+    }
+
 private:
     mutable std::mutex mutex_;
     std::vector<std::shared_ptr<IPluginStage>> stages_;
@@ -93,6 +137,15 @@ private:
     uint16_t channels_ = 0;
     uint32_t max_frames_per_block_ = 0;
     bool prepared_ = false;
+#if AUDIOROUTER_ENABLE_VST3
+    // Owns one Vst3PluginEditor per plugin in the chain. Created on
+    // first open_editors() and destroyed by close_editors() (or by
+    // the chain's destructor). The actual editor windows are
+    // platform-native; on Windows they are real HWNDs. Only present
+    // when VST3 is compiled in; without it, the editor manager has
+    // no methods to call (see vst3_gui.cpp's #if guard).
+    std::unique_ptr<Vst3EditorManager> editor_manager_;
+#endif
 };
 
 std::unique_ptr<IPluginChain> make_plugin_chain(const std::vector<std::string>& vst3_paths) {

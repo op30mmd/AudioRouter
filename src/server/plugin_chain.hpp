@@ -32,6 +32,21 @@ public:
 
     // Human-readable name for logs / status output.
     virtual std::string name() const = 0;
+
+    // Opaque pointer to the underlying plugin's native handle, for
+    // out-of-band operations like opening a GUI editor. The meaning of
+    // the pointer is implementation-specific:
+    //   * Vst3Stage: Steinberg::Vst::IComponent* (the audio component)
+    //   * BypassPluginChain stages: nullptr
+    // The caller is expected to know what to do with the pointer
+    // based on the plugin's name and on which features are compiled
+    // in (e.g. VST3 GUI). Returns nullptr for non-VST3 stages.
+    virtual void* native_handle() const { return nullptr; }
+
+    // Opaque pointer to the underlying plugin's IPluginFactory (for
+    // VST3, needed to instantiate the IEditController). Same
+    // void*-to-SDK-pointer convention as native_handle().
+    virtual void* plugin_factory() const { return nullptr; }
 };
 
 // A chain of zero or more IPluginStages that processes audio in series.
@@ -61,6 +76,15 @@ public:
 
     // Human-readable list of stages, one per line, for log output.
     virtual std::string describe() const = 0;
+
+    // Open plugin editors (VST3 GUI windows) for any stage that
+    // supports them. Default: no-op (BypassPluginChain, or any chain
+    // compiled without VST3 GUI support). Each editor runs on its
+    // own thread; the windows appear asynchronously. close_editors()
+    // must be called before destruction to ensure the windows close
+    // before the plugin chain is torn down.
+    virtual void open_editors() {}
+    virtual void close_editors() {}
 };
 
 // Factory: construct the appropriate chain for the given list of plugin
