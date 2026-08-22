@@ -44,6 +44,20 @@
 
 #if AUDIOROUTER_ENABLE_VST3
 
+// vst3_host.cpp defines INIT_CLASS_IID around its SDK includes,
+// which emits out-of-line definitions of the static `iid` members
+// for the interfaces it uses (IComponent, IAudioProcessor, ...).
+// We can't use the same trick here: re-including the same headers
+// with INIT_CLASS_IID defined would emit duplicate `IComponent::iid`
+// etc. definitions at link time (the macros are per-TU).
+//
+// Instead, we include the SDK headers WITHOUT INIT_CLASS_IID (so
+// they only emit the static TUID tables), then use DEF_CLASS_IID to
+// define just the IIDs we actually use. IEditController is the
+// only one the GUI code references directly (passed to
+// factory->createInstance on line ~345); the other IIDs
+// (IComponent::iid, IAudioProcessor::iid, ...) come from
+// vst3_host.cpp's translation unit.
 #include <pluginterfaces/base/funknown.h>
 #include <pluginterfaces/vst/ivstcomponent.h>
 #include <pluginterfaces/vst/ivstaudioprocessor.h>
@@ -58,6 +72,16 @@
     #include <windows.h>
     #include <windowsx.h>  // for GET_X_LPARAM / GET_Y_LPARAM on mouse msgs
 #endif
+
+// Definition of Steinberg::Vst::IEditController::iid (the only
+// GUI-side IID we reference that vst3_host.cpp does not already
+// define). DEF_CLASS_IID expands to:
+//   const ::Steinberg::FUID Steinberg::Vst::IEditController::iid
+//       (Steinberg::Vst::IEditController_iid);
+// which is the out-of-line member definition. The macro uses
+// token concatenation (`ClassName##_iid`) on the class name, so
+// we pass the fully qualified Steinberg::Vst::IEditController.
+DEF_CLASS_IID(Steinberg::Vst::IEditController)
 
 namespace audiorouter {
 
