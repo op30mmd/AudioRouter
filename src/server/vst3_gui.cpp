@@ -301,31 +301,44 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
         return;
     }
 
+    // The header stores the SDK interface pointers as void* to keep
+    // the SDK headers out of the public surface. Inside the .cpp we
+    // have the SDK, so we keep a local typed pointer alongside the
+    // void* member and use the typed one for actual method calls.
+    // The void* members are kept in sync so the error-path teardown
+    // and the message-loop teardown can both reach the same objects
+    // through either spelling.
+    Steinberg::Vst::IEditController* controller = nullptr;
+    Steinberg::IPlugView* view = nullptr;
+    HostComponentHandler* handler = nullptr;
+
     // 2. Instantiate the IEditController.
     Steinberg::tresult r = factory->createInstance(
         classIdBuf, Steinberg::Vst::IEditController::iid,
-        reinterpret_cast<void**>(&controller_));
-    if (r != Steinberg::kResultOk || !controller_) {
+        reinterpret_cast<void**>(&controller));
+    if (r != Steinberg::kResultOk || !controller) {
         LOG_ERROR("VST3 GUI: createInstance(IEditController) failed (0x" << std::hex << r << ")");
         return;
     }
+    controller_ = controller;
 
     // 3. Initialize the controller (analogous to component->initialize
     //    for the audio side). The controller is a FUnknown-derived
     //    object that needs to be initialized with our host context.
     Steinberg::FUnknown* host_ctx = nullptr;  // No-op host; controller doesn't need callbacks at init
-    r = controller_->initialize(host_ctx);
+    r = controller->initialize(host_ctx);
     if (r != Steinberg::kResultOk) {
         LOG_ERROR("VST3 GUI: IEditController::initialize failed (0x" << std::hex << r << ")");
-        controller_->release();
+        controller->release();
         controller_ = nullptr;
         return;
     }
 
     // 4. Set the component handler. The plugin uses this to inform
     //    the host of parameter changes from the UI.
-    handler_ = new HostComponentHandler();
-    r = controller_->setComponentHandler(handler_);
+    handler = new HostComponentHandler();
+    handler_ = handler;
+    r = controller->setComponentHandler(handler);
     if (r != Steinberg::kResultOk) {
         LOG_WARN("VST3 GUI: setComponentHandler returned 0x" << std::hex << r);
     }
@@ -333,29 +346,29 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
     // 5. Create the IPlugView. IPlugView is in the Steinberg::
     //    namespace (not Steinberg::Vst::, despite being a GUI
     //    interface) -- see pluginterfaces/gui/iplugview.h.
-    Steinberg::IPlugView* view = controller_->createView("editor");
+    view = controller->createView("editor");
     if (!view) {
         LOG_ERROR("VST3 GUI: IEditController::createView returned null (plugin has no editor)");
-        handler_->release();
+        handler->release();
         handler_ = nullptr;
-        controller_->terminate();
-        controller_->release();
+        controller->terminate();
+        controller->release();
         controller_ = nullptr;
         return;
     }
     view_ = view;
 
     // 6. Verify the plugin supports Windows native windows.
-    r = view_->isPlatformTypeSupported("HWND");
+    r = view->isPlatformTypeSupported("HWND");
     if (r != Steinberg::kResultTrue) {
         LOG_ERROR("VST3 GUI: plugin does not support HWND platform type (returned 0x"
                   << std::hex << r << ")");
-        view_->release();
+        view->release();
         view_ = nullptr;
-        handler_->release();
+        handler->release();
         handler_ = nullptr;
-        controller_->terminate();
-        controller_->release();
+        controller->terminate();
+        controller->release();
         controller_ = nullptr;
         return;
     }
@@ -363,7 +376,7 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
     // 7. Get the desired window size so we can size the host window
     //    before the plugin paints.
     Steinberg::ViewRect desiredSize;
-    r = view_->getSize(&desiredSize);
+    r = view->getSize(&desiredSize);
     int winW = 600, winH = 400;  // safe fallback
     if (r == Steinberg::kResultOk) {
         winW = desiredSize.getWidth();
@@ -412,13 +425,8 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
     // it back to find the view and the editor.
     WindowContext* wctx = new WindowContext();
     wctx->editor = this;
-    // The header declares view_/controller_ as void* to avoid
-    // pulling the VST3 SDK headers in; here (inside the .cpp) we
-    // know the concrete types and need explicit casts. C++ does
-    // not allow implicit void* -> typed-pointer conversion (C did),
-    // and MSVC's stricter type checks flag the implicit form.
-    wctx->view = static_cast<Steinberg::IPlugView*>(view_);
-    wctx->controller = static_cast<Steinberg::Vst::IEditController*>(controller_);
+    wctx->view = view;
+    wctx->controller = controller;
     wctx->frame = new HostPlugFrame();
 
     HWND hwnd = CreateWindowExW(
@@ -431,12 +439,12 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
         LOG_ERROR("VST3 GUI: CreateWindowExW failed: " << GetLastError());
         delete wctx->frame;
         delete wctx;
-        view_->release();
+        view->release();
         view_ = nullptr;
-        handler_->release();
+        handler->release();
         handler_ = nullptr;
-        controller_->terminate();
-        controller_->release();
+        controller->terminate();
+        controller->release();
         controller_ = nullptr;
         return;
     }
@@ -445,7 +453,7 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
     wctx->frame->setHostHwnd(hwnd);
 
     // 10. Set the IPlugFrame (must be done before attached()).
-    view_->setFrame(wctx->frame);
+    view->setFrame(wctx->frame);
 
     // 11. Create the child window that the plugin's view will draw
     //     into. We do this before attached() so the plugin has a
@@ -463,12 +471,12 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
         DestroyWindow(hwnd);
         delete wctx->frame;
         delete wctx;
-        view_->release();
+        view->release();
         view_ = nullptr;
-        handler_->release();
+        handler->release();
         handler_ = nullptr;
-        controller_->terminate();
-        controller_->release();
+        controller->terminate();
+        controller->release();
         controller_ = nullptr;
         return;
     }
@@ -477,19 +485,19 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
     // 12. Attach the plugin's view to the child window. The plugin
     //     creates whatever sub-windows it needs (HWND-based UIs in
     //     this case) as children of `child`.
-    r = view_->attached(child, "HWND");
+    r = view->attached(child, "HWND");
     if (r != Steinberg::kResultOk) {
         LOG_ERROR("VST3 GUI: IPlugView::attached failed (0x" << std::hex << r << ")");
         DestroyWindow(child);
         DestroyWindow(hwnd);
         delete wctx->frame;
         delete wctx;
-        view_->release();
+        view->release();
         view_ = nullptr;
-        handler_->release();
+        handler->release();
         handler_ = nullptr;
-        controller_->terminate();
-        controller_->release();
+        controller->terminate();
+        controller->release();
         controller_ = nullptr;
         return;
     }
@@ -513,9 +521,9 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
 
     // 15. Tear down in reverse order.
     LOG_INFO("VST3 GUI: editor window closing");
-    if (view_) {
-        view_->removed();
-        view_->release();
+    if (view) {
+        view->removed();
+        view->release();
         view_ = nullptr;
     }
     if (host_hwnd_) {
@@ -523,13 +531,13 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
         host_hwnd_ = nullptr;
     }
     if (view_hwnd_) view_hwnd_ = nullptr;
-    if (handler_) {
-        handler_->release();
+    if (handler) {
+        handler->release();
         handler_ = nullptr;
     }
-    if (controller_) {
-        controller_->terminate();
-        controller_->release();
+    if (controller) {
+        controller->terminate();
+        controller->release();
         controller_ = nullptr;
     }
     if (wctx) {

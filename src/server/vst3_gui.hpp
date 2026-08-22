@@ -116,11 +116,15 @@ private:
     // loop and also wakes when WM_CLOSE arrives.
     std::atomic<bool> is_stopping_{false};
 
-    // Owned VST3 interface pointers, set on the UI thread during
-    // start() and released in stop(). void* to keep the header free
-    // of the SDK includes; the cpp casts to the appropriate SDK
-    // type. (controller is Vst::IEditController; view is
-    // Steinberg::IPlugView; handler is our own host-side impl.)
+    // VST3 SDK interface pointers held for the duration of one
+    // ui_thread_main() invocation. We use void* in the header to
+    // keep the SDK out of the public surface; the .cpp casts back
+    // to the concrete types for actual method calls. The pointers
+    // are created and released inside ui_thread_main; on error or
+    // WM_CLOSE they're released in reverse order before the
+    // function returns. stop() does not touch them -- it only
+    // posts WM_CLOSE, which causes the message loop to exit and
+    // ui_thread_main to fall through to its teardown code.
     void* controller_ = nullptr;  // Steinberg::Vst::IEditController*
     void* view_ = nullptr;        // Steinberg::IPlugView*
     void* handler_ = nullptr;     // HostComponentHandler*
