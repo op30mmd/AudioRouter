@@ -302,16 +302,23 @@ void AudioRouterServer::handle_connect_req(const protocol::CommonHeader& hdr, co
     }
 
     // Prepare the plugin chain now that we know the actual sample rate
-    // and channel layout. max_frames_per_block is the size of the
-    // largest chunk we will hand to process(); the capture engine
-    // typically delivers in slightly larger bursts, but the chain
-    // gracefully passes through any oversized block (with a warning),
-    // and the server's packetizer then re-chunks the output into
-    // frames_per_packet-sized UDP packets as before.
+    // and channel layout. max_frames_per_block is the largest single
+    // block the chain's process() will ever be asked to handle. The
+    // capture engine delivers audio in its own quantum (typically
+    // 10 ms = 480 frames at 48 kHz on shared-mode WASAPI), which is
+    // generally larger than the on-wire packet size (frames_per_packet,
+    // default 5 ms = 240). We size max_frames_per_block to cover the
+    // capture quantum: the chain processes whatever the capture
+    // engine hands it, and the server's packetizer then re-chunks
+    // the chain's output into frames_per_packet-sized UDP packets
+    // for transmission. 2048 frames is a generous upper bound
+    // (covers up to ~43 ms at 48 kHz) and matches the VST3 SDK's
+    // common "maxSamplesPerBlock" recommendation.
+    constexpr uint32_t kMaxPluginBlockFrames = 2048;
     if (plugin_chain_) {
         if (!plugin_chain_->prepare(actual_audio_config_.sample_rate,
                                     actual_audio_config_.channels,
-                                    actual_audio_config_.frames_per_packet)) {
+                                    kMaxPluginBlockFrames)) {
             LOG_WARN("Plugin chain prepare() failed; continuing without effects");
         }
     }
@@ -531,6 +538,16 @@ void AudioRouterServer::disconnect_client(const std::string& reason, bool send_a
             endpoint_control_.unmute_pc_speaker();
         }
 
+        // Flip state to LISTENING *before* un-preparing the chain so the
+        // capture thread's on_audio_captured() bails on the state check
+        // and never tries to process() an unprepared chain. Without this
+        // ordering the audio thread can race past the state check while
+        // we're in the middle of un-preparing the chain, which produces
+        // "received N frames but was prepared for 0" warnings and (in the
+        // worst case) a call into an unprepared plugin.
+        active_client_ = SocketAddress();
+        state_ = ServerState::LISTENING;
+
         // Tear down the plugin chain so a re-connect with a different
         // sample rate re-prepares correctly. If we keep the chain
         // prepared across disconnects, a subsequent CONNECT with a
@@ -541,8 +558,6 @@ void AudioRouterServer::disconnect_client(const std::string& reason, bool send_a
             plugin_chain_->unprepare();
         }
 
-        active_client_ = SocketAddress();
-        state_ = ServerState::LISTENING;
         LOG_INFO("Server back in LISTENING state. Waiting for next client.");
     }
 }
