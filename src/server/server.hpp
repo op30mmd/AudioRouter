@@ -5,6 +5,7 @@
 #include "../common/audio_types.hpp"
 #include "audio_capture.hpp"
 #include "audio_endpoint_control.hpp"
+#include "plugin_chain.hpp"
 
 #include <atomic>
 #include <thread>
@@ -31,6 +32,12 @@ struct ServerConfig {
     // injects the phone's TCP traffic straight into the PC's loopback; the
     // server relays each UDP datagram as a length-prefixed frame over it.
     bool usb_mode = false;
+    // VST3 audio effects: each path is loaded as a VST3 plugin and
+    // applied in series to the captured audio before packetisation. An
+    // empty list means no effects (passthrough). The on-wire format
+    // stays S16LE; internally the audio is converted to float32 for the
+    // plugins, then back to S16LE for transmission.
+    std::vector<std::string> vst3_plugins;
 };
 
 enum class ServerState {
@@ -81,6 +88,7 @@ private:
 
     UdpSocket socket_;
     std::unique_ptr<IAudioCapture> capture_engine_;
+    std::unique_ptr<IPluginChain> plugin_chain_;
     AudioEndpointControl endpoint_control_;
     AudioConfig actual_audio_config_;
 

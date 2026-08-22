@@ -106,9 +106,20 @@ and a watchdog:
   `client_timeout_ms` (8 s), the client is disconnected and the speaker restored.
 - **Test tone** (`dummy_capture.cpp`): `-t` replaces loopback with a 440 Hz sine
   generator for network/pipeline testing without a sound source.
+- **VST3 audio effects** (`plugin_chain.cpp`, `vst3_host.cpp`): any number of
+  VST3 plugins can be loaded with `--vst3 <path>` (repeatable). They are
+  applied in series to the captured audio between capture and packetization.
+  The on-wire format stays S16LE; audio is converted to float32 for the
+  plugins and back. The plugin chain is a generic abstraction
+  (`IPluginChain` / `IPluginStage`) so future effect formats (LV2, AU,
+  built-in) can be added without changing the server. Requires a build
+  with `-DAUDIOROUTER_ENABLE_VST3=ON` and the VST3 public SDK headers
+  (`third_party/vst3/`, BSD-licensed); when VST3 support is not compiled
+  in, `--vst3` falls back to bypass with a warning and audio passes
+  through unchanged.
 
 Options: `-p/--port`, `-b/--bind`, `-r/--rate`, `-f/--frames`, `--no-mute`,
-`--mute-mode`, `-t/--test-tone`, `-l/--list-if`, `--usb`.
+`--mute-mode`, `-t/--test-tone`, `-l/--list-if`, `--usb`, `--vst3 <path>`.
 
 ### 2.1 Voice over USB
 

@@ -30,7 +30,7 @@ jobs:
 
       - name: Build host tests & binaries
         run: |
-          cmake -B build-host -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23
+          cmake -B build-host -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 -DAUDIOROUTER_ENABLE_VST3=ON
           cmake --build build-host --config Release --parallel --verbose
 
       - name: Run Unit Tests
@@ -50,8 +50,6 @@ jobs:
 
           if [ -n "$NDK_PATH" ] && [ -f "$NDK_PATH/build/cmake/android.toolchain.cmake" ]; then
             echo "Building with Android NDK toolchain at: $NDK_PATH"
-            # android-26 (Android 8.0) so the AAudio no-root backend
-            # (aaudio_player.cpp, stream_daemon) is compiled in.
             cmake -B build-android-arm64 \
               -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
               -DANDROID_ABI=arm64-v8a \
@@ -92,6 +90,7 @@ jobs:
           cp README.md staging-arm64/
           cp LICENSE staging-arm64/
           chmod +x staging-arm64/*.sh staging-arm64/audiorouter_client
+          [ -f staging-arm64/stream_daemon ] && chmod +x staging-arm64/stream_daemon
 
       - name: Upload Android ARM64 Client Artifact
         uses: actions/upload-artifact@v4
@@ -108,9 +107,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure CMake
+      - name: Configure CMake (Release with VST3)
         run: |
-          cmake -B build-win -A x64 -DCMAKE_BUILD_TYPE=Release
+          cmake -B build-win -A x64 -DCMAKE_BUILD_TYPE=Release -DAUDIOROUTER_ENABLE_VST3=ON
 
       - name: Build Windows Server
         run: |
@@ -120,7 +119,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p staging-win
-          cp build-win/src/server/Release/audiorouter_server.exe staging-win/
+          if [ -f build-win/src/server/Release/audiorouter_server.exe ]; then
+            cp build-win/src/server/Release/audiorouter_server.exe staging-win/
+          elif [ -f build-win/Release/audiorouter_server.exe ]; then
+            cp build-win/Release/audiorouter_server.exe staging-win/
+          else
+            find build-win -name "audiorouter_server.exe" -exec cp {} staging-win/ \;
+          fi
           cp README.md staging-win/
           cp LICENSE staging-win/
 
@@ -135,8 +140,8 @@ jobs:
     name: Generate Tag & Publish Release
     needs: [build-and-test-linux, build-windows]
     runs-on: ubuntu-latest
-    # Only run on push to main or manual trigger, NEVER on pull requests
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # Run on push to main or manual trigger, NEVER on pull requests
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout repository
@@ -164,14 +169,10 @@ jobs:
           echo "tag_name=$VERSION_TAG" >> "$GITHUB_OUTPUT"
 
           # Package Windows zip
-          cd release-staging/server-win
-          zip -r "../../audiorouter-$VERSION_TAG-windows-x64.zip" .
-          cd ../..
+          (cd release-staging/server-win && zip -r "$GITHUB_WORKSPACE/audiorouter-$VERSION_TAG-windows-x64.zip" .)
 
           # Package Android Termux tar.gz
-          cd release-staging/client-arm64
-          tar -czvf "../../audiorouter-$VERSION_TAG-android-termux-arm64.tar.gz" .
-          cd ../..
+          (cd release-staging/client-arm64 && tar -czvf "$GITHUB_WORKSPACE/audiorouter-$VERSION_TAG-android-termux-arm64.tar.gz" .)
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -192,7 +193,7 @@ jobs:
             High-performance audio streaming engine from Windows PC to Android Termux (ALSA / Root / AAudio no-root).
 
             ### 📦 Release Assets
-            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-windows-x64.zip`**: Windows PC Server (`audiorouter_server.exe` with WASAPI Loopback Capture and Endpoint Volume muting).
+            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-windows-x64.zip`**: Windows PC Server (`audiorouter_server.exe` with WASAPI Loopback Capture, VST3 plugin host, and Endpoint Volume muting).
             - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-android-termux-arm64.tar.gz`**: Android ARM64 Client for Termux (`audiorouter_client` with ALSA, direct `/dev/snd/`, Qualcomm AGM, AAudio, and Termux:API media player backends + standalone `stream_daemon`).
 
             ### 🚀 Quick Start

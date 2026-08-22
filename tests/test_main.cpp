@@ -39,6 +39,7 @@ bool run_pulse_tests();
 bool run_thread_safety_tests();
 bool run_type_safety_tests();
 bool run_memory_safety_tests();
+bool run_plugin_chain_tests();
 
 int main(int argc, char* argv[]) {
     (void)argc;
@@ -60,6 +61,7 @@ int main(int argc, char* argv[]) {
     test::register_test("Thread Safety Verification", run_thread_safety_tests);
     test::register_test("Type Safety Verification", run_type_safety_tests);
     test::register_test("Memory Safety Verification", run_memory_safety_tests);
+    test::register_test("VST3 Plugin Chain (bypass & roundtrip)", run_plugin_chain_tests);
 
     int passed = 0;
     int failed = 0;

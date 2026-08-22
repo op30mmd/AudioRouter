@@ -1,0 +1,76 @@
+Vendored VST3 public SDK headers
+================================
+
+This directory contains a subset of the VST3 public SDK by Steinberg
+Media Technologies GmbH, vendored under the MIT license so that the
+VST3 host in this project can be built without a separate SDK
+install or a network round-trip during CI.
+
+The full SDK is at https://github.com/steinbergmedia/vst3sdk. Only
+the public header files needed by src/server/vst3_host.cpp are
+included here; the SDK's implementation .cpp files are not vendored
+(the host loads plugins dynamically via dlopen/LoadLibrary at
+runtime).
+
+What is vendored
+----------------
+
+* pluginterfaces/base/  - the Steinberg::FUnknown base interface and
+  platform alignment macros.
+* pluginterfaces/vst/   - IComponent, IAudioProcessor, the bus
+  structures, ProcessData, ProcessSetup, and the supporting
+  interfaces.
+* public.sdk/source/vst/hosting/ - the VST3 host-side helpers
+  (HostClasses, ProcessData, parameter-changes queue, etc.).
+
+What is NOT vendored
+--------------------
+
+* The SDK's .cpp implementation files.
+* The SDK's CMake build system, base utilities, audio GUI, examples,
+  tutorials, validator, and helper scripts.
+* Submodule contents outside of pluginterfaces/ and
+  public.sdk/source/vst/hosting/.
+
+Why a subset and not the full SDK
+---------------------------------
+
+The full VST3 SDK is several thousand files and tens of thousands of
+lines, most of which is GUI toolkit code, validator tools, examples,
+and a CMake build system that is not useful here. The host in this
+project only ever needs the public ABI headers to compile against.
+Vendoring only the headers keeps the repository small and avoids
+maintenance churn from upstream SDK changes that do not affect the
+ABI surface used here.
+
+How to update
+-------------
+
+To refresh the vendored headers from upstream, run from the
+repository root:
+
+  git clone --depth 1 --recurse-submodules https://github.com/steinbergmedia/vst3sdk.git /tmp/vst3sdk
+  rsync -a --delete /tmp/vst3sdk/pluginterfaces/base/ third_party/vst3/pluginterfaces/base/
+  rsync -a --delete /tmp/vst3sdk/pluginterfaces/vst/  third_party/vst3/pluginterfaces/vst/
+  rsync -a --delete /tmp/vst3sdk/public.sdk/source/vst/hosting/ third_party/vst3/public.sdk/source/vst/hosting/
+  cp /tmp/vst3sdk/LICENSE.txt third_party/vst3/LICENSE.txt
+  rm -rf /tmp/vst3sdk
+
+Review the diff before committing. ABI-breaking changes upstream
+require a corresponding update to src/server/vst3_host.cpp; the
+host's compile errors on CI will surface the breakage.
+
+License
+-------
+
+The vendored headers are MIT-licensed by Steinberg Media
+Technologies GmbH. The full license text is in LICENSE.txt in this
+directory. Each header also retains its original copyright header
+from the upstream SDK.
+
+In addition to the MIT terms, the upstream SDK's
+VST3_Usage_Guidelines.pdf and LICENSE.txt apply to anyone who
+distributes the SDK headers (which this repository does). The
+trademark guidelines in particular restrict the use of the "VST" and
+"VST3" trademarks; this project complies by using the names
+descriptively only.

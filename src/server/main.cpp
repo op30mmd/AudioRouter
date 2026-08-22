@@ -155,6 +155,11 @@ void print_usage(const char* prog) {
               << "      --freq <hz>           Test tone frequency in Hz (default: 440.0)\n"
               << "      --usb                 Voice over USB: bind to loopback and stream over the USB cable\n"
               << "                              via 'adb reverse tcp:<port> tcp:<port>' (no Wi-Fi)\n"
+              << "      --vst3 <path>         Load a VST3 plugin (.vst3) and apply it to the audio. May be\n"
+              << "                              repeated to chain multiple effects in series (left to right).\n"
+              << "                              The on-wire format stays S16LE; audio is converted to\n"
+              << "                              float32 internally for the plugins. Requires a build with\n"
+              << "                              -DAUDIOROUTER_ENABLE_VST3=ON and the VST3 SDK.\n"
               << "  -l, --list-if             List all available network interfaces and exit\n"
               << "  -v, --verbose             Enable debug logging\n"
               << "  -h, --help                Show this help message\n\n"
@@ -224,6 +229,8 @@ int main(int argc, char* argv[]) {
             config.test_tone_freq = std::stod(argv[++i]);
         } else if (arg == "--usb") {
             config.usb_mode = true;
+        } else if (arg == "--vst3" && i + 1 < argc) {
+            config.vst3_plugins.emplace_back(argv[++i]);
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage(argv[0]);
@@ -273,7 +280,10 @@ int main(int argc, char* argv[]) {
             LOG_INFO("Status: Streaming to " << client.to_string()
                      << " | Sent: " << stats.packets_sent << " pkts ("
                      << (stats.bytes_sent / 1024) << " KB)"
-                     << " | Lost (Client reported): " << stats.client_lost_packets);
+                     << " | Lost (Client reported): " << stats.client_lost_packets
+                     << " | FX: " << (config.vst3_plugins.empty()
+                                        ? std::string("none")
+                                        : std::to_string(config.vst3_plugins.size()) + " plugin(s)"));
         }
     }
 
