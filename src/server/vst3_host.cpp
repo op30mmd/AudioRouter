@@ -32,11 +32,15 @@
 //      channel layout.
 //
 // Then each block of audio is delivered via
-// IAudioProcessor::process(ProcessData&). The ProcessData owns pointers
-// to the audio buffers; we provide a single interleaved float32 input
-// and output buffer (VST3 supports separate channel buffers but our
-// on-wire format is interleaved; the host takes the per-channel
-// performance hit for the convenience of one buffer).
+// IAudioProcessor::process(ProcessData&). ProcessData holds separate
+// planar channel buffers (channelBuffers[c][i] is the i-th sample of
+// channel c), while the host's on-wire format is interleaved stereo
+// ([L0, R0, L1, R1, ...]). The host deinterleaves into a private
+// scratch buffer (input half), runs the plugin (which writes to the
+// scratch's output half), and re-interleaves back into the caller's
+// buffer. The plugin thus sees distinct read and write pointers
+// arranged planar, which is the standard VST3 setup most plugins are
+// written and tested against.
 
 #include "vst3_host.hpp"
 #include "../common/logger.hpp"
@@ -389,9 +393,15 @@ public:
         channels_ = channels;
         max_frames_per_block_ = max_frames_per_block;
 
-        // Scratch buffer for the input copy. Sized for the maximum
-        // block we'll ever hand to it.
-        scratch_.resize(static_cast<size_t>(max_frames_per_block) * channels);
+        // Scratch buffer holds two planar copies of the input block:
+        // one for the plugin's input, one for the plugin's output.
+        // Each planar copy is laid out as
+        //   [channel 0 samples | channel 1 samples | ...]
+        // with each channel's samples contiguous, so a single
+        // channel of `max_frames_per_block` samples lives at offset
+        // `channel * max_frames_per_block`. The scratch is sized to
+        // hold two such planar copies back-to-back.
+        scratch_.resize(static_cast<size_t>(max_frames_per_block) * channels * 2);
 
         prepared_ = true;
         return true;
@@ -418,22 +428,53 @@ public:
             return;
         }
 
-        // Copy the input to scratch. The plugin will read from the
-        // scratch (channel-strided) and write back to interleaved.
+        // VST3 expects planar channel buffers (channelBuffers[c][i] is
+        // the i-th sample of channel c), but the host passes
+        // interleaved audio ([L0, R0, L1, R1, ...]). Convert between
+        // the two layouts via the scratch buffer:
+        //
+        //   in_base  = scratch input half  (planar, for the plugin to read)
+        //   out_base = scratch output half (planar, for the plugin to write)
+        //
+        // The halves are disjoint so the plugin sees distinct read
+        // and write pointers, which is the standard VST3 setup most
+        // plugins are written and tested against. (The VST3 spec
+        // permits in-place processing, but plugins generally
+        // assume they aren't.) We deinterleave the input into the
+        // input half, run the plugin, then re-interleave the output
+        // half back into the caller's buffer.
         const size_t total = num_frames * channels_;
-        std::memcpy(scratch_.data(), interleaved, total * sizeof(float));
-
-        // Set up channel pointers: each channel's data is
-        // scratch_[channel * num_frames .. (channel+1) * num_frames]
-        // for input, and interleaved[channel * num_frames ..] for
-        // output.
-        std::vector<float*> in_chan(channels_);
-        for (uint16_t c = 0; c < channels_; ++c) {
-            in_chan[c] = scratch_.data() + static_cast<size_t>(c) * num_frames;
+        const size_t half = static_cast<size_t>(max_frames_per_block_) * channels_;
+        if (scratch_.size() < half * 2) {
+            // Defensive: prepare() sized this, so it should never
+            // resize here. Resize and continue rather than fail.
+            scratch_.resize(half * 2);
         }
+        float* in_base  = scratch_.data();
+        float* out_base = scratch_.data() + half;
+
+        const bool stereo = (channels_ == 2);
+        if (stereo) {
+            // Deinterleave: L0, R0, L1, R1, ... -> planar [L0, L1, ...], [R0, R1, ...]
+            for (size_t i = 0; i < num_frames; ++i) {
+                in_base[0 * max_frames_per_block_ + i] = interleaved[2 * i + 0];
+                in_base[1 * max_frames_per_block_ + i] = interleaved[2 * i + 1];
+            }
+        } else {
+            // Mono (or >2 channels handled defensively): copy as-is.
+            for (size_t i = 0; i < num_frames; ++i) {
+                in_base[0 * max_frames_per_block_ + i] = interleaved[i * channels_];
+            }
+        }
+
+        // Set up channel pointers. Inputs read from the input half;
+        // outputs write to the output half. The plugin sees distinct
+        // read and write pointers, which is the standard VST3 setup.
+        std::vector<float*> in_chan(channels_);
         std::vector<float*> out_chan(channels_);
         for (uint16_t c = 0; c < channels_; ++c) {
-            out_chan[c] = interleaved + static_cast<size_t>(c) * num_frames;
+            in_chan[c]  = in_base  + static_cast<size_t>(c) * max_frames_per_block_;
+            out_chan[c] = out_base + static_cast<size_t>(c) * max_frames_per_block_;
         }
 
         Steinberg::Vst::AudioBusBuffers in_bus{};
@@ -460,12 +501,28 @@ public:
             // A non-zero return typically means the plugin entered a
             // bad state (e.g. out-of-memory). We log once and pass
             // through the input for the rest of the lifetime to avoid
-            // log spam on every block.
+            // log spam on every block. The re-interleave below sees
+            // the original (un-processed) input.
             static std::once_flag once;
             std::call_once(once, [this]() {
                 LOG_ERROR("VST3: '" << name_ << "' process() returned non-zero; passing through");
             });
-            std::memcpy(interleaved, scratch_.data(), total * sizeof(float));
+            // Copy the deinterleaved input into the output half so the
+            // re-interleave produces the original audio.
+            std::memcpy(out_base, in_base, total * sizeof(float));
+        }
+
+        // Re-interleave the (now processed) planar output back into
+        // the caller's interleaved buffer.
+        if (stereo) {
+            for (size_t i = 0; i < num_frames; ++i) {
+                interleaved[2 * i + 0] = out_base[0 * max_frames_per_block_ + i];
+                interleaved[2 * i + 1] = out_base[1 * max_frames_per_block_ + i];
+            }
+        } else {
+            for (size_t i = 0; i < num_frames; ++i) {
+                interleaved[i * channels_] = out_base[0 * max_frames_per_block_ + i];
+            }
         }
     }
 
@@ -483,6 +540,8 @@ private:
     bool prepared_ = false;
     std::mutex mutex_;
 
+    // See process() for layout. Two planar copies of the input block
+    // (input + output), each channels_ * max_frames_per_block_ floats.
     std::vector<float> scratch_;
 };
 
