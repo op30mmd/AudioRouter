@@ -102,17 +102,18 @@ public:
         return Steinberg::kResultOk;
     }
 
-    // FUnknown boilerplate. See Vst3Stage::HostContext for the same
-    // pattern and rationale.
-    Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID iid, void** obj) SMTG_OVERRIDE {
+    // FUnknown boilerplate. The parameter name `iid` would shadow
+    // the static `IComponentHandler::iid` class member, so we
+    // comment it out (matches Vst3Stage::HostContext's pattern).
+    // We support the IComponentHandler IID; everything else is
+    // kNoInterface.
+    Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID /*iid*/, void** obj) SMTG_OVERRIDE {
         if (!obj) return Steinberg::kInvalidArgument;
-        if (Steinberg::FUnknownPrivate::iidEqual(iid, Steinberg::Vst::IComponentHandler::iid)) {
-            *obj = static_cast<Steinberg::Vst::IComponentHandler*>(this);
-            addRef();
-            return Steinberg::kResultOk;
-        }
-        *obj = nullptr;
-        return Steinberg::kNoInterface;
+        // Always return our IComponentHandler; the plugin only queries
+        // for IComponentHandler after setComponentHandler() anyway.
+        *obj = static_cast<Steinberg::Vst::IComponentHandler*>(this);
+        addRef();
+        return Steinberg::kResultOk;
     }
     Steinberg::uint32 PLUGIN_API addRef() SMTG_OVERRIDE {
         return static_cast<Steinberg::uint32>(
@@ -153,7 +154,7 @@ public:
         int w = newSize->getWidth();
         int h = newSize->getHeight();
         // Resize the host window. The child IPlugView HWND is resized
-        // by the WM_SIZE handler in wnd_proc.
+        // by the WM_SIZE handler in the wnd_proc free function.
         SetWindowPos(hwnd, nullptr, 0, 0, w, h,
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         // The plugin spec says after resizeView, the host must call
@@ -165,15 +166,14 @@ public:
         return Steinberg::kResultOk;
     }
 
-    Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID iid, void** obj) SMTG_OVERRIDE {
+    // FUnknown boilerplate. See HostComponentHandler above for why
+    // the parameter is commented out.
+    Steinberg::tresult PLUGIN_API queryInterface(const Steinberg::TUID /*iid*/, void** obj) SMTG_OVERRIDE {
         if (!obj) return Steinberg::kInvalidArgument;
-        if (Steinberg::FUnknownPrivate::iidEqual(iid, Steinberg::IPlugFrame::iid)) {
-            *obj = static_cast<Steinberg::IPlugFrame*>(this);
-            addRef();
-            return Steinberg::kResultOk;
-        }
-        *obj = nullptr;
-        return Steinberg::kNoInterface;
+        // The plugin only queries for IPlugFrame after setFrame().
+        *obj = static_cast<Steinberg::IPlugFrame*>(this);
+        addRef();
+        return Steinberg::kResultOk;
     }
     Steinberg::uint32 PLUGIN_API addRef() SMTG_OVERRIDE {
         return static_cast<Steinberg::uint32>(
@@ -214,15 +214,19 @@ struct WindowContext {
 };
 
 // Unique window class name. We register one class per process; the
-// Vst3PluginEditor's static member is the per-instance data carrier.
+// per-window state lives in WindowContext (above) carried in
+// GWLP_USERDATA.
 static const wchar_t* kWindowClassName = L"AudioRouterVst3EditorClass";
 
-// Registry of HWND -> WindowContext*. The plugin's WndProc needs to
-// find the WindowContext for a given HWND; we use SetWindowLongPtr
-// with a private index to store it. This means the HWND itself
-// carries the context, no global map needed.
-//
-// The window is associated with its WindowContext via GWLP_USERDATA.
+// Forward declaration of the WndProc free function. The full
+// definition appears later in this file (after ui_thread_main, where
+// the lambda inside RegisterClassExW needs to take its address).
+// The forward declaration is purely for readability: the symbol is
+// resolvable at link time regardless, but MSVC's stricter name
+// lookup would otherwise warn that the symbol is undeclared at the
+// point of use. Same file, same translation unit -- this is a
+// one-line forward decl that documents the cross-reference.
+static LRESULT CALLBACK vst3_editor_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 #endif // _WIN32
 
@@ -377,7 +381,7 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc);
         wc.style = CS_HREDRAW | CS_VREDRAW;
-        wc.lpfnWndProc = Vst3PluginEditor::wnd_proc;
+        wc.lpfnWndProc = &vst3_editor_wnd_proc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
@@ -408,8 +412,13 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
     // it back to find the view and the editor.
     WindowContext* wctx = new WindowContext();
     wctx->editor = this;
-    wctx->view = view_;
-    wctx->controller = controller_;
+    // The header declares view_/controller_ as void* to avoid
+    // pulling the VST3 SDK headers in; here (inside the .cpp) we
+    // know the concrete types and need explicit casts. C++ does
+    // not allow implicit void* -> typed-pointer conversion (C did),
+    // and MSVC's stricter type checks flag the implicit form.
+    wctx->view = static_cast<Steinberg::IPlugView*>(view_);
+    wctx->controller = static_cast<Steinberg::Vst::IEditController*>(controller_);
     wctx->frame = new HostPlugFrame();
 
     HWND hwnd = CreateWindowExW(
@@ -530,7 +539,12 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
     is_open_.store(false);
 }
 
-LRESULT CALLBACK Vst3PluginEditor::wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+// Free function (not a static method on Vst3PluginEditor) so the
+// WndProc doesn't have to be declared in the header -- otherwise
+// the header would need <windows.h> just to make CALLBACK/HWND/UINT
+// visible, even for callers (e.g. plugin_chain.cpp on Linux) that
+// include the header but never see Win32 types.
+static LRESULT CALLBACK vst3_editor_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // The window stores its WindowContext* in GWLP_USERDATA (set at
     // WM_CREATE time). We retrieve it on every message.
     WindowContext* wctx = reinterpret_cast<WindowContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));

@@ -92,13 +92,14 @@ private:
                         void* component_ptr,
                         Steinberg::IBStream* component_state);
 
-    // The Win32 window procedure. Handles WM_CLOSE, WM_SIZE, WM_DESTROY.
-    // On Windows only; declared here so the cpp can register it via
-    // SetWindowLongPtr. The HWND-to-Vst3PluginEditor map is keyed by
-    // a window property set at creation time.
-#if defined(_WIN32)
-    static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-#endif
+    // Note: the Win32 WndProc is a free function in vst3_gui.cpp
+    // (not a static member). It looks up the editor instance via
+    // GWLP_USERDATA on the HWND, so it doesn't need access to any
+    // private state on this class. Keeping it out of the header
+    // means the header does not have to drag in <windows.h> for
+    // CALLBACK/HWND/... types on platforms that include the header
+    // but not <windows.h> (notably the Linux build with VST3 host
+    // code that links vst3_gui.cpp as a no-op).
 
     std::thread thread_;
     std::atomic<bool> is_open_{false};
