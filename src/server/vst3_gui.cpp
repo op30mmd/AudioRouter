@@ -15,8 +15,11 @@
 //   5. The host calls IEditController::setComponentHandler(...)
 //      passing in an IComponentHandler implementation. The plugin
 //      uses this to inform the host of parameter changes from the UI.
-//   6. The host calls IEditController::createView("editor") to get
-//      the IPlugView.
+//   6. The host calls IEditController::createView() to get
+//      the IPlugView. The spec name is "editor" (ViewType::kEditor
+//      in the SDK), but we try a small set of legacy fallbacks
+//      too because some non-conformant plugins return null for
+//      "editor" and only expose their UI under e.g. "Default".
 //   7. The host calls IPlugView::isPlatformTypeSupported("HWND")
 //      (on Windows) to verify the plugin supports native windows.
 //   8. The host creates a Win32 window and calls
@@ -370,9 +373,40 @@ void Vst3PluginEditor::ui_thread_main(Steinberg::IPluginFactory* factory,
     // 5. Create the IPlugView. IPlugView is in the Steinberg::
     //    namespace (not Steinberg::Vst::, despite being a GUI
     //    interface) -- see pluginterfaces/gui/iplugview.h.
-    view = controller->createView("editor");
+    //
+    // The VST3 spec says the canonical view name is "editor"
+    // (ViewType::kEditor in the SDK) and "currently only
+    // 'editor' is supported". In practice, some older or
+    // non-conformant plugins return null for "editor" and only
+    // expose their UI under a legacy name (e.g. "Default",
+    // "default", or ""). We try "editor" first, then fall back
+    // through the other names that have been seen in the wild.
+    // Each attempt uses a fresh null-terminated C string; the
+    // plugin's createView() takes a FIDString, which is just a
+    // const char* on the VST3 platforms we care about.
+    static const char* const kViewNameCandidates[] = {
+        "editor",    // ViewType::kEditor -- the spec name
+        "",          // some older plugins accept only an empty name
+        "Default",   // a handful of legacy VST3 plugins
+        "default",   // (case variant)
+    };
+    for (const char* view_name : kViewNameCandidates) {
+        view = controller->createView(view_name);
+        if (view) {
+            if (view_name[0] != '\0' && std::strcmp(view_name, "editor") != 0) {
+                // We had to fall back. Log it so the operator can
+                // see which view name their plugin is exposing.
+                LOG_INFO("VST3 GUI: plugin '"
+                         << plugin_name
+                         << "' did not return a view for \"editor\"; using fallback \""
+                         << view_name << "\"");
+            }
+            break;
+        }
+    }
     if (!view) {
-        LOG_ERROR("VST3 GUI: IEditController::createView returned null (plugin has no editor)");
+        LOG_ERROR("VST3 GUI: IEditController::createView returned null for all candidate view names"
+                  " (plugin '" << plugin_name << "' has no editor, or none of the standard names matched)");
         handler->release();
         handler_ = nullptr;
         controller->terminate();
