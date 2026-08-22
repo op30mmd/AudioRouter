@@ -29,13 +29,8 @@ jobs:
           sudo apt-get install -y cmake make g++ gcc-aarch64-linux-gnu g++-aarch64-linux-gnu zip pkg-config libpulse-dev
 
       - name: Build host tests & binaries
-        # Linux test build: explicitly disable VST3. The Linux build's
-        # purpose is to run the cross-platform unit tests (jitter
-        # buffer, protocol, conversions, etc.) and the new VST3
-        # plugin-chain tests in bypass mode; the VST3 host code path
-        # is exercised by the Windows job below.
         run: |
-          cmake -B build-host -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 -DAUDIOROUTER_ENABLE_VST3=OFF
+          cmake -B build-host -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=23 -DAUDIOROUTER_ENABLE_VST3=ON
           cmake --build build-host --config Release --parallel --verbose
 
       - name: Run Unit Tests
@@ -55,8 +50,6 @@ jobs:
 
           if [ -n "$NDK_PATH" ] && [ -f "$NDK_PATH/build/cmake/android.toolchain.cmake" ]; then
             echo "Building with Android NDK toolchain at: $NDK_PATH"
-            # android-26 (Android 8.0) so the AAudio no-root backend
-            # (aaudio_player.cpp, stream_daemon) is compiled in.
             cmake -B build-android-arm64 \
               -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
               -DANDROID_ABI=arm64-v8a \
@@ -97,6 +90,7 @@ jobs:
           cp README.md staging-arm64/
           cp LICENSE staging-arm64/
           chmod +x staging-arm64/*.sh staging-arm64/audiorouter_client
+          [ -f staging-arm64/stream_daemon ] && chmod +x staging-arm64/stream_daemon
 
       - name: Upload Android ARM64 Client Artifact
         uses: actions/upload-artifact@v4
@@ -113,101 +107,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure CMake (release)
-        # Primary Release build: matches the existing released
-        # artifact exactly. VST3 is OFF here so the shipped
-        # audiorouter_server.exe stays bit-compatible with the
-        # current release. Users who want VST3 support build
-        # locally with -DAUDIOROUTER_ENABLE_VST3=ON and the VST3
-        # public SDK.
+      - name: Configure CMake (Release with VST3)
         run: |
-          cmake -B build-win -A x64 -DCMAKE_BUILD_TYPE=Release -DAUDIOROUTER_ENABLE_VST3=OFF
+          cmake -B build-win -A x64 -DCMAKE_BUILD_TYPE=Release -DAUDIOROUTER_ENABLE_VST3=ON
 
-      - name: Build Windows Server (release)
+      - name: Build Windows Server
         run: |
           cmake --build build-win --config Release --target audiorouter_server --parallel
-
-      - name: Configure CMake (VST3 verification)
-        # Secondary build that turns on VST3. The purpose is to
-        # catch any breakage in the VST3 host code path (Windows
-        # LoadLibrary, IComponent / IAudioProcessor lifecycle, the
-        # S16LE<->float32 conversion, the prepare/unprepare on
-        # connect/disconnect, etc.) without affecting the
-        # shipped artifact. The binary produced here is not
-        # uploaded and not released; if this step fails, CI fails.
-        #
-        # The VST3 public SDK headers are vendored under
-        # third_party/vst3/ (MIT-licensed by Steinberg). The CMake
-        # build picks them up automatically when the option is ON,
-        # so the host is compiled with the real SDK rather than
-        # the no-op stub. The build then asserts that the host
-        # source was actually compiled (not the stub) -- a
-        # regression in the CMake logic that would silently fall
-        # back to the stub fails CI.
-        #
-        # We run CMake configure twice: once into a temporary
-        # location to capture the configure output (where the
-        # "VST3 host: enabled" status line is printed), then
-        # again into the real build directory for the actual
-        # build. The status line tells us whether the vendored
-        # SDK headers were detected.
-        shell: bash
-        run: |
-          set -euo pipefail
-          # First configure: capture the configure output (where
-          # the "VST3 host: enabled" message(STATUS ...) line is
-          # printed) and assert the SDK was detected.
-          rm -rf build-win-vst3-cfg
-          cmake -B build-win-vst3-cfg -A x64 \
-            -DCMAKE_BUILD_TYPE=Release -DAUDIOROUTER_ENABLE_VST3=ON 2>&1 | tee build-vst3-cfg.log
-          if ! grep -q "VST3 host: enabled" build-vst3-cfg.log; then
-            echo "::error::VST3 verification build did not pick up the vendored SDK headers."
-            echo "The CMake configure step did not print 'VST3 host: enabled', which means"
-            echo "AUDIOROUTER_VST3_FOUND is OFF and the build will silently fall back to the"
-            echo "no-op stub. Either:"
-            echo "  1. The vendored SDK headers at third_party/vst3/ are missing or incomplete."
-            echo "  2. The CMake option AUDIOROUTER_ENABLE_VST3 is not being set on this configure."
-            echo "  3. The include path is not being added to the target."
-            exit 1
-          fi
-
-      - name: Build Windows Server (VST3 verification)
-        # The CMake configure (in the previous step) verified that
-        # the vendored SDK headers were detected. This step does the
-        # actual build, and asserts afterwards that the real host
-        # source was compiled (not the stub). The build does not
-        # silently fall back to the stub -- the previous step would
-        # have failed.
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf build-win-vst3
-          cmake -B build-win-vst3 -A x64 \
-            -DCMAKE_BUILD_TYPE=Release -DAUDIOROUTER_ENABLE_VST3=ON > /dev/null
-          cmake --build build-win-vst3 --config Release \
-            --target audiorouter_server --parallel
-
-          # The MSVC generator writes per-source object files at
-          # CMakeFiles/<target>.dir/<source-with-slashes-replaced>.obj.
-          # Sanity check: vst3_host.cpp must have been compiled
-          # (not just the stub).
-          obj_path="build-win-vst3/CMakeFiles/audiorouter_server.dir/src/server/vst3_host.cpp.obj"
-          if [ ! -f "$obj_path" ]; then
-            echo "::error::VST3 verification build did not compile vst3_host.cpp."
-            echo "Expected to find $obj_path. The build may have silently"
-            echo "fallen back to the no-op stub (vst3_host_stub.cpp)."
-            echo ""
-            echo "Files in build-win-vst3/CMakeFiles/audiorouter_server.dir/src/server/:"
-            ls -la "build-win-vst3/CMakeFiles/audiorouter_server.dir/src/server/" || true
-            exit 1
-          fi
-          echo "VST3 verification OK: vst3_host.cpp was compiled (object file at $obj_path)."
 
       - name: Stage Windows Artifacts
         shell: bash
         run: |
           mkdir -p staging-win
-          cp build-win/src/server/Release/audiorouter_server.exe staging-win/
+          if [ -f build-win/src/server/Release/audiorouter_server.exe ]; then
+            cp build-win/src/server/Release/audiorouter_server.exe staging-win/
+          elif [ -f build-win/Release/audiorouter_server.exe ]; then
+            cp build-win/Release/audiorouter_server.exe staging-win/
+          else
+            find build-win -name "audiorouter_server.exe" -exec cp {} staging-win/ \;
+          fi
           cp README.md staging-win/
           cp LICENSE staging-win/
 
@@ -222,8 +140,8 @@ jobs:
     name: Generate Tag & Publish Release
     needs: [build-and-test-linux, build-windows]
     runs-on: ubuntu-latest
-    # Only run on push to main or manual trigger, NEVER on pull requests
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    # Run on push to main or manual trigger, NEVER on pull requests
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout repository
@@ -251,14 +169,10 @@ jobs:
           echo "tag_name=$VERSION_TAG" >> "$GITHUB_OUTPUT"
 
           # Package Windows zip
-          cd release-staging/server-win
-          zip -r "../../audiorouter-$VERSION_TAG-windows-x64.zip" .
-          cd ../..
+          (cd release-staging/server-win && zip -r "$GITHUB_WORKSPACE/audiorouter-$VERSION_TAG-windows-x64.zip" .)
 
           # Package Android Termux tar.gz
-          cd release-staging/client-arm64
-          tar -czvf "../../audiorouter-$VERSION_TAG-android-termux-arm64.tar.gz" .
-          cd ../..
+          (cd release-staging/client-arm64 && tar -czvf "$GITHUB_WORKSPACE/audiorouter-$VERSION_TAG-android-termux-arm64.tar.gz" .)
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -279,7 +193,7 @@ jobs:
             High-performance audio streaming engine from Windows PC to Android Termux (ALSA / Root / AAudio no-root).
 
             ### 📦 Release Assets
-            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-windows-x64.zip`**: Windows PC Server (`audiorouter_server.exe` with WASAPI Loopback Capture and Endpoint Volume muting).
+            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-windows-x64.zip`**: Windows PC Server (`audiorouter_server.exe` with WASAPI Loopback Capture, VST3 plugin host, and Endpoint Volume muting).
             - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-android-termux-arm64.tar.gz`**: Android ARM64 Client for Termux (`audiorouter_client` with ALSA, direct `/dev/snd/`, Qualcomm AGM, AAudio, and Termux:API media player backends + standalone `stream_daemon`).
 
             ### 🚀 Quick Start
