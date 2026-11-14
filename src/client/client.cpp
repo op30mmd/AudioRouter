@@ -636,9 +636,9 @@ bool AudioRouterClient::start() {
             LOG_ERROR("Failed to connect to the USB tunneled server at 127.0.0.1:" << config_.server_port);
             LOG_ERROR("Check that on the PC the tunnel is up and the server is listening:");
             LOG_ERROR("    adb reverse tcp:" << config_.server_port << " tcp:" << config_.server_port);
-            LOG_ERROR("    audiorouter_server.exe --usb");
+            LOG_ERROR("    audiorouter_server --usb");
         } else {
-            LOG_ERROR("Failed to connect to Windows AudioRouter Server at " << server_addr_.to_string());
+            LOG_ERROR("Failed to connect to AudioRouter Server at " << server_addr_.to_string());
         }
         socket_.close();
         return false;
@@ -831,7 +831,7 @@ ClientStats AudioRouterClient::get_stats() const {
 }
 
 bool AudioRouterClient::discover_server(SocketAddress& out_server_addr) {
-    LOG_INFO("Discovering Windows AudioRouter server on network...");
+    LOG_INFO("Discovering AudioRouter server on network...");
     socket_.set_broadcast(true);
     socket_.set_receive_timeout_ms(500);
 
@@ -876,7 +876,12 @@ bool AudioRouterClient::discover_server(SocketAddress& out_server_addr) {
                 resp_hdr->msg_type == static_cast<uint8_t>(protocol::MsgType::DISCOVERY_RESP)) {
                 const auto* resp_pay = reinterpret_cast<const protocol::DiscoveryRespPayload*>(recv_buf.data() + sizeof(protocol::CommonHeader));
                 out_server_addr = responder;
-                LOG_INFO("Discovered server '" << resp_pay->server_name << "' at " << responder.to_string()
+                if (std::strstr(resp_pay->server_name, "Linux") != nullptr) {
+                    server_os_ = "Linux";
+                } else if (std::strstr(resp_pay->server_name, "Windows") != nullptr) {
+                    server_os_ = "Windows";
+                }
+                LOG_INFO("Discovered " << server_os_ << " server '" << resp_pay->server_name << "' at " << responder.to_string()
                          << " (PC Muted: " << (resp_pay->pc_muted ? "Yes" : "No") << ")");
                 return true;
             }
@@ -936,7 +941,12 @@ bool AudioRouterClient::perform_handshake() {
                     audio_config_.frames_per_packet = ack->frames_per_packet;
 
                     LOG_INFO("-------------------------------------------------");
-                    LOG_INFO(" CONNECT_ACK Received from Windows Server!");
+                    if (std::strstr(ack->status_msg, "Linux") != nullptr) {
+                        server_os_ = "Linux";
+                    } else if (std::strstr(ack->status_msg, "Windows") != nullptr) {
+                        server_os_ = "Windows";
+                    }
+                    LOG_INFO(" CONNECT_ACK Received from " << server_os_ << " Server!");
                     LOG_INFO(" Stream Format: " << audio_config_.to_string());
                     LOG_INFO(" PC Speaker Silenced: " << (ack->pc_speaker_muted ? "YES (Audio routed to Android)" : "NO"));
                     LOG_INFO(" Server Message: " << ack->status_msg);

@@ -264,7 +264,13 @@ void AudioRouterServer::handle_discovery_req(const protocol::CommonHeader& hdr, 
     resp_hdr->timestamp_us = get_time_us();
     resp_hdr->payload_size = sizeof(protocol::DiscoveryRespPayload);
 
+#if defined(_WIN32)
+    std::strncpy(resp_pay->server_name, "AudioRouter-Windows", sizeof(resp_pay->server_name) - 1);
+#elif defined(__linux__)
+    std::strncpy(resp_pay->server_name, "AudioRouter-Linux", sizeof(resp_pay->server_name) - 1);
+#else
     std::strncpy(resp_pay->server_name, "AudioRouter-PC-Server", sizeof(resp_pay->server_name) - 1);
+#endif
     resp_pay->server_version = protocol::CURRENT_VERSION;
     resp_pay->server_port = config_.port;
     resp_pay->is_busy = (state_ == ServerState::STREAMING) ? 1 : 0;
@@ -374,7 +380,13 @@ void AudioRouterServer::handle_connect_req(const protocol::CommonHeader& hdr, co
     ack_pay->format = static_cast<uint8_t>(actual_audio_config_.format);
     ack_pay->frames_per_packet = static_cast<uint16_t>(actual_audio_config_.frames_per_packet);
     ack_pay->pc_speaker_muted = muted_ok ? 1 : 0;
+#if defined(_WIN32)
+    std::strncpy(ack_pay->status_msg, "Connected (Windows): Audio routed to client", sizeof(ack_pay->status_msg) - 1);
+#elif defined(__linux__)
+    std::strncpy(ack_pay->status_msg, "Connected (Linux): Audio routed to client", sizeof(ack_pay->status_msg) - 1);
+#else
     std::strncpy(ack_pay->status_msg, "Connected: Audio routed to client", sizeof(ack_pay->status_msg) - 1);
+#endif
 
     socket_.send_to(ack_buf.data(), ack_buf.size(), sender);
     LOG_INFO("Client connected! Streaming audio to " << sender.to_string()
