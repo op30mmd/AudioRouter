@@ -1,5 +1,7 @@
 #include "server.hpp"
 #include "wasapi_capture.hpp"
+#include "pulse_capture.hpp"
+#include "alsa_capture.hpp"
 #include "dummy_capture.hpp"
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
@@ -9,6 +11,12 @@
 #include <vector>
 
 namespace audiorouter {
+
+namespace {
+bool starts_with(const std::string& s, const char* prefix) {
+    return s.rfind(prefix, 0) == 0;
+}
+} // namespace
 
 AudioRouterServer::AudioRouterServer(const ServerConfig& config)
     : config_(config),
@@ -25,13 +33,17 @@ bool AudioRouterServer::start() {
     if (is_running_) return true;
 
     LOG_INFO("=================================================");
+#if defined(_WIN32)
     LOG_INFO(" Starting AudioRouter Windows Server Engine");
+#else
+    LOG_INFO(" Starting AudioRouter Linux Server Engine");
+#endif
     LOG_INFO("=================================================");
 
     // Initialize Endpoint Volume Control (for PC speaker muting)
     if (config_.auto_mute_pc_speaker) {
         if (!endpoint_control_.init()) {
-            LOG_WARN("Failed to initialize Windows endpoint volume controller. PC speaker muting might be unavailable.");
+            LOG_WARN("Failed to initialize endpoint volume controller. PC speaker muting might be unavailable.");
         }
     }
 
@@ -66,14 +78,30 @@ bool AudioRouterServer::start() {
     LOG_INFO("Listening for Android client on UDP port " << config_.port << "...");
 
     // Create Audio Capture Engine
-    if (config_.use_test_tone) {
+    if (config_.use_test_tone || config_.capture_device == "dummy") {
         capture_engine_ = std::make_unique<DummyCapture>(config_.test_tone_freq);
     } else {
 #if defined(_WIN32)
         capture_engine_ = std::make_unique<WasapiCapture>();
 #else
-        LOG_WARN("Non-Windows host detected: using synthetic audio generator");
-        capture_engine_ = std::make_unique<DummyCapture>(config_.test_tone_freq);
+        const std::string& dev = config_.capture_device;
+        if (dev == "alsa" || starts_with(dev, "alsa:")) {
+            capture_engine_ = std::make_unique<AlsaCapture>(dev);
+        } else if (dev == "pulse" || dev == "pulseaudio" || dev == "pa" ||
+                   starts_with(dev, "pulse:") || starts_with(dev, "pulseaudio:") ||
+                   starts_with(dev, "pa:")) {
+            capture_engine_ = std::make_unique<PulseCapture>(dev);
+        } else if (PulseCapture::is_supported() && PulseCapture::server_available()) {
+            LOG_INFO("Selected Linux capture backend: PulseAudio/PipeWire loopback");
+            capture_engine_ = std::make_unique<PulseCapture>();
+        } else if (AlsaCapture::is_supported()) {
+            LOG_INFO("Selected Linux capture backend: ALSA PCM");
+            capture_engine_ = std::make_unique<AlsaCapture>();
+        } else {
+            LOG_WARN("No Linux audio capture backend available (PulseAudio/ALSA); "
+                     "falling back to synthetic test tone");
+            capture_engine_ = std::make_unique<DummyCapture>(config_.test_tone_freq);
+        }
 #endif
     }
 
@@ -180,7 +208,7 @@ void AudioRouterServer::network_receive_thread() {
         }
 
         const uint8_t* payload = recv_buf.data() + sizeof(protocol::CommonHeader);
-        size_t payload_len = bytes_read - sizeof(protocol::CommonHeader);
+        size_t payload_len = static_cast<size_t>(bytes_read) - sizeof(protocol::CommonHeader);
 
         auto msg_type = static_cast<protocol::MsgType>(hdr->msg_type);
 
@@ -277,10 +305,24 @@ void AudioRouterServer::handle_connect_req(const protocol::CommonHeader& hdr, co
     desired_config.format = AudioSampleFormat::PCM_S16LE;
     desired_config.frames_per_packet = config_.frames_per_packet;
 
-    // Start WASAPI audio capture
+    // Start audio capture
     if (!capture_engine_->is_capturing()) {
         if (!capture_engine_->start(desired_config, actual_audio_config_)) {
             LOG_ERROR("Failed to start audio capture engine");
+            std::vector<uint8_t> nak_buf(sizeof(protocol::CommonHeader) + sizeof(protocol::ConnectNakPayload));
+            auto* nak_hdr = reinterpret_cast<protocol::CommonHeader*>(nak_buf.data());
+            auto* nak_pay = reinterpret_cast<protocol::ConnectNakPayload*>(nak_buf.data() + sizeof(protocol::CommonHeader));
+            nak_hdr->magic = protocol::MAGIC;
+            nak_hdr->version = protocol::CURRENT_VERSION;
+            nak_hdr->msg_type = static_cast<uint8_t>(protocol::MsgType::CONNECT_NAK);
+            nak_hdr->flags = protocol::FLAG_NONE;
+            nak_hdr->seq_num = 0;
+            nak_hdr->timestamp_us = get_time_us();
+            nak_hdr->payload_size = sizeof(protocol::ConnectNakPayload);
+            nak_pay->error_code = 2;
+            std::strncpy(nak_pay->reason, "Failed to start audio capture engine", sizeof(nak_pay->reason) - 1);
+            socket_.send_to(nak_buf.data(), nak_buf.size(), sender);
+            active_client_ = SocketAddress();
             return;
         }
     }
@@ -565,14 +607,15 @@ void AudioRouterServer::on_audio_captured(const void* data, size_t num_frames, c
                     chunk_buffer_.data(), target_chunk_bytes);
 
         // Erase chunked bytes from buffer
-        chunk_buffer_.erase(chunk_buffer_.begin(), chunk_buffer_.begin() + target_chunk_bytes);
+        chunk_buffer_.erase(chunk_buffer_.begin(),
+                            chunk_buffer_.begin() + static_cast<std::ptrdiff_t>(target_chunk_bytes));
 
         // Send packet over UDP to Android client
         int sent = socket_.send_to(packet_buf.data(), packet_buf.size(), active_client_);
         if (sent > 0) {
             std::lock_guard<std::mutex> s_lock(stats_mutex_);
             stats_.packets_sent++;
-            stats_.bytes_sent += sent;
+            stats_.bytes_sent += static_cast<uint64_t>(sent);
             stats_.audio_frames_captured += target_chunk_frames;
         }
     }

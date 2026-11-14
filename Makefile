@@ -31,7 +31,7 @@ ifeq ($(OS),Windows_NT)
     SERVER_RESOURCE_OBJ = $(BUILD_DIR)/server_manifest.o
 else
     PLATFORM := linux
-    SERVER_LIBS = -lpthread
+    SERVER_LIBS = -lpthread -ldl
     CLIENT_LIBS = -lpthread -ldl
     EXE_EXT =
     SERVER_RESOURCE_OBJ =
@@ -118,6 +118,8 @@ COMMON_OBJS = $(BUILD_DIR)/socket_util.o
 SERVER_SRCS = src/server/main.cpp \
               src/server/server.cpp \
               src/server/wasapi_capture.cpp \
+              src/server/pulse_capture.cpp \
+              src/server/alsa_capture.cpp \
               src/server/dummy_capture.cpp \
               src/server/audio_endpoint_control.cpp
 SERVER_OBJS = $(patsubst src/server/%.cpp,$(BUILD_DIR)/server_%.o,$(SERVER_SRCS))
@@ -147,6 +149,7 @@ TEST_SRCS = tests/test_main.cpp \
             tests/test_conversion.cpp \
             tests/test_termux_api.cpp \
             tests/test_pulse.cpp \
+            tests/test_server_linux.cpp \
             tests/test_thread_safety.cpp \
             tests/test_type_safety.cpp \
             tests/test_memory_safety.cpp
@@ -227,7 +230,10 @@ $(CLIENT_TARGET): $(CLIENT_OBJS) $(COMMON_OBJS)
 	@echo "Built: $(CLIENT_TARGET)"
 
 # Link Tests
-$(TEST_TARGET): $(TEST_OBJS) $(BUILD_DIR)/client_jitter_buffer.o $(BUILD_DIR)/client_termux_api_player.o $(BUILD_DIR)/client_pulse_player.o $(BUILD_DIR)/client_dummy_player.o $(BUILD_DIR)/client_aaudio_player.o $(BUILD_DIR)/client_android_helpers.o $(COMMON_OBJS)
+$(TEST_TARGET): $(TEST_OBJS) \
+                $(BUILD_DIR)/client_jitter_buffer.o $(BUILD_DIR)/client_termux_api_player.o $(BUILD_DIR)/client_pulse_player.o $(BUILD_DIR)/client_dummy_player.o $(BUILD_DIR)/client_aaudio_player.o $(BUILD_DIR)/client_android_helpers.o \
+                $(BUILD_DIR)/server_server.o $(BUILD_DIR)/server_wasapi_capture.o $(BUILD_DIR)/server_pulse_capture.o $(BUILD_DIR)/server_alsa_capture.o $(BUILD_DIR)/server_dummy_capture.o $(BUILD_DIR)/server_audio_endpoint_control.o \
+                $(COMMON_OBJS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXTRA) $^ -o $@ $(CLIENT_LIBS)
 	@echo "Built: $(TEST_TARGET)"
 

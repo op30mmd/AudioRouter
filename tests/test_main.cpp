@@ -36,6 +36,7 @@ bool run_usb_tunnel_tests();
 bool run_conversion_tests();
 bool run_termux_api_tests();
 bool run_pulse_tests();
+bool run_server_linux_tests();
 bool run_thread_safety_tests();
 bool run_type_safety_tests();
 bool run_memory_safety_tests();
@@ -57,6 +58,7 @@ int main(int argc, char* argv[]) {
     test::register_test("Audio Converter & Downmixing", run_conversion_tests);
     test::register_test("Termux:API backend (WAV segments, scheduling, protocol)", run_termux_api_tests);
     test::register_test("PulseAudio backend (device spec, buffer sizing)", run_pulse_tests);
+    test::register_test("Linux Server (capture specs, endpoint control, discovery)", run_server_linux_tests);
     test::register_test("Thread Safety Verification", run_thread_safety_tests);
     test::register_test("Type Safety Verification", run_type_safety_tests);
     test::register_test("Memory Safety Verification", run_memory_safety_tests);

@@ -11,6 +11,7 @@ set(TEST_SOURCES
     test_conversion.cpp
     test_termux_api.cpp
     test_pulse.cpp
+    test_server_linux.cpp
     test_thread_safety.cpp
     test_type_safety.cpp
     test_memory_safety.cpp
@@ -20,6 +21,12 @@ set(TEST_SOURCES
     ../src/client/dummy_player.cpp
     ../src/client/aaudio_player.cpp
     ../src/client/android_helpers.cpp
+    ../src/server/server.cpp
+    ../src/server/wasapi_capture.cpp
+    ../src/server/pulse_capture.cpp
+    ../src/server/alsa_capture.cpp
+    ../src/server/dummy_capture.cpp
+    ../src/server/audio_endpoint_control.cpp
     ../src/common/socket_util.cpp
 )
 
@@ -39,6 +46,8 @@ if (WIN32)
     target_link_libraries(audiorouter_tests PRIVATE
         ws2_32
         iphlpapi
+        avrt
+        ole32
     )
 else()
     target_link_libraries(audiorouter_tests PRIVATE

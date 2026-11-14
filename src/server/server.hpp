@@ -26,6 +26,8 @@ struct ServerConfig {
     uint32_t client_timeout_ms = 8000;
     bool use_test_tone = false;
     double test_tone_freq = 440.0;
+    // Capture backend/device ("auto", "pulse", "pulse:<source>", "alsa", "alsa:<dev>", "dummy").
+    std::string capture_device = "auto";
     // Voice over USB: bind to loopback only and accept the client through an
     // "adb reverse tcp:PORT tcp:PORT" tunnel instead of the LAN. The tunnel
     // injects the phone's TCP traffic straight into the PC's loopback; the

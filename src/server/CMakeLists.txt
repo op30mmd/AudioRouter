@@ -2,6 +2,8 @@ set(SERVER_SOURCES
     main.cpp
     server.cpp
     wasapi_capture.cpp
+    pulse_capture.cpp
+    alsa_capture.cpp
     dummy_capture.cpp
     audio_endpoint_control.cpp
     ../common/socket_util.cpp
@@ -11,6 +13,8 @@ set(SERVER_HEADERS
     server.hpp
     audio_capture.hpp
     wasapi_capture.hpp
+    pulse_capture.hpp
+    alsa_capture.hpp
     dummy_capture.hpp
     audio_endpoint_control.hpp
     ../common/protocol.hpp
@@ -67,5 +71,6 @@ if (WIN32)
 else()
     target_link_libraries(audiorouter_server PRIVATE
         pthread
+        dl
     )
 endif()

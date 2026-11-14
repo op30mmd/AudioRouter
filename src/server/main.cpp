@@ -1,4 +1,5 @@
 #include "server.hpp"
+#include "pulse_capture.hpp"
 #include "../common/logger.hpp"
 #include "../common/time_util.hpp"
 
@@ -137,9 +138,15 @@ void print_banner() {
  ██║  ██║╚██████╔╝██████╔╝██║╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║
  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝
 )" << reset;
+#if defined(_WIN32)
     std::cout << green << bold
               << "   Windows PC audio loopback -> Android  (WASAPI / UDP)" << reset
               << "\n\n";
+#else
+    std::cout << green << bold
+              << "   Linux PC audio loopback -> Android  (PulseAudio / PipeWire / ALSA / UDP)" << reset
+              << "\n\n";
+#endif
 }
 
 void print_usage(const char* prog) {
@@ -147,31 +154,35 @@ void print_usage(const char* prog) {
               << "Options:\n"
               << "  -p, --port <port>         UDP listening port (default: 44100)\n"
               << "  -b, --bind <ip>           Bind IP address (default: 0.0.0.0)\n"
+              << "  -d, --device <dev>        Capture backend/device: 'auto' (default), 'pulse',\n"
+              << "                              'pulse:<source>', 'alsa', 'alsa:<dev>', or 'dummy'\n"
               << "  -r, --rate <hz>           Sample rate in Hz (default: 48000)\n"
               << "  -f, --frames <count>      Audio frames per UDP packet (default: 240 = 5ms)\n"
               << "      --no-mute             Do not mute PC speaker when client connects (debug)\n"
               << "      --mute-mode <mode>    Mute method: 'mute' (default), 'zero' (volume 0), 'both'\n"
-              << "  -t, --test-tone           Generate test sine tone instead of WASAPI loopback\n"
+              << "  -t, --test-tone           Generate test sine tone instead of system loopback\n"
               << "      --freq <hz>           Test tone frequency in Hz (default: 440.0)\n"
               << "      --usb                 Voice over USB: bind to loopback and stream over the USB cable\n"
               << "                              via 'adb reverse tcp:<port> tcp:<port>' (no Wi-Fi)\n"
               << "  -l, --list-if             List all available network interfaces and exit\n"
+#if !defined(_WIN32)
+              << "      --list-sources        List available PulseAudio/PipeWire capture sources and exit\n"
+#endif
               << "  -v, --verbose             Enable debug logging\n"
               << "  -h, --help                Show this help message\n\n"
               << "Hotspot Quick Start:\n"
               << "  1. If PC is connected to Android Wi-Fi Hotspot:\n"
               << "     Note your PC's IP address (e.g. 192.168.43.x) from the interface list.\n"
-               << "  2. Start this server on Windows:\n"
-               << "     " << prog << "\n"
-               << "  3. In Termux on Android with root privileges, run:\n"
-               << "     su\n"
-               << "     ./audiorouter_client -s <PC_IP> -p 44100\n"
-               << "  4. PC speaker will automatically go quiet and audio will play on Android!\n\n"
-               << "Voice over USB (no Wi-Fi):\n"
-               << "  1. Connect the phone by USB (USB debugging on).\n"
-               << "  2. " << prog << " --usb   (sets up 'adb reverse tcp:44100 tcp:44100' automatically)\n"
-               << "  3. On the phone: ./audiorouter_client -u\n"
-               << std::endl;
+              << "  2. Start this server:\n"
+              << "     " << prog << "\n"
+              << "  3. In Termux on Android, run:\n"
+              << "     ./audiorouter_client -s <PC_IP> -p 44100\n"
+              << "  4. PC speaker will automatically go quiet and audio will play on Android!\n\n"
+              << "Voice over USB (no Wi-Fi):\n"
+              << "  1. Connect the phone by USB (USB debugging on).\n"
+              << "  2. " << prog << " --usb   (sets up 'adb reverse tcp:44100 tcp:44100' automatically)\n"
+              << "  3. On the phone: ./audiorouter_client -u\n"
+              << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -193,6 +204,7 @@ int main(int argc, char* argv[]) {
 #endif
     audiorouter::ServerConfig config;
     bool list_ifaces_only = false;
+    bool list_sources_only = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -201,12 +213,16 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (arg == "-l" || arg == "--list-if") {
             list_ifaces_only = true;
+        } else if (arg == "--list-sources") {
+            list_sources_only = true;
         } else if (arg == "-v" || arg == "--verbose") {
             audiorouter::Logger::instance().set_level(audiorouter::LogLevel::Debug);
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
             config.port = static_cast<uint16_t>(std::stoi(argv[++i]));
         } else if ((arg == "-b" || arg == "--bind") && i + 1 < argc) {
             config.bind_ip = argv[++i];
+        } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
+            config.capture_device = argv[++i];
         } else if ((arg == "-r" || arg == "--rate") && i + 1 < argc) {
             config.sample_rate = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if ((arg == "-f" || arg == "--frames") && i + 1 < argc) {
@@ -238,6 +254,20 @@ int main(int argc, char* argv[]) {
             std::cout << "  [" << (iface.is_up ? "UP" : "DOWN") << "] "
                       << iface.name << ": " << iface.ip_address
                       << (iface.is_loopback ? " (Loopback)" : "") << "\n";
+        }
+        return 0;
+    }
+
+    if (list_sources_only) {
+        auto sources = audiorouter::PulseCapture::list_sources();
+        std::cout << "\nAvailable PulseAudio/PipeWire Capture Sources:\n";
+        if (sources.empty()) {
+            std::cout << "  (none found - is PulseAudio or PipeWire-Pulse running?)\n";
+        } else {
+            const std::string def_mon = audiorouter::PulseCapture::resolve_default_monitor_source();
+            for (const auto& s : sources) {
+                std::cout << "  - " << s << (s == def_mon ? "  [default monitor]" : "") << "\n";
+            }
         }
         return 0;
     }
