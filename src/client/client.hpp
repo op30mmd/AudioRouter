@@ -103,6 +103,7 @@ private:
 
     UdpSocket socket_;
     SocketAddress server_addr_;
+    std::string server_os_ = "PC";
     AudioConfig audio_config_;
 
     // Guards all socket send/receive/close calls (UdpSocket is not thread-safe)

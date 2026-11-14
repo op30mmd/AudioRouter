@@ -53,7 +53,7 @@ void print_banner() {
     const char* green = banner_green();
     const char* bold  = banner_bold();
     const char* reset = banner_reset();
-    const char* tag   = "Windows PC audio -> Android speakers  (AAudio / Termux:API / AGM / ALSA)";
+    const char* tag   = "PC audio -> Android speakers  (AAudio / Termux:API / AGM / ALSA)";
 
     if (term_width >= 84) {
         std::cout << cyan << R"(
@@ -77,7 +77,7 @@ void print_banner() {
     // Tagline on its own line, trimmed for narrow terminals.
     std::cout << green << bold;
     if (term_width < 52) {
-        std::cout << " - Windows PC audio -> Android speakers";
+        std::cout << " - PC audio -> Android speakers";
     } else {
         std::cout << "   " << tag;
     }
@@ -87,7 +87,7 @@ void print_banner() {
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " [options]\n\n"
               << "Options:\n"
-              << "  -s, --server <ip>         Windows PC Server IP address (e.g. 192.168.43.45 or 192.168.137.1)\n"
+              << "  -s, --server <ip>         PC Server IP address (e.g. 192.168.43.45 or 192.168.137.1)\n"
               << "  -p, --port <port>         Server UDP port (default: 44100)\n"
               << "  -d, --device <dev>        Audio device (default: 'default'):\n"
               << "                              ALSA: 'default', 'hw:0,0', 'plughw:0,0'\n"
@@ -121,8 +121,8 @@ void print_usage(const char* prog) {
               << "Hotspot Connection Instructions:\n"
               << "  Scenario A: PC connected to Android Mobile Hotspot\n"
               << "    1. Turn on Wi-Fi Hotspot on Android.\n"
-              << "    2. Connect your Windows PC to the Hotspot.\n"
-              << "    3. On Windows PC, run: audiorouter_server.exe\n"
+              << "    2. Connect your PC (Windows or Linux) to the Hotspot.\n"
+              << "    3. On the PC, run: audiorouter_server (or audiorouter_server.exe on Windows)\n"
               << "    4. On Android Termux (run 'su' first for root):\n"
               << "       ./audiorouter_client -s <PC_IP_ADDRESS> -p 44100\n\n"
               << "  Scenario B: Android connected to Windows Mobile Hotspot\n"
