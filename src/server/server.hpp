@@ -18,6 +18,7 @@ namespace audiorouter {
 struct ServerConfig {
     uint16_t port = protocol::DEFAULT_PORT;
     std::string bind_ip = "0.0.0.0";
+    std::string bind_iface; // Optional Linux SO_BINDTODEVICE ("auto" or interface name)
     uint32_t sample_rate = 48000;
     uint16_t channels = 2;
     uint32_t frames_per_packet = 240; // 5ms at 48kHz (960 bytes PCM) -> single MTU

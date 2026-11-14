@@ -53,6 +53,20 @@ bool AudioRouterServer::start() {
         return false;
     }
 
+    // Optional VPN bypass on Linux: pin UDP socket to physical interface via SO_BINDTODEVICE
+#if !defined(_WIN32)
+    if (!config_.usb_mode && !config_.bind_iface.empty()) {
+        std::string target_if = config_.bind_iface;
+        if (target_if == "auto") {
+            target_if = UdpSocket::pick_physical_interface();
+        }
+        if (target_if.empty() || !socket_.bind_to_interface(target_if)) {
+            LOG_WARN("Could not pin UDP socket to interface '" << config_.bind_iface
+                     << "' (grant CAP_NET_RAW via: sudo setcap cap_net_raw+ep ./bin/audiorouter_server)");
+        }
+    }
+#endif
+
     // Bind UDP Socket
     if (!socket_.bind(config_.port, config_.bind_ip)) {
         LOG_ERROR("Failed to bind UDP socket to " << config_.bind_ip << ":" << config_.port);

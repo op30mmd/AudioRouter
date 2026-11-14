@@ -390,7 +390,9 @@ std::string UdpSocket::pick_physical_interface() {
         // are tunNN, hotspot clients use rmnet/ppp, tunnels use sit/gre/ip_vti.
         const char* virtual_prefixes[] = {"lo",  "tun", "tap", "ppp", "rmnet",
                                           "dum", "sit", "gre", "vti", "ip6tnl",
-                                          "ip_vti", "wlan", "wifi"};
+                                          "ip_vti", "wg", "nordlynx", "tailscale",
+                                          "mullvad", "proton", "docker", "veth",
+                                          "br-", "virbr", "wlan", "wifi"};
         bool virtual_iface = false;
         for (const char* p : virtual_prefixes) {
             if (n.rfind(p, 0) == 0) {

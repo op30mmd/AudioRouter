@@ -154,6 +154,9 @@ void print_usage(const char* prog) {
               << "Options:\n"
               << "  -p, --port <port>         UDP listening port (default: 44100)\n"
               << "  -b, --bind <ip>           Bind IP address (default: 0.0.0.0)\n"
+#if !defined(_WIN32)
+              << "  -I, --iface <if|auto>     Pin UDP socket to physical interface (SO_BINDTODEVICE, bypasses VPN)\n"
+#endif
               << "  -d, --device <dev>        Capture backend/device: 'auto' (default), 'pulse',\n"
               << "                              'pulse:<source>', 'alsa', 'alsa:<dev>', or 'dummy'\n"
               << "  -r, --rate <hz>           Sample rate in Hz (default: 48000)\n"
@@ -221,6 +224,8 @@ int main(int argc, char* argv[]) {
             config.port = static_cast<uint16_t>(std::stoi(argv[++i]));
         } else if ((arg == "-b" || arg == "--bind") && i + 1 < argc) {
             config.bind_ip = argv[++i];
+        } else if ((arg == "-I" || arg == "--iface") && i + 1 < argc) {
+            config.bind_iface = argv[++i];
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
             config.capture_device = argv[++i];
         } else if ((arg == "-r" || arg == "--rate") && i + 1 < argc) {
