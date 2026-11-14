@@ -1,7 +1,7 @@
 # AudioRouter
 
-High-performance, ultra-low-latency C++ audio routing engine that captures Windows
-system audio output (WASAPI loopback) and streams it to an Android device over UDP,
+High-performance, ultra-low-latency C++ audio routing engine that captures Windows (WASAPI loopback)
+or Linux (PulseAudio/PipeWire `.monitor` loopback or ALSA PCM) system audio output and streams it to an Android device over UDP,
 where it is rendered through one of several pluggable playback backends (ALSA, direct
 kernel PCM, Qualcomm AGM, PulseAudio, Android AAudio, or the Termux:API media player
 — the last three need no root). The server automatically mutes the PC
@@ -83,32 +83,49 @@ Validation helpers (`is_valid_header`, `validate_audio_header`, `validate`) enfo
 magic/version/type and payload-size consistency on every receive; malformed packets
 are dropped.
 
-## 2. Server (Windows)
+## 2. Server (Windows & Linux)
 
-`src/server/` — WASAPI loopback capture, packetization, endpoint-volume control,
-and a watchdog:
+`src/server/` — system audio loopback capture, packetization, endpoint-volume
+control, and a watchdog:
 
-- **Capture** (`wasapi_capture.cpp`): `IAudioClient` in `AUDCLNT_SHAREMODE_SHARED` +
-  `AUDCLNT_STREAMFLAGS_LOOPBACK`, `IAudioCaptureClient::GetBuffer` on a dedicated
-  thread. The device mix format is queried and the client is told the negotiated
-  format in `CONNECT_ACK`. The Windows executable embeds a
-  `requireAdministrator` UAC manifest so its integrity level matches programs
-  started with **Run as administrator** and their audio is included in capture.
+- **Capture (Windows — `wasapi_capture.cpp`)**: `IAudioClient` in
+  `AUDCLNT_SHAREMODE_SHARED` + `AUDCLNT_STREAMFLAGS_LOOPBACK`,
+  `IAudioCaptureClient::GetBuffer` on a dedicated thread. The device mix format
+  is queried and the client is told the negotiated format in `CONNECT_ACK`. The
+  Windows executable embeds a `requireAdministrator` UAC manifest so its
+  integrity level matches programs started with **Run as administrator** and
+  their audio is included in capture.
+- **Capture (Linux — `pulse_capture.cpp`, `alsa_capture.cpp`)**:
+  - `PulseCapture` (default when PulseAudio or PipeWire-Pulse is running):
+    dynamically loads `libpulse-simple.so.0` / `libpulse.so.0` (with a `parec`
+    CLI fallback) and records the default output sink's `.monitor` source
+    (no `-dev` audio headers required at build time). Run as your normal desktop
+    user (not `sudo`) so `XDG_RUNTIME_DIR` points to your user Pulse/PipeWire
+    socket.
+  - `AlsaCapture` (`-d alsa[:device]`): dynamically loads `libasound.so.2` for
+    pure-ALSA capture (e.g. `snd-aloop` at `alsa:hw:Loopback,1,0`).
 - **Packetization** (`server.cpp::on_audio_captured`): captured frames are chunked to
   `frames_per_packet` (default 240 = 5 ms @ 48 kHz, single-MTU), stamped with a
   monotonically increasing `seq_num` and a µs timestamp, and sent over a
   QoS-prioritized UDP socket.
 - **Endpoint control** (`audio_endpoint_control.cpp`): on client connect the current
-  master volume/mute is saved and the PC speaker is silenced (`IAudioEndpointVolume`),
-  using either `mute`, `zero` (volume 0) or `both` (`--mute-mode`); on disconnect the
-  saved state is restored.
+  master volume/mute is saved and the PC speaker is silenced, using either `mute`,
+  `zero` (volume 0) or `both` (`--mute-mode`); on disconnect the saved state is
+  restored. Uses `IAudioEndpointVolume` on Windows, and scans ALSA hardware
+  mixers (`hw:0`–`hw:7` before `default`, falling back to `pactl`) on Linux so
+  physical speakers mute without silencing PulseAudio/PipeWire `.monitor` capture.
+- **Linux VPN bypass (`-I` / `--iface <if|auto>`)**: pins the server UDP socket
+  to a physical network interface via `SO_BINDTODEVICE` so replies bypass Linux
+  VPN policy routing. Grant `CAP_NET_RAW` (`sudo setcap cap_net_raw+ep ./bin/audiorouter_server`)
+  to use `-I` as your normal user without `sudo`.
 - **Watchdog** (`server.cpp::watchdog_thread`): if no client traffic arrives within
   `client_timeout_ms` (8 s), the client is disconnected and the speaker restored.
 - **Test tone** (`dummy_capture.cpp`): `-t` replaces loopback with a 440 Hz sine
   generator for network/pipeline testing without a sound source.
 
-Options: `-p/--port`, `-b/--bind`, `-r/--rate`, `-f/--frames`, `--no-mute`,
-`--mute-mode`, `-t/--test-tone`, `-l/--list-if`, `--usb`.
+Options: `-p/--port`, `-b/--bind`, `-I/--iface`, `-d/--device`, `-r/--rate`,
+`-f/--frames`, `--no-mute`, `--mute-mode`, `-t/--test-tone`, `-l/--list-if`,
+`--list-sources`, `--usb`.
 
 ### 2.1 Voice over USB
 
@@ -370,6 +387,18 @@ Both build paths embed an elevation manifest. Windows displays a UAC prompt when
 `audiorouter_server.exe` starts; approve it so WASAPI can capture audio from elevated
 as well as ordinary programs.
 
+### Linux server
+```bash
+./scripts/build_server_linux.sh   # or: make -j$(nproc) server
+```
+No PulseAudio or ALSA `-dev` headers are required at compile time (`PulseCapture`,
+`AlsaCapture`, and `AudioEndpointControl` load `libpulse-simple.so.0`,
+`libpulse.so.0`, and `libasound.so.2` at runtime via `dlopen`). If you want
+`-I/--iface` VPN bypass without running as root, grant `CAP_NET_RAW` once:
+```bash
+sudo setcap cap_net_raw+ep ./bin/audiorouter_server
+```
+
 ### Android client (Termux)
 ```bash
 ./scripts/termux_setup.sh         # clang, make, pkg-config, alsa-utils,
@@ -409,7 +438,7 @@ cmake --build build-android --target audiorouter_client stream_daemon
 
 ### Host tests
 ```bash
-make test          # 11 suites: protocol, ring buffer, jitter buffer/PLC,
+make test          # 12 suites: protocol, ring buffer, jitter buffer/PLC,
                    # socket, USB tunnel framing, conversion, Termux:API
                    # segment scheduling, PulseAudio device spec/buffer sizing,
                    # thread/type/memory safety
@@ -429,9 +458,17 @@ explicit "source checkout required" error in this layout.
 
 ### Server
 ```bat
+:: Windows
 bin\audiorouter_server.exe                  :: loopback capture, port 44100
 bin\audiorouter_server.exe -t               :: 440 Hz test tone
 bin\audiorouter_server.exe --usb            :: Voice over USB (binds loopback, sets up adb reverse)
+```
+```bash
+# Linux (run as your normal desktop user, not sudo)
+./bin/audiorouter_server                    # auto-detect PipeWire/PulseAudio .monitor
+./bin/audiorouter_server --list-sources     # list PulseAudio/PipeWire sources
+./bin/audiorouter_server -I auto            # pin physical NIC (bypasses Linux VPN routing)
+./bin/audiorouter_server --usb              # Voice over USB (adb reverse)
 ```
 
 ### Client
@@ -689,7 +726,8 @@ client keeps root for `SO_BINDTODEVICE` while AAudio runs in-process.
 ```
 src/common/    protocol.hpp, socket_util.*, audio_types.hpp, ring_buffer.hpp,
                logger.hpp, time_util.hpp, span/expected/thread compat
-src/server/    main.cpp, server.*, wasapi_capture.*, dummy_capture.*,
+src/server/    main.cpp, server.*, wasapi_capture.*, pulse_capture.*,
+               alsa_capture.*, dummy_capture.*,
                audio_endpoint_control.*, audio_capture.hpp, UAC manifest/resource
 src/client/    main.cpp, client.*, jitter_buffer.*, audio_player.hpp,
                aaudio_player.*, termux_api_player.*, agm_fifo_player.*,
@@ -698,7 +736,8 @@ src/client/    main.cpp, client.*, jitter_buffer.*, audio_player.hpp,
 src/tools/     stream_daemon.cpp
 scripts/       termux_setup.sh, termux_run.sh, build_client.sh,
                build_stream_daemon.sh, android_mixer_setup.sh,
-               build_server_msvc.bat, build_server_mingw.bat, usb_setup.bat,
+               build_server_linux.sh, build_server_msvc.bat,
+               build_server_mingw.bat, usb_setup.bat,
                usb_tether_setup.bat, usb_tether_setup.ps1
 tests/         protocol, ring buffer, jitter buffer/PLC, socket, USB tunnel,
                conversion, Termux:API segments/scheduling/protocol,

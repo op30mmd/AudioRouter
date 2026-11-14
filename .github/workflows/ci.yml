@@ -37,6 +37,22 @@ jobs:
         run: |
           ctest --test-dir build-host --output-on-failure
 
+      - name: Stage Linux x64 Server Artifact
+        run: |
+          mkdir -p staging-linux
+          cp build-host/src/server/audiorouter_server staging-linux/audiorouter_server
+          cp scripts/build_server_linux.sh staging-linux/
+          cp README.md staging-linux/
+          cp LICENSE staging-linux/
+          chmod +x staging-linux/audiorouter_server staging-linux/build_server_linux.sh
+
+      - name: Upload Linux x64 Server Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audiorouter_server_linux_x64
+          path: staging-linux/
+          if-no-files-found: error
+
       - name: Build Android / Termux ARM64 Client
         run: |
           NDK_PATH=""
@@ -150,6 +166,12 @@ jobs:
           name: audiorouter_client_android_arm64
           path: release-staging/client-arm64
 
+      - name: Download Linux x64 Server Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: audiorouter_server_linux_x64
+          path: release-staging/server-linux
+
       - name: Download Windows Server Artifact
         uses: actions/download-artifact@v4
         with:
@@ -166,6 +188,11 @@ jobs:
           # Package Windows zip
           cd release-staging/server-win
           zip -r "../../audiorouter-$VERSION_TAG-windows-x64.zip" .
+          cd ../..
+
+          # Package Linux x64 server tar.gz
+          cd release-staging/server-linux
+          tar -czvf "../../audiorouter-$VERSION_TAG-linux-x64.tar.gz" .
           cd ../..
 
           # Package Android Termux tar.gz
@@ -189,16 +216,16 @@ jobs:
           body: |
             ## 🎵 AudioRouter ${{ steps.tag_gen.outputs.tag_name }}
 
-            High-performance audio streaming engine from Windows PC to Android Termux (ALSA / Root / AAudio no-root).
+            High-performance audio streaming engine from Windows or Linux PC to Android Termux (ALSA / Root / AAudio no-root).
 
             ### 📦 Release Assets
             - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-windows-x64.zip`**: Windows PC Server (`audiorouter_server.exe` with WASAPI Loopback Capture and Endpoint Volume muting).
+            - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-linux-x64.tar.gz`**: Linux PC Server (`audiorouter_server` with PulseAudio/PipeWire `.monitor` loopback, ALSA PCM capture, ALSA mixer muting, and `SO_BINDTODEVICE` VPN bypass).
             - **`audiorouter-${{ steps.tag_gen.outputs.tag_name }}-android-termux-arm64.tar.gz`**: Android ARM64 Client for Termux (`audiorouter_client` with ALSA, direct `/dev/snd/`, Qualcomm AGM, AAudio, and Termux:API media player backends + standalone `stream_daemon`).
 
             ### 🚀 Quick Start
-            1. **Windows PC**: Run `audiorouter_server.exe`
-            2. **Android Termux (Root)**:
+            1. **Windows / Linux PC**: Run `audiorouter_server.exe` (Windows) or `./audiorouter_server` (Linux)
+            2. **Android Termux**:
                ```bash
-               su
                ./audiorouter_client -s <PC_IP> -p 44100
                ```
